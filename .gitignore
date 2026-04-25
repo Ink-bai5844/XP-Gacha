@@ -1,0 +1,14 @@
+/.streamlit
+/.vscode
+/b64_cache
+/b64_tmp
+/config.py
+/data
+/datacache
+/dictionaries
+/localimgtmp
+/manga_vectors
+/onlineimgtmp
+/paraphrase-multilingual-MiniLM-L12-v2
+/Qwen3-Embedding-0.6B
+/__pycache__
