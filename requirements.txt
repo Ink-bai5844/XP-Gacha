@@ -1,0 +1,23 @@
+# Web UI
+streamlit
+
+# Data processing
+pandas
+sqlalchemy
+pymysql
+
+# Image handling
+pillow
+
+# NLP / semantic search
+janome
+sentence-transformers
+torch
+
+# HTTP / crawling
+requests
+curl-cffi
+beautifulsoup4
+
+# Python 3.10 compatibility for tomllib usage in scripts
+tomli; python_version < "3.11"
