@@ -26,22 +26,48 @@
 
 ```text
 XP-Gacha/
-├─ app.py                          # Streamlit 主入口
-├─ config_empty.py                 # 配置模板
-├─ config.py                       # 本地实际配置（默认未纳入版本控制）
-├─ data_pipeline.py                # 数据读取、缓存、标签/标题处理、动态评分
-├─ utils_core.py                   # 本地目录匹配、封面缩略图与 Base64 缓存
-├─ utils_nlp.py                    # 标题分词、语义检索模型加载
-├─ utils_chat.py                   # LLM 对话与流式输出
-├─ dictionaries/                   # 停用词、语义映射等字典资源
-├─ data_processing/                # CSV 入库、向量库构建、预处理脚本
-├─ data_get/                       # 在线抓取、本地链接补全等脚本
-├─ manga_vectors/                  # 向量库输出目录
-├─ onlineimgtmp/                   # 在线封面缩略图缓存
-├─ localimgtmp/                    # 本地封面缩略图缓存
-├─ b64_cache/                      # Base64 封面缓存
-├─ datacache/                      # DataFrame 预处理缓存
-└─ .streamlit/secrets.toml         # MySQL 密钥配置
+├─ app.py                                  # Streamlit 主入口
+├─ config_empty.py                         # 配置模板
+├─ config.py                               # 本地实际配置（默认未纳入版本控制）
+├─ data_pipeline.py                        # 数据读取、缓存、标签/标题处理、动态评分
+├─ utils_core.py                           # 本地目录匹配、封面缩略图与 Base64 缓存
+├─ utils_nlp.py                            # 标题分词、语义检索模型加载
+├─ utils_chat.py                           # LLM 对话与流式输出
+├─ .streamlit/
+│  └─ secrets.toml                         # MySQL 密钥配置
+├─ dictionaries/                           # 停用词、语义映射等字典资源
+│  ├─ SEMANTIC_MAP.json
+│  ├─ STOP_TAGS.txt
+│  ├─ TITLE_SEMANTIC_MAP.json
+│  └─ TITLE_STOP_WORDS.txt
+├─ data/                                   # 原始数据、整理后的 CSV 与 SQL 备份
+│  ├─ gallery_info/                        # 已补全文件夹名的标准化 CSV
+│  ├─ gallery_info_no_name/                # 原始抓取 CSV
+│  └─ local_data/                          # 本地书签/链接列表输入
+├─ data_get/                               # 在线抓取、本地链接补全等脚本
+│  ├─ get_information_online.py
+│  ├─ get_information_online_fix.py
+│  └─ local/
+│     ├─ get_images_local.py
+│     ├─ get_information_local.py
+│     └─ output/                           # 本地抓取输出目录
+├─ data_processing/                        # CSV 入库、向量库构建、预处理脚本
+│  ├─ add_csv_to_mysql.py
+│  ├─ addname.py
+│  ├─ all_csv_to_mysql.py
+│  ├─ b64_pre_encode.py
+│  ├─ build_vector_db.py
+│  ├─ map_add_name.py
+│  ├─ tag_set.py
+│  └─ title_cut_set.py
+├─ manga_vectors/                          # 向量库输出目录
+├─ onlineimgtmp/                           # 在线封面缩略图缓存
+├─ localimgtmp/                            # 本地封面缩略图缓存
+├─ b64_cache/                              # Base64 封面缓存
+├─ b64_tmp/                                # Base64 处理中间目录
+├─ datacache/                              # DataFrame 预处理缓存
+├─ paraphrase-multilingual-MiniLM-L12-v2/  # 本地 embedding 模型目录（可替换）
+└─ Qwen3-Embedding-0.6B/                   # 本地 embedding 模型目录（默认）
 ```
 
 ## 核心流程
@@ -241,4 +267,3 @@ python data_get/local/get_images_local.py
 ## 适合谁用
 
 如果你想要一个个人化、可解释、可调权重、同时支持本地浏览和 AI 检索的（正经）漫画库存系统，这个项目非常适合你的需求:P。
-
