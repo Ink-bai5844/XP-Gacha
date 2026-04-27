@@ -1,0 +1,1 @@
+https://huggingface.co/datasets/Ink-bai/XP-Gacha-datasets
