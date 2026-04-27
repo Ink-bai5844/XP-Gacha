@@ -445,7 +445,7 @@ python data_processing/b64_pre_encode.py
 
 并为 `ID.*` 图片生成对应的增量 Base64 文本缓存到 `b64_tmp` 文件夹下，检查无误后需手动拷贝至 `b64_cache` 文件夹下。
 
-<small>注：若想跳过数据爬取阶段直接获得数据，请移步tools/datasets.txt</small>
+*注：若想跳过数据爬取阶段直接获得数据，请移步tools/datasets.txt*
 
 ## 缓存说明
 
