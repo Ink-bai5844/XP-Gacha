@@ -14,7 +14,7 @@
 /__pycache__
 /logs
 /Integration/__pycache__
-/data_processing/__pycache__
 /tools/__pycache__
 /data_get/__pycache__
 /data_get/local/__pycache__
+/data_processing/__pycache__

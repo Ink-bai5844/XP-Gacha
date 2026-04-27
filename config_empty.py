@@ -8,8 +8,8 @@ IMG_CACHE_DIR = "localimgtmp"
 CACHE_DIR = "datacache"
 B64_CACHE_DIR = "b64_cache"
 VECTOR_FILE = "manga_vectors/manga_vectors_Qwen3.pkl"
-LOCAL_MODEL_PATH = r"D:\Python\XP-Gacha\Qwen3-Embedding-0.6B"
-BASE_DIR = r"H:\1\12"
+LOCAL_MODEL_PATH = r"xxxxx\XP-Gacha\Qwen3-Embedding-0.6B"
+BASE_DIR = r"xxxxx\1\12"
 
 # LM Studio 配置
 LM_STUDIO_API_BASE = "http://localhost:1234/v1"
@@ -62,3 +62,5 @@ TITLE_SEMANTIC_MAP = load_json_config('dictionaries/TITLE_SEMANTIC_MAP.json')
 print("配置已就绪！")
 print(f"TITLE_STOP_WORDS 数量: {len(TITLE_STOP_WORDS)}")
 print(f"TITLE_SEMANTIC_MAP 数量: {len(TITLE_SEMANTIC_MAP)}")
+print(f"STOP_TAGS 数量: {len(STOP_TAGS)}")
+print(f"SEMANTIC_MAP 数量: {len(SEMANTIC_MAP)}")
