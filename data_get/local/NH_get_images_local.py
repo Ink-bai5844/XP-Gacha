@@ -60,12 +60,12 @@ def main():
     os.makedirs(root_dir, exist_ok=True)
     
     # 初始化错误日志
-    error_log = "error_log_images_local.txt"
+    error_log = "logs/NH_error_log_images_local.txt"
     if os.path.exists(error_log):
         os.remove(error_log)
     
     # 读取2.txt文件
-    with open('data/local_data/2.txt', 'r', encoding='utf-8') as file:
+    with open('data/local_data/NH_2.txt', 'r', encoding='utf-8') as file:
         lines = file.readlines()
     
     # 正则表达式解析每行内容

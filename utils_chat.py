@@ -28,8 +28,9 @@ def get_ai_response_stream(user_query, context_df, api_mode="本地 (LM Studio)"
     if not context_df.empty:
         context_text = "### 当前选中的参考库存数据：\n"
         for _, row in context_df.iterrows():
+            item_id = row.get('ID', '无ID')
             link = row.get('链接', '无链接')
-            context_text += f"- 标题: {row['标题']} | 作者: {row['作者']} | 标签: {row['标签']} | 评分: {row['推荐评分']} | 链接: {link}\n"
+            context_text += f"- ID: {item_id} | 标题: {row['标题']} | 作者: {row['作者']} | 标签: {row['标签']} | 评分: {row['推荐评分']} | 链接: {link}\n"
 
     payload = {
         "model": model_name,

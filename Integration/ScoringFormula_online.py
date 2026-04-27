@@ -11,15 +11,6 @@ from collections import Counter
 from janome.tokenizer import Tokenizer
 from sqlalchemy import create_engine, text
 
-# 数据文件夹
-CACHE_DIR = "datacache"
-B64_CACHE_DIR = "b64_cache"
-
-# 初始标签权重
-INITIAL_TAG_WEIGHTS = {
-    'NTR(netorare)': -2.0
-}
-
 st.set_page_config(page_title="地下金库(Online)", layout="wide")
 
 st.markdown(
@@ -70,9 +61,18 @@ def init_db_engine():
 
 engine = init_db_engine()
 
+# 数据文件夹
+CACHE_DIR = "datacache"
+B64_CACHE_DIR = "b64_cache"
+
 for directory in [CACHE_DIR, B64_CACHE_DIR]:
     if not os.path.exists(directory):
         os.makedirs(directory)
+
+# 初始标签权重
+INITIAL_TAG_WEIGHTS = {
+    'NTR(netorare)': -2.0
+}
 
 # 辅助读取函数
 def load_text_config(filepath):
@@ -90,10 +90,10 @@ def load_json_config(filepath):
     except FileNotFoundError:
         return {}
 
-STOP_TAGS = load_text_config('STOP_TAGS.txt')
-SEMANTIC_MAP = load_json_config('SEMANTIC_MAP.json')
-TITLE_STOP_WORDS = load_text_config('TITLE_STOP_WORDS.txt')
-TITLE_SEMANTIC_MAP = load_json_config('TITLE_SEMANTIC_MAP.json')
+STOP_TAGS = load_text_config('dictionaries/STOP_TAGS.txt')
+SEMANTIC_MAP = load_json_config('dictionaries/SEMANTIC_MAP.json')
+TITLE_STOP_WORDS = load_text_config('dictionaries/TITLE_STOP_WORDS.txt')
+TITLE_SEMANTIC_MAP = load_json_config('dictionaries/TITLE_SEMANTIC_MAP.json')
 
 tokenizer = Tokenizer()
 
@@ -102,15 +102,26 @@ print(f"TITLE_STOP_WORDS 数量: {len(TITLE_STOP_WORDS)}")
 print(f"TITLE_SEMANTIC_MAP 数量: {len(TITLE_SEMANTIC_MAP)}")
 
 # 缩略图字符串读取
-def get_cover_base64(url):
-    gallery_id = None
-    
-    # 提取图库ID
+def resolve_gallery_id(gallery_id="", url=""):
+    if pd.notna(gallery_id) and str(gallery_id).strip():
+        return str(gallery_id).strip()
+
     if pd.notna(url) and str(url).strip():
-        match = re.search(r'/g/(\d+)/?', str(url))
-        if match:
-            gallery_id = match.group(1)
-            
+        url_str = str(url).strip()
+        nh_match = re.search(r'/g/(\d+)/?', url_str)
+        if nh_match:
+            return f"NH{nh_match.group(1)}"
+
+        jm_match = re.search(r'/album/(\d+)/?', url_str)
+        if jm_match:
+            return f"JM{jm_match.group(1)}"
+
+    return None
+
+
+def get_cover_base64(gallery_id="", url=""):
+    gallery_id = resolve_gallery_id(gallery_id, url)
+
     if not gallery_id:
         return None
 
@@ -149,7 +160,7 @@ def get_data_hash():
     hasher = hashlib.md5()
     
     # 监控配置文件
-    config_files = ['STOP_TAGS.txt', 'SEMANTIC_MAP.json', 'TITLE_STOP_WORDS.txt', 'TITLE_SEMANTIC_MAP.json']
+    config_files = ['dictionaries/STOP_TAGS.txt', 'dictionaries/SEMANTIC_MAP.json', 'dictionaries/TITLE_STOP_WORDS.txt', 'dictionaries/TITLE_SEMANTIC_MAP.json']
     for file in config_files:
         if os.path.exists(file):
             hasher.update(str(os.path.getmtime(file)).encode())
@@ -157,7 +168,7 @@ def get_data_hash():
     # 监控数据库更新状态
     try:
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT COUNT(*), MAX(链接) FROM gallery_info")).fetchone()
+            result = conn.execute(text("SELECT COUNT(*), MAX(ID) FROM gallery_info")).fetchone()
             if result:
                 hasher.update(str(result[0]).encode())
                 hasher.update(str(result[1]).encode())
@@ -293,24 +304,26 @@ with st.sidebar.expander("标题关键词权重配置", expanded=False):
 def apply_dynamic_scores(df, tag_weights, artist_weights, title_weights, tag_freq, artist_freq, title_word_freq, global_tag_w, global_artist_w, global_title_w):
     def calculate_score(row):
         score = 0.0
-        
         tags = row['解析后标签']
         if tags:
             tag_score_sum = sum(math.log1p(tag_freq.get(t, 0)) * 10 * tag_weights.get(t, 1.0) for t in tags)
             base_tag_score = tag_score_sum / math.sqrt(len(tags))
-            score += base_tag_score * global_tag_w 
+            score += base_tag_score * global_tag_w * 0.5
 
         artist = row['作者'].strip()
         if artist:
             multiplier = artist_weights.get(artist, 5.0)
-            base_artist_score = artist_freq.get(artist, 0) * multiplier
+            base_artist_score = math.log1p(artist_freq.get(artist, 0)) * 10 * multiplier
             score += base_artist_score * global_artist_w 
             
         title_words = row.get('标题特征词', [])
         if title_words:
-            title_score_sum = sum(title_word_freq.get(w, 0) * title_weights.get(w, 1.0) for w in title_words)
+            title_score_sum = sum(
+                math.log1p(title_word_freq.get(w, 0)) * 10 * title_weights.get(w, 1.0)
+                for w in title_words
+            )
             title_dilution = max(1, math.sqrt(len(title_words)))
-            base_title_score = (title_score_sum / title_dilution) * 0.5 
+            base_title_score = (title_score_sum / title_dilution)
             score += base_title_score * global_title_w 
             
         return int(score)
@@ -318,7 +331,7 @@ def apply_dynamic_scores(df, tag_weights, artist_weights, title_weights, tag_fre
     scored_df = df.copy()
     scored_df['推荐评分'] = scored_df.apply(calculate_score, axis=1)
     
-    columns_order = ['封面', '推荐评分', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '链接', '文件名', '解析后标签', '标题特征词']
+    columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '链接', '文件名', '解析后标签', '标题特征词']
     if '上传日期' not in scored_df.columns:
         scored_df['上传日期'] = ''
         
@@ -369,6 +382,7 @@ if search_kw and not filtered_df.empty:
     kw_list = [kw.strip().lower() for kw in search_kw.replace('，', ',').split(',') if kw.strip()]
     for kw in kw_list:
         mask_search = (
+            filtered_df['ID'].str.lower().str.contains(kw, regex=False, na=False) |
             filtered_df['标题'].str.lower().str.contains(kw, regex=False, na=False) |
             filtered_df['标签'].str.lower().str.contains(kw, regex=False, na=False) |
             filtered_df['作者'].str.lower().str.contains(kw, regex=False, na=False) |
@@ -394,7 +408,7 @@ st.markdown("---")
 st.subheader("库存列表")
 
 if not filtered_df.empty:
-    sort_columns = ['推荐评分', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数']
+    sort_columns = ['推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数']
     
     col_sort1, col_sort2, col_page, col_empty = st.columns([1.5, 1, 1.5, 2])
     
@@ -431,17 +445,15 @@ if not filtered_df.empty:
 
     with st.spinner(f'正在加载 {selected_page_label} 范围的缩略图...'):
         display_df['封面'] = display_df.apply(
-            lambda row: get_cover_base64(row.get('链接', '')), 
+            lambda row: get_cover_base64(row.get('ID', ''), row.get('链接', '')),
             axis=1
         )
 
     display_df = display_df.drop(columns=['文件名'], errors='ignore')
-
-    cols = display_df.columns.tolist()
-    if '封面' in cols:
-        cols.remove('封面')
-        cols.insert(0, '封面') 
-    display_df = display_df[cols]
+    preferred_columns = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '链接']
+    display_columns = [col for col in preferred_columns if col in display_df.columns]
+    display_columns += [col for col in display_df.columns if col not in display_columns]
+    display_df = display_df[display_columns]
 
     st.dataframe(
         display_df,
@@ -454,6 +466,7 @@ if not filtered_df.empty:
                 min_value=min_possible_score, 
                 max_value=max_possible_score
             ),
+            "ID": st.column_config.TextColumn("ID", help="唯一标识符"),
             "上传日期": st.column_config.TextColumn("上传日期", help="该漫画的上传时间")
         },
         hide_index=True,

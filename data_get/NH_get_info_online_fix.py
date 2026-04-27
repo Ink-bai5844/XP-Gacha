@@ -4,19 +4,21 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from get_information_online import (
+from NH_get_info_online import (
+    CSV_HEADERS,
     IMG_DIR,
     MAX_WORKERS,
     csv_lock,
+    ensure_csv_has_id_column,
     get_page_urls,
-    load_existing_urls,
+    load_existing_ids,
     log_lock,
     process_single_gallery,
 )
 
 OUTPUT_CSV = "gallery_info_chinese.csv"
-SOURCE_ERROR_LOG = "error_log_online_4.txt"
-RETRY_ERROR_LOG = "error_log_online_fix.txt"
+SOURCE_ERROR_LOG = "logs/NH_error_log_online.txt"
+RETRY_ERROR_LOG = "logs/NH_error_log_online_fix.txt"
 PAGE_PATTERN = re.compile(r"\[页数:\s*(\d+)")
 
 
@@ -57,16 +59,17 @@ def main():
         return
 
     os.makedirs(IMG_DIR, exist_ok=True)
-    processed_urls = load_existing_urls(OUTPUT_CSV)
+    ensure_csv_has_id_column(OUTPUT_CSV)
+    processed_ids = load_existing_ids(OUTPUT_CSV)
     page_preview = ", ".join(str(page) for page in error_pages[:20])
     if len(error_pages) > 20:
         page_preview += ", ..."
 
     print(f"修复模式：将按错误日志中的页码重试，共 {len(error_pages)} 页。")
     print(f"待重试页码：{page_preview}")
-    print(f"初始化查重：已在本地CSV发现 {len(processed_urls)} 条历史记录。")
+    print(f"初始化查重：已在本地CSV发现 {len(processed_ids)} 条历史记录。")
 
-    csv_headers = ["链接", "标题", "标签", "作者", "团队", "语言", "页数", "上传日期"]
+    csv_headers = CSV_HEADERS
     write_header = not os.path.exists(OUTPUT_CSV)
     total_count = 0
 
@@ -111,7 +114,7 @@ def main():
                         item_index,
                         len(items),
                         page,
-                        processed_urls,
+                        processed_ids,
                         writer,
                         f_csv,
                         RETRY_ERROR_LOG,

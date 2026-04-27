@@ -43,7 +43,7 @@ def get_data_hash():
             
     try:
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT COUNT(*), MAX(链接) FROM gallery_info")).fetchone()
+            result = conn.execute(text("SELECT COUNT(*), MAX(ID) FROM gallery_info")).fetchone()
             if result:
                 hasher.update(str(result[0]).encode()) 
                 hasher.update(str(result[1]).encode()) 
@@ -149,7 +149,7 @@ def apply_dynamic_scores(df, tag_weights, artist_weights, title_weights, tag_fre
     scored_df = df.copy()
     scored_df['推荐评分'] = scored_df.apply(calculate_score, axis=1)
     
-    columns_order = ['封面', '推荐评分', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接', '文件名', '解析后标签', '标题特征词']
+    columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接', '文件名', '解析后标签', '标题特征词']
     if '上传日期' not in scored_df.columns:
         scored_df['上传日期'] = ''
         

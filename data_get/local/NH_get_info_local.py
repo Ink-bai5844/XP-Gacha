@@ -5,10 +5,57 @@ import time
 from curl_cffi import requests 
 from bs4 import BeautifulSoup
 
+ID_COLUMN = "ID"
+LINK_COLUMN = "链接"
+ID_PREFIX = "NH"
+GALLERY_URL_PATTERN = re.compile(r"/g/(\d+)/?")
+
 PROXIES = {
     "http": "http://127.0.0.1:7890",
     "https": "http://127.0.0.1:7890"
 }
+
+
+def extract_nh_id(url):
+    match = GALLERY_URL_PATTERN.search((url or "").strip())
+    if not match:
+        return ""
+    return f"{ID_PREFIX}{match.group(1)}"
+
+
+def ensure_csv_has_id_column(csv_path):
+    """若 CSV 还是旧格式，则自动补齐 ID 列并调整到表头首列。"""
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return
+
+    with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    if not fieldnames:
+        return
+
+    if LINK_COLUMN not in fieldnames:
+        raise ValueError(f"CSV 中未找到列: {LINK_COLUMN}")
+
+    new_fieldnames = [name for name in fieldnames if name != ID_COLUMN]
+    new_fieldnames.insert(0, ID_COLUMN)
+
+    needs_rewrite = fieldnames != new_fieldnames
+    for row in rows:
+        nh_id = extract_nh_id(row.get(LINK_COLUMN, ""))
+        if row.get(ID_COLUMN, "") != nh_id:
+            row[ID_COLUMN] = nh_id
+            needs_rewrite = True
+
+    if not needs_rewrite:
+        return
+
+    with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=new_fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 def extract_field_data(soup, field_name):
     """
@@ -76,6 +123,7 @@ def get_gallery_info(url, retries=3):
             uploaded_date = extract_upload_date(soup)
             
             return {
+                "id": extract_nh_id(url),
                 "url": url,
                 "title": title,
                 "tags": tags,
@@ -94,9 +142,9 @@ def get_gallery_info(url, retries=3):
                 return None
 
 def main():
-    input_file = 'data/local_data/all.txt'
+    input_file = 'data/local_data/NH_all.txt'
     output_csv = 'gallery_info_local.csv'
-    error_log = 'error_log_local.txt'
+    error_log = 'logs/NH_error_log_local.txt'
     
     # 检查输入文件是否存在
     if not os.path.exists(input_file):
@@ -118,9 +166,10 @@ def main():
     print(f"共提取到 {len(urls)} 个图库链接。开始处理...")
     
     # CSV 表头
-    csv_headers = ['链接', '标题', '标签', '作者', '团队', '语言', '页数', '上传日期']
+    csv_headers = [ID_COLUMN, LINK_COLUMN, '标题', '标签', '作者', '团队', '语言', '页数', '上传日期']
     
     # 是新文件则写入表头（使用 utf-8-sig 防止 Excel 乱码）
+    ensure_csv_has_id_column(output_csv)
     write_header = not os.path.exists(output_csv)
     with open(output_csv, 'a', newline='', encoding='utf-8-sig') as f_csv:
         writer = csv.writer(f_csv)
@@ -135,6 +184,7 @@ def main():
             if info:
                 # 写入到 CSV
                 writer.writerow([
+                    info['id'],
                     info['url'], 
                     info['title'], 
                     info['tags'], 

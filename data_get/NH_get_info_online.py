@@ -3,12 +3,18 @@ import csv
 import time
 import threading
 import argparse
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests 
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://nhentai.net"
-IMG_DIR = "onlineimgtmp"
+IMG_DIR = "onlineimgtmp_c"
+LINK_COLUMN = "链接"
+ID_COLUMN = "ID"
+ID_PREFIX = "NH"
+GALLERY_URL_PATTERN = re.compile(r"/g/(\d+)/?")
+CSV_HEADERS = [ID_COLUMN, LINK_COLUMN, '标题', '标签', '作者', '团队', '语言', '页数', '上传日期']
 PROXIES = {
     "http": "http://127.0.0.1:7890",
     "https": "http://127.0.0.1:7890"
@@ -53,17 +59,60 @@ def parse_max_page():
     return max_page
 
 
-def load_existing_urls(csv_path):
-    """读取已有的 CSV 文件，返回所有已经爬取过的链接集合"""
-    existing_urls = set()
+def load_existing_ids(csv_path):
+    """读取已有的 CSV 文件，返回所有已经爬取过的 NH ID 集合。"""
+    existing_ids = set()
     if os.path.exists(csv_path):
-        with open(csv_path, 'r', encoding='utf-8-sig') as f:
-            reader = csv.reader(f)
-            next(reader, None) # 跳过表头
+        with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+            reader = csv.DictReader(f)
             for row in reader:
-                if row and len(row) > 0:
-                    existing_urls.add(row[0])  
-    return existing_urls
+                gallery_id = (row.get(ID_COLUMN, "") or "").strip()
+                if gallery_id:
+                    existing_ids.add(gallery_id)
+    return existing_ids
+
+
+def extract_nh_id(url):
+    """从 nhentai 链接中提取数字 ID，并补上 NH 前缀。"""
+    match = GALLERY_URL_PATTERN.search((url or "").strip())
+    if not match:
+        return ""
+    return f"{ID_PREFIX}{match.group(1)}"
+
+
+def ensure_csv_has_id_column(csv_path):
+    """若 CSV 还是旧格式，则自动补齐 ID 列并调整到表头首列。"""
+    if not os.path.exists(csv_path):
+        return
+
+    with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    if not fieldnames:
+        return
+
+    if LINK_COLUMN not in fieldnames:
+        raise ValueError(f"CSV 中未找到列: {LINK_COLUMN}")
+
+    new_fieldnames = [name for name in fieldnames if name != ID_COLUMN]
+    new_fieldnames.insert(0, ID_COLUMN)
+
+    needs_rewrite = (fieldnames != new_fieldnames)
+    for row in rows:
+        nh_id = extract_nh_id(row.get(LINK_COLUMN, ""))
+        if row.get(ID_COLUMN, "") != nh_id:
+            row[ID_COLUMN] = nh_id
+            needs_rewrite = True
+
+    if not needs_rewrite:
+        return
+
+    with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=new_fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 def extract_field_data(soup, field_name):
     """提取标签信息"""
@@ -84,13 +133,13 @@ def extract_upload_date(soup):
                 return time_tag['datetime'][:10]
     return ""
 
-def download_thumbnail(img_url, gallery_id, retries=3):
+def download_thumbnail(img_url, nh_id, retries=3):
     """下载缩略图并保存到指定文件夹"""
     if not img_url:
         return False, "缩略图链接为空"
         
     ext = img_url.split('.')[-1].split('?')[0] 
-    file_path = os.path.join(IMG_DIR, f"{gallery_id}.{ext}")
+    file_path = os.path.join(IMG_DIR, f"{nh_id}.{ext}")
     
     if os.path.exists(file_path):
         return True, ""
@@ -150,6 +199,7 @@ def get_gallery_info(url, retries=3):
                     title = pretty_tag.text.strip() if pretty_tag else h1_tag.text.strip()
             
             return {
+                "id": extract_nh_id(url),
                 "url": url,
                 "title": title,
                 "tags": extract_field_data(soup, 'Tags:'),
@@ -201,7 +251,7 @@ def get_page_urls(page_num, retries=3):
                     if href.startswith('/g/'):
                         items.append({
                             'url': BASE_URL + href,
-                            'id': href.strip('/').split('/')[-1],
+                            'id': extract_nh_id(BASE_URL + href),
                             'thumb_url': img_tag.get('src', img_tag.get('data-src', '')) if img_tag else ""
                         })
             return items
@@ -213,41 +263,41 @@ def get_page_urls(page_num, retries=3):
             else:
                 return False 
 
-def process_single_gallery(item, index, total, page, processed_urls, writer, f_csv, error_log):
+def process_single_gallery(item, index, total, page, processed_ids, writer, f_csv, error_log):
     """
     单个画廊的处理函数（交由线程池执行）
     返回新增记录的数量 (0 或 1)
     """
-    gallery_id = item['id']
+    nh_id = item['id']
     gallery_url = item['url']
     thumb_url = item['thumb_url']
     
     # 读操作不需要锁
-    is_in_csv = gallery_url in processed_urls
+    is_in_csv = nh_id in processed_ids
     
     thumb_exists = True
     if thumb_url:
         ext = thumb_url.split('.')[-1].split('?')[0]
-        thumb_path = os.path.join(IMG_DIR, f"{gallery_id}.{ext}")
+        thumb_path = os.path.join(IMG_DIR, f"{nh_id}.{ext}")
         thumb_exists = os.path.exists(thumb_path)
     
     if is_in_csv and thumb_exists:
-        print(f"  [页 {page} - {index}/{total}] ⏭️ 双重已存，跳过: {gallery_id}")
+        print(f"  [页 {page} - {index}/{total}] ⏭️ 双重已存，跳过: {nh_id}")
         return 0
         
-    print(f"  [页 {page} - {index}/{total}] ⚡ 正在处理: {gallery_id} (CSV已存:{is_in_csv} | 图已存:{thumb_exists})")
+    print(f"  [页 {page} - {index}/{total}] ⚡ 正在处理: {nh_id} (CSV已存:{is_in_csv} | 图已存:{thumb_exists})")
     
     new_record_added = 0
     
     # 下载缩略图
     if not thumb_exists and thumb_url:
-        success, err_msg = download_thumbnail(thumb_url, gallery_id)
+        success, err_msg = download_thumbnail(thumb_url, nh_id)
         if success:
-            print(f"    -> 🖼️ 缩略图保存成功: {gallery_id}")
+            print(f"    -> 🖼️ 缩略图保存成功: {nh_id}")
         else:
             with log_lock:
                 with open(error_log, 'a', encoding='utf-8') as f_err:
-                    f_err.write(f"[页数: {page}, ID: {gallery_id}] 缩图获取失败: {thumb_url} ({err_msg})\n")
+                    f_err.write(f"[页数: {page}, ID: {nh_id}] 缩图获取失败: {thumb_url} ({err_msg})\n")
     
     # 抓取详情并写入 CSV
     if not is_in_csv:
@@ -255,34 +305,35 @@ def process_single_gallery(item, index, total, page, processed_urls, writer, f_c
         if info:
             # 涉及文件写入和共享集合修改，必须加锁
             with csv_lock:
-                if info['url'] not in processed_urls: # 二次检查，防止极端情况下的并发写入
+                if info['id'] not in processed_ids: # 二次检查，防止极端情况下的并发写入
                     writer.writerow([
-                        info['url'], info['title'], info['tags'], info['artists'], 
+                        info['id'], info['url'], info['title'], info['tags'], info['artists'], 
                         info['groups'], info['languages'], info['pages'], info['uploaded_date']
                     ])
                     f_csv.flush()
-                    processed_urls.add(info['url'])
+                    processed_ids.add(info['id'])
                     new_record_added = 1
                     print(f"    -> 📝 CSV保存成功: {info['title'][:25]}...")
         else:
             with log_lock:
                 with open(error_log, 'a', encoding='utf-8') as f_err:
-                    f_err.write(f"[页数: {page}, ID: {gallery_id}] 详情页获取失败: {gallery_url}\n")
+                    f_err.write(f"[页数: {page}, ID: {nh_id}] 详情页获取失败: {gallery_url}\n")
                     
     return new_record_added
 
 
 def main():
     output_csv = 'gallery_info_chinese.csv'
-    error_log = 'error_log_online_4.txt'
+    error_log = 'logs/NH_error_log_online.txt'
     max_page = parse_max_page()
     
     os.makedirs(IMG_DIR, exist_ok=True)
-    processed_urls = load_existing_urls(output_csv)
+    ensure_csv_has_id_column(output_csv)
+    processed_ids = load_existing_ids(output_csv)
     print(f"循环模式：将从第 1 页爬到第 {max_page} 页，完成后重新从第 1 页开始。按 Ctrl+C 手动停止。")
-    print(f"初始化查重：已在本地CSV发现 {len(processed_urls)} 条历史记录。")
+    print(f"初始化查重：已在本地CSV发现 {len(processed_ids)} 条历史记录。")
     
-    csv_headers = ['链接', '标题', '标签', '作者', '团队', '语言', '页数', '上传日期']
+    csv_headers = CSV_HEADERS
     write_header = not os.path.exists(output_csv)
     
     with open(output_csv, 'a', newline='', encoding='utf-8-sig') as f_csv:
@@ -335,7 +386,7 @@ def main():
                     future = executor.submit(
                         process_single_gallery, 
                         item, index, len(items), page, 
-                        processed_urls, writer, f_csv, error_log
+                        processed_ids, writer, f_csv, error_log
                     )
                     futures.append(future)
                 

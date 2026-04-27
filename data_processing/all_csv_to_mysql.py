@@ -1,5 +1,6 @@
 import os
 import glob
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +15,9 @@ except ModuleNotFoundError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SECRETS_FILE = PROJECT_ROOT / ".streamlit" / "secrets.toml"
 CSV_DIR = "data/gallery_info"
+ID_COLUMN = "ID"
+LINK_COLUMN = "链接"
+DB_COLUMNS = [ID_COLUMN, LINK_COLUMN, "文件名", "标题", "标签", "作者", "团队", "语言", "页数", "上传日期"]
 
 
 def load_db_uri():
@@ -40,6 +44,51 @@ def load_db_uri():
 
 engine = create_engine(load_db_uri())
 
+
+def extract_gallery_id(url):
+    url = str(url or "").strip()
+    if not url:
+        return ""
+
+    nh_match = re.search(r"/g/(\d+)/?", url)
+    if nh_match:
+        return f"NH{nh_match.group(1)}"
+
+    jm_match = re.search(r"/album/(\d+)/?", url)
+    if jm_match:
+        return f"JM{jm_match.group(1)}"
+
+    return ""
+
+
+def normalize_dataframe(df):
+    df = df.copy()
+
+    if LINK_COLUMN not in df.columns:
+        raise ValueError(f"CSV 缺少必要列: {LINK_COLUMN}")
+
+    if ID_COLUMN not in df.columns:
+        df[ID_COLUMN] = ""
+
+    for column in DB_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+
+    df = df.fillna("")
+    df[ID_COLUMN] = df[ID_COLUMN].astype(str).str.strip()
+    df[LINK_COLUMN] = df[LINK_COLUMN].astype(str).str.strip()
+
+    missing_id_mask = df[ID_COLUMN] == ""
+    df.loc[missing_id_mask, ID_COLUMN] = df.loc[missing_id_mask, LINK_COLUMN].apply(extract_gallery_id)
+
+    df["标题"] = df.apply(
+        lambda row: row.get("文件名", "") if row.get("标题", "") == "" else row.get("标题", ""),
+        axis=1,
+    )
+    df = df.drop_duplicates(subset=[ID_COLUMN]).copy()
+    df = df[DB_COLUMNS]
+    return df
+
 def migrate_data():
     all_dfs = []
     if os.path.exists(CSV_DIR):
@@ -61,18 +110,16 @@ def migrate_data():
 
     # 合并与基础清洗
     df = pd.concat(all_dfs, ignore_index=True)
-    df = df.drop_duplicates(subset=['链接']).copy()
-    df = df.fillna('')
-    df['标题'] = df.apply(lambda row: row.get('文件名', '') if row.get('标题', '') == '' else row.get('标题', ''), axis=1)
+    df = normalize_dataframe(df)
 
     # 写入 MySQL (if_exists='replace' 会自动建表并覆盖已有数据)
     print("正在写入 MySQL 数据库，请稍候...")
     df.to_sql(name='gallery_info', con=engine, if_exists='replace', index=False)
 
-    # 导入完成后修正字段类型，并为链接字段建立唯一索引。
+    # 导入完成后修正字段类型，并为 ID 字段建立唯一索引。
     with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE gallery_info MODIFY COLUMN 链接 VARCHAR(255);"))
-        conn.execute(text("ALTER TABLE gallery_info ADD UNIQUE INDEX idx_link (链接);"))
+        conn.execute(text("ALTER TABLE gallery_info MODIFY COLUMN ID VARCHAR(64);"))
+        conn.execute(text("ALTER TABLE gallery_info ADD UNIQUE INDEX idx_id (ID);"))
 
     print(f"迁移完成！共写入 {len(df)} 条数据。")
 

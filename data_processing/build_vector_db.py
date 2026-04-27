@@ -56,8 +56,8 @@ def load_db_uri():
 def build_vectors():
     engine = create_engine(load_db_uri())
     print("正在从 MySQL 读取数据...")
-    # 过滤掉没有链接的无效数据
-    df = pd.read_sql("SELECT * FROM gallery_info WHERE 链接 != ''", con=engine)
+    # 过滤掉没有 ID 的无效数据
+    df = pd.read_sql("SELECT * FROM gallery_info WHERE ID != ''", con=engine)
     df = df.fillna("")
 
     documents = []
@@ -77,7 +77,7 @@ def build_vectors():
             semantic_text = semantic_text[:800]
 
         documents.append(semantic_text)
-        ids.append(str(row["链接"]))
+        ids.append(str(row["ID"]))
 
     model_name = get_model_display_name()
     print(f"正在唤醒向量模型：{model_name} ...")

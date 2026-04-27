@@ -38,12 +38,25 @@ def match_local_folder(csv_filename, folder_map):
         
     return "本地目录不存在"
 
-def get_cover_base64(local_path, url=""):
-    gallery_id = None
+def resolve_gallery_id(gallery_id="", url=""):
+    if pd.notna(gallery_id) and str(gallery_id).strip():
+        return str(gallery_id).strip()
+
     if pd.notna(url) and str(url).strip():
-        match = re.search(r'/g/(\d+)/?', str(url))
-        if match:
-            gallery_id = match.group(1)
+        url_str = str(url).strip()
+        nh_match = re.search(r'/g/(\d+)/?', url_str)
+        if nh_match:
+            return f"NH{nh_match.group(1)}"
+
+        jm_match = re.search(r'/album/(\d+)/?', url_str)
+        if jm_match:
+            return f"JM{jm_match.group(1)}"
+
+    return None
+
+
+def get_cover_base64(local_path, gallery_id="", url=""):
+    gallery_id = resolve_gallery_id(gallery_id, url)
             
     if not gallery_id:
         return None

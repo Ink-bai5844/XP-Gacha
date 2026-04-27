@@ -45,4 +45,4 @@ def process_gallery_data(csv_file, txt_file, output_file):
     print(f"处理完成！已生成新表格：{output_file}")
 
 if __name__ == "__main__":
-    process_gallery_data('data/gallery_info_no_name/gallery_info_chinese.csv', 'data/local_data/all.txt', 'data/gallery_info/gallery_info_chinese_full.csv')
+    process_gallery_data('data/gallery_info_no_name/JM_info_kemonomimi.csv', 'data/local_data/NH_all.txt', 'data/gallery_info/JM_info_kemonomimi_full.csv')
