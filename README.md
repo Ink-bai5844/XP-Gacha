@@ -1,8 +1,10 @@
 # XP-Gacha / 地下金库
 
-一个基于 `Streamlit` 的本地（正经）漫画库存管理、检索与推荐系统。
+争做最强大的本子推荐系统（误
 
-它把「在线抓取 / 本地链接整理 / CSV 清洗 / MySQL 入库 / 标题分词 / 标签语义聚合 / 向量语义检索 / LLM 问答」串成了一条完整流程，适合做个人向漫画资料库、XP 标签筛选器和本地图库浏览器。
+一个基于 `Streamlit` 的本地（正经？）漫画库存管理、检索与推荐系统。
+
+将「在线抓取 / 本地链接整理 / CSV 清洗 / MySQL 入库 / 标题分词 / 标签语义聚合 / 向量语义检索 / LLM 问答」串成了一条完整流程，搭建个人专属本子资料库、个人 XP 标签筛选器和线上&本地图库浏览器。
 
 当前实现明显偏向 Windows 本地环境使用：
 
@@ -15,33 +17,7 @@
 ![主界面1](UI-imgs/main-ui-1.png)
 ![主界面2](UI-imgs/main-ui-2.png)
 
-## 核心约定
-
-### `ID` 唯一标识
-
-当前项目已统一以 `ID` 作为唯一标识：
-
-- nhentai源(以下简称NH)：`NH123456`
-- 禁漫天堂源(以下简称JM)：`JM123456`
-
-应用者：
-
-- CSV 首列
-- MySQL 表 `gallery_info`
-- 数据库唯一索引
-- 向量库 `ids`
-- 语义检索命中
-- 缩略图文件名
-- Base64 缓存文件名
-- Streamlit 页面显示与本地打开逻辑
-
-### 缩略图命名规则
-
-- 在线缩略图：`onlineimgtmp/NH123456.jpg` 或 `onlineimgtmp/JM123456.png`
-- 本地缩略图：`localimgtmp/NH123456.jpg`
-- Base64 缓存：`b64_cache/NH123456.txt` 或 `b64_cache/JM123456.txt`
-
-## 功能概览
+## ✨ 功能概览
 
 - 基于MySQL数据库读取漫画元数据并缓存预处理结果
 - 按标签、作者、标题关键词进行动态推荐评分
@@ -75,7 +51,7 @@
 
 ![本地路径打开](UI-imgs/Functions-5.png)
 
-## 项目结构
+## 🗂️ 项目结构
 
 ```text
 XP-Gacha/
@@ -134,7 +110,7 @@ XP-Gacha/
 7. 页面中按照推荐评分、关键词、语义检索结果进行筛选和展示。
 8. 缩略图显示优先命中 Base64 缓存，其次在线图，最后本地图回退。
 
-## 运行环境
+## 💻 运行环境
 
 建议环境：
 
@@ -156,7 +132,7 @@ pip install -r requirements.txt
 pip install streamlit pandas sqlalchemy pymysql pillow janome sentence-transformers torch requests curl-cffi beautifulsoup4 cloudscraper tomli
 ```
 
-## 配置
+## ⚙️ 如何开始
 
 ### 1. 创建 `config.py`
 
@@ -197,7 +173,7 @@ database = "gallery_info"
 - `dictionaries/TITLE_SEMANTIC_MAP.json`
 - `config.py` 中指定的本地 embedding 模型目录
 
-### `dictionaries/` 目录说明
+### 📖 字典与 XP 语义聚合说明
 
 `dictionaries/` 里当前主要有 4 个文件：
 
@@ -274,7 +250,7 @@ database = "gallery_info"
 4. 统计聚合后的标题词频
 5. 用聚合后的标题词参与推荐评分
 
-### 修改词典后的影响
+### ⚠️ 修改词典后的影响
 
 如果你改了 `dictionaries/` 下的词典：
 
@@ -288,7 +264,7 @@ database = "gallery_info"
 - 改标签/标题评分逻辑：通常不需要重建向量库
 - 改数据库内容或想让语义检索语料同步：需要重跑 `data_processing/build_vector_db.py`
 
-## 启动应用
+## 🚀 启动应用
 
 本地版：
 
@@ -309,6 +285,32 @@ streamlit run app.py
 - 一键打开本地漫画目录
 - 偏好统计图表
 
+## 🔑 核心约定
+
+### `ID` 唯一标识
+
+当前项目已统一以 `ID` 作为唯一标识：
+
+- nhentai源(以下简称NH)：`NH123456`
+- 禁漫天堂源(以下简称JM)：`JM123456`
+
+应用者：
+
+- CSV 首列
+- MySQL 表 `gallery_info`
+- 数据库唯一索引
+- 向量库 `ids`
+- 语义检索命中
+- 缩略图文件名
+- Base64 缓存文件名
+- Streamlit 页面显示与本地打开逻辑
+
+### 🖼️ 缩略图命名规则
+
+- 在线缩略图：`onlineimgtmp/NH123456.jpg` 或 `onlineimgtmp/JM123456.png`
+- 本地缩略图：`localimgtmp/NH123456.jpg`
+- Base64 缓存：`b64_cache/NH123456.txt` 或 `b64_cache/JM123456.txt`
+
 ## 缩略图显示机制
 
 `app.py` 当前只对当前分页的数据懒加载封面。
@@ -323,7 +325,7 @@ streamlit run app.py
 
 即，Base64 缓存是第一优先级，在线图是第二优先级，本地图是最后回退。
 
-## 数据准备与维护
+## 🛠️ 数据准备与维护
 
 注：均需按照自己想法修改相应代码中的参数【链接/保存名称/最大循环页数/读取错误报告名称】
 
@@ -430,7 +432,7 @@ python data_processing/b64_pre_encode.py
 
 并为 `ID.*` 图片生成对应的增量 Base64 文本缓存到 `b64_tmp` 文件夹下，检查无误后需手动拷贝至 `b64_cache` 文件夹下。
 
-## 推荐评分逻辑
+## 🧮 推荐评分逻辑
 
 推荐分当前由三部分组成：
 
@@ -462,7 +464,7 @@ python data_processing/b64_pre_encode.py
 
 数据库内容或字典文件变化后，应用会自动根据哈希重新生成预处理缓存。
 
-## 注意事项
+## ⚠️ 注意事项
 
 - 当前实现对 Windows 更友好，尤其是“打开本地文件夹”功能。
 - `BASE_DIR`、模型路径等默认值是本机路径，换机器必须修改。
@@ -477,6 +479,6 @@ python data_processing/build_vector_db.py
 
 - 在线抓取脚本默认代理地址写死为 `127.0.0.1:7890`，需要按实际网络环境调整。
 
-## 适合谁用
+## 💡 适合谁用
 
-如果你想要一个个人化、可解释、可调权重、支持本地浏览、语义检索和 LLM 问答的漫画库存系统，这个项目非常适合你。
+如果你想要一个高度个人化、可解释、XP 可量化调节、支持本地浏览、语义检索和 LLM 问答的绅士漫画库存检索系统，这个项目非常适合你。
