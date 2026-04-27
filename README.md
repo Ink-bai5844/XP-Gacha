@@ -318,13 +318,13 @@ streamlit run app.py
 - Base64 缓存文件名
 - Streamlit 页面显示与本地打开逻辑
 
-### 🖼️ 缩略图命名规则
+### 缩略图命名规则
 
 - 在线缩略图：`onlineimgtmp/NH123456.jpg` 或 `onlineimgtmp/JM123456.png`
 - 本地缩略图：`localimgtmp/NH123456.jpg`
 - Base64 缓存：`b64_cache/NH123456.txt` 或 `b64_cache/JM123456.txt`
 
-## 缩略图显示机制
+## 🖼️ 缩略图显示机制
 
 `app.py` 当前只对当前分页的数据懒加载封面。
 
