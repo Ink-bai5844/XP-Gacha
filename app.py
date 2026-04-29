@@ -205,7 +205,11 @@ if vector_search_kw and not filtered_df.empty:
                 sub_ids = [corpus_ids[i] for i in valid_indices]
 
                 query_embedding = embed_model.encode([vector_search_kw], convert_to_tensor=True)
-                sub_embeddings = sub_embeddings.to(query_embedding.device)
+                if query_embedding.device.type == "cpu":
+                    query_embedding = query_embedding.float()
+                    sub_embeddings = sub_embeddings.to(query_embedding.device, dtype=query_embedding.dtype)
+                else:
+                    sub_embeddings = sub_embeddings.to(query_embedding.device, dtype=query_embedding.dtype)
 
                 cos_scores = util.cos_sim(query_embedding, sub_embeddings)[0]
                 top_k = min(SEMANTIC_SEARCH_TOP_K, len(sub_ids))
