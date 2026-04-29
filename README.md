@@ -28,7 +28,7 @@
 - 支持展示封面缩略图、来源链接和本地目录
 - 支持在界面中直接打开本地漫画文件夹
 - 支持将当前筛选结果注入给 LLM 做RAG增强检索问答
-- 支持 `NH` / `JM` 双源抓取、修复抓取和本地链接补抓
+- 支持 nhentai源(以下简称`NH`) / 禁漫天堂源(以下简称`JM`) 双源抓取、修复抓取和本地链接补抓
 - 支持全量导库、增量导库、向量库重建与封面 Base64 预编码
 
 ### 检索排序
@@ -176,7 +176,52 @@ port = 3306
 database = "gallery_info"
 ```
 
-### 3. 准备字典与模型资源
+### 3. 自定义主题色
+
+项目使用 `Streamlit` 的项目级主题配置文件：
+
+- `.streamlit/config.toml`
+
+当前仓库已经内置了一套浅色和深色主题，你可以直接修改里面的颜色值：
+
+```toml
+[theme]
+primaryColor = "#755bbb"
+
+[theme.light]
+backgroundColor = "#FFFDF8"
+secondaryBackgroundColor = "#F3EEE7"
+textColor = "#1F1F1F"
+borderColor = "#D9D1C7"
+
+[theme.dark]
+backgroundColor = "#121714"
+secondaryBackgroundColor = "#1D2520"
+textColor = "#EAF2EC"
+borderColor = "#334039"
+```
+
+各字段含义：
+
+- `primaryColor`：主强调色，影响按钮、链接、高亮控件等
+- `backgroundColor`：页面主背景色
+- `secondaryBackgroundColor`：侧边栏、输入框、面板等区域背景色
+- `textColor`：主要文字颜色
+- `borderColor`：边框颜色
+
+使用方式：
+
+1. 打开 `.streamlit/config.toml`
+2. 修改浅色或深色主题下对应的颜色值
+3. 保存文件
+4. 刷新页面；如果没有立即生效，重启 `streamlit run app.py`
+
+深浅色模式切换：
+
+- 应用右上角 `⋮` -> `Settings`
+- 在 `Theme` 中切换 `Light` / `Dark`
+
+### 4. 准备字典与模型资源
 
 默认会读取：
 
@@ -304,8 +349,8 @@ streamlit run app.py
 
 当前项目已统一以 `ID` 作为唯一标识：
 
-- nhentai源(以下简称NH)：`NH123456`
-- 禁漫天堂源(以下简称JM)：`JM123456`
+- NH源：`NH123456`
+- JM源：`JM123456`
 
 应用者：
 

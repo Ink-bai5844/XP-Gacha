@@ -9,6 +9,7 @@ from collections import Counter
 from sqlalchemy import create_engine, text
 from config import CACHE_DIR, STOP_TAGS, SEMANTIC_MAP
 from utils_core import get_local_folders, match_local_folder
+from utils_charts import build_preference_chart_cache
 from utils_nlp import extract_and_map_title_words
 
 @st.cache_resource
@@ -28,6 +29,24 @@ def init_db_engine():
         st.stop()
 
 engine = init_db_engine()
+
+
+def build_empty_base_data():
+    empty_tag_frequencies = Counter()
+    empty_artist_frequencies = Counter()
+    empty_title_word_frequencies = Counter()
+    chart_cache = build_preference_chart_cache(
+        empty_tag_frequencies,
+        empty_artist_frequencies,
+        empty_title_word_frequencies,
+    )
+    return (
+        None,
+        empty_tag_frequencies,
+        empty_artist_frequencies,
+        empty_title_word_frequencies,
+        chart_cache,
+    )
 
 def get_data_hash():
     hasher = hashlib.md5()
@@ -64,17 +83,18 @@ def load_base_data():
         if saved_hash == current_hash:
             print("触发文件级缓存，跳过计算！")
             with open(cache_data_file, 'rb') as f:
-                return pickle.load(f)
+                cached_payload = pickle.load(f)
+            return normalize_cached_base_data(cached_payload, cache_data_file)
 
     print("缓存失效，执行数据库全量读取与自然语言处理...")
     try:
         df = pd.read_sql("SELECT * FROM gallery_info", con=engine)
     except Exception as e:
         print(f"数据库读取失败: {e}")
-        return None, Counter(), Counter(), Counter()
+        return build_empty_base_data()
 
     if df.empty:
-        return None, Counter(), Counter(), Counter()
+        return build_empty_base_data()
 
     df = df.fillna('')
     folder_map = get_local_folders()
@@ -105,8 +125,19 @@ def load_base_data():
     tag_frequencies = Counter(all_tags)
     artist_frequencies = Counter([str(a).strip() for a in df.get('作者', []) if str(a).strip()])
     title_word_frequencies = Counter(all_title_words)
+    chart_cache = build_preference_chart_cache(
+        tag_frequencies,
+        artist_frequencies,
+        title_word_frequencies,
+    )
 
-    result_tuple = (df, tag_frequencies, artist_frequencies, title_word_frequencies)
+    result_tuple = (
+        df,
+        tag_frequencies,
+        artist_frequencies,
+        title_word_frequencies,
+        chart_cache,
+    )
 
     with open(cache_data_file, 'wb') as f:
         pickle.dump(result_tuple, f)
@@ -118,6 +149,31 @@ def load_base_data():
     gc.collect()
 
     return result_tuple
+
+
+def normalize_cached_base_data(cached_payload, cache_data_file):
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 5:
+        return cached_payload
+
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 4:
+        df, tag_frequencies, artist_frequencies, title_word_frequencies = cached_payload
+        chart_cache = build_preference_chart_cache(
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+        )
+        normalized_payload = (
+            df,
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+            chart_cache,
+        )
+        with open(cache_data_file, 'wb') as f:
+            pickle.dump(normalized_payload, f)
+        return normalized_payload
+
+    raise ValueError("预处理缓存文件格式无法识别，请删除 datacache 后重试。")
 
 def apply_dynamic_scores(df, tag_weights, artist_weights, title_weights, tag_freq, artist_freq, title_word_freq, global_tag_w, global_artist_w, global_title_w):
     def calculate_score(row):

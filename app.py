@@ -7,6 +7,7 @@ import streamlit as st
 
 from config import INITIAL_TAG_WEIGHTS, MAX_DISPLAY
 from data_pipeline import load_base_data, apply_dynamic_scores
+from utils_charts import render_global_preference_charts
 from utils_core import get_cover_base64
 from utils_nlp import load_semantic_engine
 from utils_chat import render_chat_interface
@@ -36,7 +37,7 @@ def build_vector_search_signature(query, candidate_ids):
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 with st.spinner('正在同步预处理缓存与计算引擎...'):
-    df_base, tag_freq, artist_freq, title_word_freq = load_base_data()
+    df_base, tag_freq, artist_freq, title_word_freq, preference_chart_cache = load_base_data()
 
 # 侧边栏
 st.sidebar.title("筛选与偏好设置")
@@ -189,6 +190,7 @@ col3.metric("总标签种类", f"{len(tag_freq)} 种")
 col4.metric("解析标题词汇数", f"{len(title_word_freq)} 种")
 
 st.subheader("库存列表")
+current_page_opener_df = pd.DataFrame()
 
 if not filtered_df.empty:
     sort_columns = ['推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录']
@@ -226,6 +228,7 @@ if not filtered_df.empty:
     slice_end = (selected_page_index + 1) * MAX_DISPLAY
     
     display_df = filtered_df.iloc[slice_start:slice_end].copy()
+    current_page_opener_df = display_df[['ID', '标题', '本地目录']].copy()
 
     with st.spinner(f'正在加载 {selected_page_label} 范围的缩略图...'):
         display_df['封面'] = display_df.apply(
@@ -302,7 +305,7 @@ def render_local_opener(filtered_df):
         
         col_btn, col_path = st.columns([1, 4])
         with col_btn:
-            if st.button("打开本地文件夹", use_container_width=True):
+            if st.button("打开本地文件夹", width="stretch"):
                 if selected_path != "本地目录不存在" and os.path.exists(selected_path):
                     os.startfile(selected_path)
                     st.toast(f"已成功开启: {selected_path}", icon="✅")
@@ -314,47 +317,6 @@ def render_local_opener(filtered_df):
         st.warning("当前筛选条件下没有匹配的漫画。")
 
 # 执行局部渲染函数
-render_local_opener(filtered_df)
+render_local_opener(current_page_opener_df)
 
-st.markdown("---")
-st.subheader("全局偏好数据")
-chart_col1, chart_col2, chart_col3 = st.columns(3)
-
-with chart_col1:
-    st.write("**Top 15 XP 标签分布**")
-    top_tags = tag_freq.most_common(15)
-    if top_tags:
-        tag_chart_df = pd.DataFrame(top_tags, columns=['标签', '频次']).set_index('标签')
-        st.bar_chart(tag_chart_df)
-        
-    with st.expander("🔍 查看 Top 150 XP 标签"):
-        top_150_tags = tag_freq.most_common(150)
-        if top_150_tags:
-            top_150_tags_df = pd.DataFrame(top_150_tags, columns=['XP 标签', '出现频次'])
-            st.dataframe(top_150_tags_df, hide_index=True, width="stretch")
-
-with chart_col2:
-    st.write("**Top 15 核心作者分布**")
-    top_artists = artist_freq.most_common(15)
-    if top_artists:
-        artist_chart_df = pd.DataFrame(top_artists, columns=['作者', '频次']).set_index('作者')
-        st.bar_chart(artist_chart_df)
-        
-    with st.expander("🔍 查看 Top 150 核心作者"):
-        top_150_artists = artist_freq.most_common(150)
-        if top_150_artists:
-            top_150_artists_df = pd.DataFrame(top_150_artists, columns=['作者名', '收录册数'])
-            st.dataframe(top_150_artists_df, hide_index=True, width="stretch")
-
-with chart_col3:
-    st.write("**Top 15 标题高频词汇**")
-    top_words = title_word_freq.most_common(15)
-    if top_words:
-        word_chart_df = pd.DataFrame(top_words, columns=['词汇', '频次']).set_index('词汇')
-        st.bar_chart(word_chart_df)
-        
-    with st.expander("🔍 查看 Top 150 标题高频词汇"):
-        top_150_words = title_word_freq.most_common(150)
-        if top_150_words:
-            top_150_df = pd.DataFrame(top_150_words, columns=['特征词汇', '出现频次'])
-            st.dataframe(top_150_df, hide_index=True, width="stretch")
+render_global_preference_charts(preference_chart_cache)
