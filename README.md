@@ -59,6 +59,16 @@
 - 作者分：基于作者出现频次和作者偏好倍率
 - 标题分：基于标题分词后的高频词和词权重
 
+当前实现为了减少大数据量下的权重拖动延迟，已经将评分链路改为“预处理阶段编码，交互阶段批量计算”：
+
+- 预处理缓存中会额外保存标签稀疏矩阵、标题词稀疏矩阵、作者索引编码、每行标签数/标题词数等评分缓存
+- 运行时会把用户侧边栏输入的动态权重字典转成权重向量
+- 标签分与标题分通过稀疏矩阵乘法批量计算
+- 作者分通过作者索引数组直接查表计算
+- 最终仍保持和原先逐行评分一致的公式口径与整数结果
+
+也就是说，当前 `apply_dynamic_scores()` 已不再逐行 `DataFrame.apply(axis=1)` 评分，而是基于 `numpy + scipy.sparse.csr_matrix` 批量完成整列推荐分计算。
+
 默认展示排序为：
 
 - `推荐评分` 降序
@@ -72,10 +82,12 @@ XP-Gacha/
 ├─ config_empty.py                         # 配置模板
 ├─ config.py                               # 本地实际配置
 ├─ data_pipeline.py                        # 数据读取、缓存、标签/标题处理、动态评分
+├─ utils_charts.py                         # 偏好图表缓存与渲染
 ├─ utils_core.py                           # 本地目录匹配、封面缩略图与 Base64 缓存
 ├─ utils_nlp.py                            # 标题分词、语义检索模型加载
 ├─ utils_chat.py                           # LLM 对话与流式输出
 ├─ .streamlit/
+│  ├─ config.toml                          # Streamlit 主题配置
 │  └─ secrets.toml                         # MySQL 密钥配置
 ├─ dictionaries/                           # 停用词、语义映射等字典资源
 ├─ data/
@@ -142,7 +154,7 @@ pip install -r requirements.txt
 如果你手动装包，至少需要：
 
 ```bash
-pip install streamlit pandas sqlalchemy pymysql pillow janome sentence-transformers torch requests curl-cffi beautifulsoup4 cloudscraper tomli
+pip install streamlit pandas numpy scipy sqlalchemy pymysql pillow janome sentence-transformers torch requests curl-cffi beautifulsoup4 cloudscraper tomli
 ```
 
 ## ⚙️ 如何开始
@@ -497,7 +509,17 @@ python data_processing/b64_pre_encode.py
 项目当前主要有这几类缓存：
 
 - `datacache/`
-  预处理后的 DataFrame 缓存
+  预处理后的主缓存。
+  当前默认会把以下内容一起写入 `preprocessed_df.pkl`：
+  - 预处理后的主 DataFrame
+  - 标签 / 作者 / 标题词频次统计
+  - 偏好排序图表所需的 Top 15 / Top 150 统计缓存
+  - 动态评分所需的预编码评分缓存
+  评分缓存当前包括：
+  - 标签稀疏矩阵
+  - 标题词稀疏矩阵
+  - 作者索引编码
+  - 每行标签数 / 标题词数对应的归一化因子
 - `onlineimgtmp/`
   在线抓取到的缩略图
 - `localimgtmp/`
@@ -510,6 +532,7 @@ python data_processing/b64_pre_encode.py
   语义向量缓存
 
 数据库内容或字典文件变化后，应用会自动根据哈希重新生成预处理缓存。
+如果只是代码升级导致缓存结构扩展，而底层数据未变化，应用会优先尝试基于旧缓存自动补齐新版缓存结构，而不一定重新全量读取数据库。
 
 ## ⚠️ 注意事项
 

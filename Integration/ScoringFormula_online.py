@@ -5,10 +5,13 @@ import hashlib
 import math
 import pickle
 import gc
+import numpy as np
 import streamlit as st
 import pandas as pd
+import altair as alt
 from collections import Counter
 from janome.tokenizer import Tokenizer
+from scipy.sparse import csr_matrix
 from sqlalchemy import create_engine, text
 
 st.set_page_config(page_title="地下金库(Online)", layout="wide")
@@ -177,6 +180,248 @@ def get_data_hash():
             
     return hasher.hexdigest()
 
+
+def build_preference_chart_cache(tag_freq, artist_freq, title_word_freq):
+    return {
+        "tags": {
+            "title": "Top 15 XP 标签分布",
+            "top_15": tag_freq.most_common(15),
+            "top_150": tag_freq.most_common(150),
+            "label_col": "标签",
+            "value_col": "频次",
+            "table_label_col": "XP 标签",
+            "table_value_col": "出现频次",
+            "expander_label": "🔍 查看 Top 150 XP 标签",
+        },
+        "artists": {
+            "title": "Top 15 核心作者分布",
+            "top_15": artist_freq.most_common(15),
+            "top_150": artist_freq.most_common(150),
+            "label_col": "作者",
+            "value_col": "频次",
+            "table_label_col": "作者名",
+            "table_value_col": "收录册数",
+            "expander_label": "🔍 查看 Top 150 核心作者",
+        },
+        "title_words": {
+            "title": "Top 15 标题高频词汇",
+            "top_15": title_word_freq.most_common(15),
+            "top_150": title_word_freq.most_common(150),
+            "label_col": "词汇",
+            "value_col": "频次",
+            "table_label_col": "特征词汇",
+            "table_value_col": "出现频次",
+            "expander_label": "🔍 查看 Top 150 标题高频词汇",
+        },
+    }
+
+
+def build_empty_base_data():
+    empty_tag_frequencies = Counter()
+    empty_artist_frequencies = Counter()
+    empty_title_word_frequencies = Counter()
+    chart_cache = build_preference_chart_cache(
+        empty_tag_frequencies,
+        empty_artist_frequencies,
+        empty_title_word_frequencies,
+    )
+    return None, empty_tag_frequencies, empty_artist_frequencies, empty_title_word_frequencies, chart_cache, None
+
+
+def build_multi_value_feature_cache(parsed_items_list, frequency_counter):
+    feature_names = sorted(frequency_counter.keys())
+    feature_index_map = {name: idx for idx, name in enumerate(feature_names)}
+    row_count = len(parsed_items_list)
+    row_indices = []
+    col_indices = []
+    values = []
+    row_lengths = np.zeros(row_count, dtype=np.float32)
+
+    for row_idx, items in enumerate(parsed_items_list):
+        row_lengths[row_idx] = float(len(items))
+        if not items:
+            continue
+
+        item_counter = Counter(items)
+        for item_name, item_count in item_counter.items():
+            feature_idx = feature_index_map.get(item_name)
+            if feature_idx is None:
+                continue
+            row_indices.append(row_idx)
+            col_indices.append(feature_idx)
+            values.append(float(item_count))
+
+    feature_matrix = csr_matrix(
+        (values, (row_indices, col_indices)),
+        shape=(row_count, len(feature_names)),
+        dtype=np.float32,
+    )
+
+    return {
+        "names": feature_names,
+        "index_map": feature_index_map,
+        "base_scores": np.array(
+            [math.log1p(frequency_counter[name]) * 10.0 for name in feature_names],
+            dtype=np.float32,
+        ),
+        "matrix": feature_matrix,
+        "row_norms": np.sqrt(np.maximum(row_lengths, 1.0)).astype(np.float32),
+    }
+
+
+def build_artist_feature_cache(df, artist_frequencies):
+    artist_names = sorted(artist_frequencies.keys())
+    artist_index_map = {name: idx for idx, name in enumerate(artist_names)}
+    artist_codes = np.full(len(df), -1, dtype=np.int32)
+    artists_series = (
+        df['作者'].astype(str).str.strip()
+        if '作者' in df.columns
+        else pd.Series([''] * len(df), index=df.index, dtype='object')
+    )
+
+    for row_idx, artist_name in enumerate(artists_series):
+        if artist_name:
+            artist_codes[row_idx] = artist_index_map.get(artist_name, -1)
+
+    return {
+        "names": artist_names,
+        "index_map": artist_index_map,
+        "base_scores": np.array(
+            [math.log1p(artist_frequencies[name]) * 10.0 for name in artist_names],
+            dtype=np.float32,
+        ),
+        "codes": artist_codes,
+    }
+
+
+def build_score_cache(df, tag_frequencies, artist_frequencies, title_word_frequencies):
+    parsed_tags_list = df['解析后标签'].tolist() if '解析后标签' in df.columns else [[] for _ in range(len(df))]
+    parsed_title_words_list = df['标题特征词'].tolist() if '标题特征词' in df.columns else [[] for _ in range(len(df))]
+
+    return {
+        "tags": build_multi_value_feature_cache(parsed_tags_list, tag_frequencies),
+        "artists": build_artist_feature_cache(df, artist_frequencies),
+        "title_words": build_multi_value_feature_cache(parsed_title_words_list, title_word_frequencies),
+    }
+
+
+def render_ranked_bar_chart(items, label_col, value_col):
+    if not items:
+        return
+
+    chart_df = pd.DataFrame(items, columns=[label_col, value_col])
+    chart_df["排序标签"] = chart_df[label_col]
+
+    chart = (
+        alt.Chart(chart_df)
+        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+        .encode(
+            x=alt.X(
+                f"{label_col}:N",
+                sort=chart_df["排序标签"].tolist(),
+                axis=alt.Axis(
+                    labelAngle=-45,
+                    labelLimit=0,
+                    labelOverlap=False,
+                    labelFontSize=11,
+                    title=None,
+                ),
+            ),
+            y=alt.Y(f"{value_col}:Q", title=None),
+            tooltip=[
+                alt.Tooltip(f"{label_col}:N", title=label_col),
+                alt.Tooltip(f"{value_col}:Q", title=value_col),
+            ],
+        )
+        .properties(height=280)
+    )
+
+    st.altair_chart(chart, width="stretch")
+
+
+def render_preference_chart_block(chart_meta):
+    st.write(f"**{chart_meta['title']}**")
+    render_ranked_bar_chart(
+        chart_meta["top_15"],
+        chart_meta["label_col"],
+        chart_meta["value_col"],
+    )
+
+    with st.expander(chart_meta["expander_label"]):
+        top_150_items = chart_meta["top_150"]
+        if top_150_items:
+            top_150_df = pd.DataFrame(
+                top_150_items,
+                columns=[chart_meta["table_label_col"], chart_meta["table_value_col"]],
+            )
+            st.dataframe(top_150_df, hide_index=True, width="stretch")
+
+
+def render_global_preference_charts(chart_cache):
+    st.markdown("---")
+    st.subheader("全局偏好数据")
+    chart_col1, chart_col2, chart_col3 = st.columns(3)
+
+    with chart_col1:
+        render_preference_chart_block(chart_cache["tags"])
+
+    with chart_col2:
+        render_preference_chart_block(chart_cache["artists"])
+
+    with chart_col3:
+        render_preference_chart_block(chart_cache["title_words"])
+
+
+def normalize_cached_base_data(cached_payload, cache_data_file):
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 6:
+        return cached_payload
+
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 5:
+        df, tag_frequencies, artist_frequencies, title_word_frequencies, score_cache = cached_payload
+        chart_cache = build_preference_chart_cache(
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+        )
+        normalized_payload = (
+            df,
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+            chart_cache,
+            score_cache,
+        )
+        with open(cache_data_file, 'wb') as f:
+            pickle.dump(normalized_payload, f)
+        return normalized_payload
+
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 4:
+        df, tag_frequencies, artist_frequencies, title_word_frequencies = cached_payload
+        chart_cache = build_preference_chart_cache(
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+        )
+        score_cache = build_score_cache(
+            df,
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+        )
+        normalized_payload = (
+            df,
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+            chart_cache,
+            score_cache,
+        )
+        with open(cache_data_file, 'wb') as f:
+            pickle.dump(normalized_payload, f)
+        return normalized_payload
+
+    raise ValueError("服务器预处理缓存文件格式无法识别，请删除 datacache 后重试。")
+
 @st.cache_data(max_entries=1, show_spinner=False)
 def load_base_data():
     current_hash = get_data_hash()
@@ -190,7 +435,8 @@ def load_base_data():
         if saved_hash == current_hash:
             print("触发服务器级文件缓存，跳过计算！")
             with open(cache_data_file, 'rb') as f:
-                return pickle.load(f)
+                cached_payload = pickle.load(f)
+            return normalize_cached_base_data(cached_payload, cache_data_file)
 
     print("缓存失效或无缓存，执行数据库全量拉取与自然语言处理...")
     
@@ -199,10 +445,10 @@ def load_base_data():
         df = pd.read_sql("SELECT * FROM gallery_info", con=engine)
     except Exception as e:
         print(f"数据库读取失败: {e}")
-        return None, Counter(), Counter(), Counter()
+        return build_empty_base_data()
 
     if df.empty:
-        return None, Counter(), Counter(), Counter()
+        return build_empty_base_data()
 
     df = df.fillna('')
     # 修复可能存在的无标题情况
@@ -234,8 +480,19 @@ def load_base_data():
     tag_frequencies = Counter(all_tags)
     artist_frequencies = Counter([str(a).strip() for a in df.get('作者', []) if str(a).strip()])
     title_word_frequencies = Counter(all_title_words)
+    chart_cache = build_preference_chart_cache(
+        tag_frequencies,
+        artist_frequencies,
+        title_word_frequencies,
+    )
+    score_cache = build_score_cache(
+        df,
+        tag_frequencies,
+        artist_frequencies,
+        title_word_frequencies,
+    )
 
-    result_tuple = (df, tag_frequencies, artist_frequencies, title_word_frequencies)
+    result_tuple = (df, tag_frequencies, artist_frequencies, title_word_frequencies, chart_cache, score_cache)
 
     # 序列化保存结果
     with open(cache_data_file, 'wb') as f:
@@ -251,7 +508,7 @@ def load_base_data():
     return result_tuple
 
 with st.spinner('正在同步预处理缓存与计算引擎...'):
-    df_base, tag_freq, artist_freq, title_word_freq = load_base_data()
+    df_base, tag_freq, artist_freq, title_word_freq, preference_chart_cache, score_cache = load_base_data()
 
 # 侧边栏
 st.sidebar.title("筛选与偏好设置")
@@ -301,35 +558,50 @@ with st.sidebar.expander("标题关键词权重配置", expanded=False):
         val = st.number_input(f"词汇「{w}」权重", value=1.0, step=0.1, format="%.1f")
         dynamic_title_weights[w] = val
 
-def apply_dynamic_scores(df, tag_weights, artist_weights, title_weights, tag_freq, artist_freq, title_word_freq, global_tag_w, global_artist_w, global_title_w):
-    def calculate_score(row):
-        score = 0.0
-        tags = row['解析后标签']
-        if tags:
-            tag_score_sum = sum(math.log1p(tag_freq.get(t, 0)) * 10 * tag_weights.get(t, 1.0) for t in tags)
-            base_tag_score = tag_score_sum / math.sqrt(len(tags))
-            score += base_tag_score * global_tag_w * 0.5
+def build_weight_vector(feature_cache, dynamic_weights, default_value):
+    weight_vector = np.full(len(feature_cache["names"]), default_value, dtype=np.float32)
+    for feature_name, feature_weight in dynamic_weights.items():
+        feature_idx = feature_cache["index_map"].get(feature_name)
+        if feature_idx is not None:
+            weight_vector[feature_idx] = float(feature_weight)
+    return weight_vector
 
-        artist = row['作者'].strip()
-        if artist:
-            multiplier = artist_weights.get(artist, 5.0)
-            base_artist_score = math.log1p(artist_freq.get(artist, 0)) * 10 * multiplier
-            score += base_artist_score * global_artist_w 
-            
-        title_words = row.get('标题特征词', [])
-        if title_words:
-            title_score_sum = sum(
-                math.log1p(title_word_freq.get(w, 0)) * 10 * title_weights.get(w, 1.0)
-                for w in title_words
+
+def apply_dynamic_scores(df, tag_weights, artist_weights, title_weights, tag_freq, artist_freq, title_word_freq, global_tag_w, global_artist_w, global_title_w, score_cache=None):
+    if score_cache is None:
+        score_cache = build_score_cache(df, tag_freq, artist_freq, title_word_freq)
+
+    total_scores = np.zeros(len(df), dtype=np.float32)
+
+    tag_cache = score_cache["tags"]
+    if tag_cache["names"]:
+        tag_weight_vector = build_weight_vector(tag_cache, tag_weights, 1.0)
+        tag_effective_scores = tag_cache["base_scores"] * tag_weight_vector
+        tag_score_sum = np.asarray(tag_cache["matrix"].dot(tag_effective_scores)).reshape(-1)
+        total_scores += (tag_score_sum / tag_cache["row_norms"]) * float(global_tag_w) * 0.5
+
+    artist_cache = score_cache["artists"]
+    if artist_cache["names"]:
+        artist_weight_vector = build_weight_vector(artist_cache, artist_weights, 5.0)
+        valid_artist_mask = artist_cache["codes"] >= 0
+        if valid_artist_mask.any():
+            artist_codes = artist_cache["codes"][valid_artist_mask]
+            artist_scores = (
+                artist_cache["base_scores"][artist_codes]
+                * artist_weight_vector[artist_codes]
+                * float(global_artist_w)
             )
-            title_dilution = max(1, math.sqrt(len(title_words)))
-            base_title_score = (title_score_sum / title_dilution)
-            score += base_title_score * global_title_w 
-            
-        return int(score)
+            total_scores[valid_artist_mask] += artist_scores
+
+    title_cache = score_cache["title_words"]
+    if title_cache["names"]:
+        title_weight_vector = build_weight_vector(title_cache, title_weights, 1.0)
+        title_effective_scores = title_cache["base_scores"] * title_weight_vector
+        title_score_sum = np.asarray(title_cache["matrix"].dot(title_effective_scores)).reshape(-1)
+        total_scores += (title_score_sum / title_cache["row_norms"]) * float(global_title_w)
 
     scored_df = df.copy()
-    scored_df['推荐评分'] = scored_df.apply(calculate_score, axis=1)
+    scored_df['推荐评分'] = total_scores.astype(np.int32)
     
     columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '链接', '文件名', '解析后标签', '标题特征词']
     if '上传日期' not in scored_df.columns:
@@ -350,7 +622,8 @@ final_df = apply_dynamic_scores(
     title_word_freq,
     global_tag_weight,
     global_artist_weight,
-    global_title_weight
+    global_title_weight,
+    score_cache=score_cache
 )
 
 if blocked_tags:
@@ -481,46 +754,4 @@ if not filtered_df.empty:
 else:
     st.info("没有可以显示的数据喔。")
 
-st.markdown("---")
-
-st.subheader("全局偏好数据")
-chart_col1, chart_col2, chart_col3 = st.columns(3)
-
-with chart_col1:
-    st.write("**Top 15 XP 标签分布**")
-    top_tags = tag_freq.most_common(15)
-    if top_tags:
-        tag_chart_df = pd.DataFrame(top_tags, columns=['标签', '频次']).set_index('标签')
-        st.bar_chart(tag_chart_df)
-        
-    with st.expander("🔍 查看 Top 150 XP 标签"):
-        top_150_tags = tag_freq.most_common(150)
-        if top_150_tags:
-            top_150_tags_df = pd.DataFrame(top_150_tags, columns=['XP 标签', '出现频次'])
-            st.dataframe(top_150_tags_df, hide_index=True, use_container_width=True)
-
-with chart_col2:
-    st.write("**Top 15 核心作者分布**")
-    top_artists = artist_freq.most_common(15)
-    if top_artists:
-        artist_chart_df = pd.DataFrame(top_artists, columns=['作者', '频次']).set_index('作者')
-        st.bar_chart(artist_chart_df)
-        
-    with st.expander("🔍 查看 Top 150 核心作者"):
-        top_150_artists = artist_freq.most_common(150)
-        if top_150_artists:
-            top_150_artists_df = pd.DataFrame(top_150_artists, columns=['作者名', '收录册数'])
-            st.dataframe(top_150_artists_df, hide_index=True, use_container_width=True)
-
-with chart_col3:
-    st.write("**Top 15 标题高频词汇**")
-    top_words = title_word_freq.most_common(15)
-    if top_words:
-        word_chart_df = pd.DataFrame(top_words, columns=['词汇', '频次']).set_index('词汇')
-        st.bar_chart(word_chart_df)
-        
-    with st.expander("🔍 查看 Top 150 标题高频词汇"):
-        top_150_words = title_word_freq.most_common(150)
-        if top_150_words:
-            top_150_df = pd.DataFrame(top_150_words, columns=['特征词汇', '出现频次'])
-            st.dataframe(top_150_df, hide_index=True, use_container_width=True)
+render_global_preference_charts(preference_chart_cache)

@@ -3,9 +3,11 @@ import math
 import hashlib
 import pickle
 import gc
+import numpy as np
 import pandas as pd
 import streamlit as st
 from collections import Counter
+from scipy.sparse import csr_matrix
 from sqlalchemy import create_engine, text
 from config import CACHE_DIR, STOP_TAGS, SEMANTIC_MAP
 from utils_core import get_local_folders, match_local_folder
@@ -46,7 +48,85 @@ def build_empty_base_data():
         empty_artist_frequencies,
         empty_title_word_frequencies,
         chart_cache,
+        None,
     )
+
+
+def build_multi_value_feature_cache(parsed_items_list, frequency_counter):
+    feature_names = sorted(frequency_counter.keys())
+    feature_index_map = {name: idx for idx, name in enumerate(feature_names)}
+    row_count = len(parsed_items_list)
+    row_indices = []
+    col_indices = []
+    values = []
+    row_lengths = np.zeros(row_count, dtype=np.float32)
+
+    for row_idx, items in enumerate(parsed_items_list):
+        row_lengths[row_idx] = float(len(items))
+        if not items:
+            continue
+
+        item_counter = Counter(items)
+        for item_name, item_count in item_counter.items():
+            feature_idx = feature_index_map.get(item_name)
+            if feature_idx is None:
+                continue
+            row_indices.append(row_idx)
+            col_indices.append(feature_idx)
+            values.append(float(item_count))
+
+    feature_matrix = csr_matrix(
+        (values, (row_indices, col_indices)),
+        shape=(row_count, len(feature_names)),
+        dtype=np.float32,
+    )
+
+    return {
+        "names": feature_names,
+        "index_map": feature_index_map,
+        "base_scores": np.array(
+            [math.log1p(frequency_counter[name]) * 10.0 for name in feature_names],
+            dtype=np.float32,
+        ),
+        "matrix": feature_matrix,
+        "row_norms": np.sqrt(np.maximum(row_lengths, 1.0)).astype(np.float32),
+    }
+
+
+def build_artist_feature_cache(df, artist_frequencies):
+    artist_names = sorted(artist_frequencies.keys())
+    artist_index_map = {name: idx for idx, name in enumerate(artist_names)}
+    artist_codes = np.full(len(df), -1, dtype=np.int32)
+    artists_series = (
+        df['作者'].astype(str).str.strip()
+        if '作者' in df.columns
+        else pd.Series([''] * len(df), index=df.index, dtype='object')
+    )
+
+    for row_idx, artist_name in enumerate(artists_series):
+        if artist_name:
+            artist_codes[row_idx] = artist_index_map.get(artist_name, -1)
+
+    return {
+        "names": artist_names,
+        "index_map": artist_index_map,
+        "base_scores": np.array(
+            [math.log1p(artist_frequencies[name]) * 10.0 for name in artist_names],
+            dtype=np.float32,
+        ),
+        "codes": artist_codes,
+    }
+
+
+def build_score_cache(df, tag_frequencies, artist_frequencies, title_word_frequencies):
+    parsed_tags_list = df['解析后标签'].tolist() if '解析后标签' in df.columns else [[] for _ in range(len(df))]
+    parsed_title_words_list = df['标题特征词'].tolist() if '标题特征词' in df.columns else [[] for _ in range(len(df))]
+
+    return {
+        "tags": build_multi_value_feature_cache(parsed_tags_list, tag_frequencies),
+        "artists": build_artist_feature_cache(df, artist_frequencies),
+        "title_words": build_multi_value_feature_cache(parsed_title_words_list, title_word_frequencies),
+    }
 
 def get_data_hash():
     hasher = hashlib.md5()
@@ -130,6 +210,12 @@ def load_base_data():
         artist_frequencies,
         title_word_frequencies,
     )
+    score_cache = build_score_cache(
+        df,
+        tag_frequencies,
+        artist_frequencies,
+        title_word_frequencies,
+    )
 
     result_tuple = (
         df,
@@ -137,6 +223,7 @@ def load_base_data():
         artist_frequencies,
         title_word_frequencies,
         chart_cache,
+        score_cache,
     )
 
     with open(cache_data_file, 'wb') as f:
@@ -152,12 +239,13 @@ def load_base_data():
 
 
 def normalize_cached_base_data(cached_payload, cache_data_file):
-    if isinstance(cached_payload, tuple) and len(cached_payload) == 5:
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 6:
         return cached_payload
 
-    if isinstance(cached_payload, tuple) and len(cached_payload) == 4:
-        df, tag_frequencies, artist_frequencies, title_word_frequencies = cached_payload
-        chart_cache = build_preference_chart_cache(
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 5:
+        df, tag_frequencies, artist_frequencies, title_word_frequencies, chart_cache = cached_payload
+        score_cache = build_score_cache(
+            df,
             tag_frequencies,
             artist_frequencies,
             title_word_frequencies,
@@ -168,6 +256,32 @@ def normalize_cached_base_data(cached_payload, cache_data_file):
             artist_frequencies,
             title_word_frequencies,
             chart_cache,
+            score_cache,
+        )
+        with open(cache_data_file, 'wb') as f:
+            pickle.dump(normalized_payload, f)
+        return normalized_payload
+
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 4:
+        df, tag_frequencies, artist_frequencies, title_word_frequencies = cached_payload
+        chart_cache = build_preference_chart_cache(
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+        )
+        score_cache = build_score_cache(
+            df,
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+        )
+        normalized_payload = (
+            df,
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+            chart_cache,
+            score_cache,
         )
         with open(cache_data_file, 'wb') as f:
             pickle.dump(normalized_payload, f)
@@ -175,35 +289,62 @@ def normalize_cached_base_data(cached_payload, cache_data_file):
 
     raise ValueError("预处理缓存文件格式无法识别，请删除 datacache 后重试。")
 
-def apply_dynamic_scores(df, tag_weights, artist_weights, title_weights, tag_freq, artist_freq, title_word_freq, global_tag_w, global_artist_w, global_title_w):
-    def calculate_score(row):
-        score = 0.0
-        tags = row['解析后标签']
-        if tags:
-            tag_score_sum = sum(math.log1p(tag_freq.get(t, 0)) * 10 * tag_weights.get(t, 1.0) for t in tags)
-            base_tag_score = tag_score_sum / math.sqrt(len(tags))
-            score += base_tag_score * global_tag_w * 0.5
+def build_weight_vector(feature_cache, dynamic_weights, default_value):
+    weight_vector = np.full(len(feature_cache["names"]), default_value, dtype=np.float32)
+    for feature_name, feature_weight in dynamic_weights.items():
+        feature_idx = feature_cache["index_map"].get(feature_name)
+        if feature_idx is not None:
+            weight_vector[feature_idx] = float(feature_weight)
+    return weight_vector
 
-        artist = row['作者'].strip()
-        if artist:
-            multiplier = artist_weights.get(artist, 5.0)
-            base_artist_score = math.log1p(artist_freq.get(artist, 0)) * 10 * multiplier
-            score += base_artist_score * global_artist_w 
-            
-        title_words = row.get('标题特征词', [])
-        if title_words:
-            title_score_sum = sum(
-                math.log1p(title_word_freq.get(w, 0)) * 10 * title_weights.get(w, 1.0)
-                for w in title_words
+
+def apply_dynamic_scores(
+    df,
+    tag_weights,
+    artist_weights,
+    title_weights,
+    tag_freq,
+    artist_freq,
+    title_word_freq,
+    global_tag_w,
+    global_artist_w,
+    global_title_w,
+    score_cache=None,
+):
+    if score_cache is None:
+        score_cache = build_score_cache(df, tag_freq, artist_freq, title_word_freq)
+
+    total_scores = np.zeros(len(df), dtype=np.float32)
+
+    tag_cache = score_cache["tags"]
+    if tag_cache["names"]:
+        tag_weight_vector = build_weight_vector(tag_cache, tag_weights, 1.0)
+        tag_effective_scores = tag_cache["base_scores"] * tag_weight_vector
+        tag_score_sum = np.asarray(tag_cache["matrix"].dot(tag_effective_scores)).reshape(-1)
+        total_scores += (tag_score_sum / tag_cache["row_norms"]) * float(global_tag_w) * 0.5
+
+    artist_cache = score_cache["artists"]
+    if artist_cache["names"]:
+        artist_weight_vector = build_weight_vector(artist_cache, artist_weights, 5.0)
+        valid_artist_mask = artist_cache["codes"] >= 0
+        if valid_artist_mask.any():
+            artist_codes = artist_cache["codes"][valid_artist_mask]
+            artist_scores = (
+                artist_cache["base_scores"][artist_codes]
+                * artist_weight_vector[artist_codes]
+                * float(global_artist_w)
             )
-            title_dilution = max(1, math.sqrt(len(title_words)))
-            base_title_score = (title_score_sum / title_dilution)
-            score += base_title_score * global_title_w 
-            
-        return int(score)
+            total_scores[valid_artist_mask] += artist_scores
+
+    title_cache = score_cache["title_words"]
+    if title_cache["names"]:
+        title_weight_vector = build_weight_vector(title_cache, title_weights, 1.0)
+        title_effective_scores = title_cache["base_scores"] * title_weight_vector
+        title_score_sum = np.asarray(title_cache["matrix"].dot(title_effective_scores)).reshape(-1)
+        total_scores += (title_score_sum / title_cache["row_norms"]) * float(global_title_w)
 
     scored_df = df.copy()
-    scored_df['推荐评分'] = scored_df.apply(calculate_score, axis=1)
+    scored_df['推荐评分'] = total_scores.astype(np.int32)
     
     columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接', '文件名', '解析后标签', '标题特征词']
     if '上传日期' not in scored_df.columns:

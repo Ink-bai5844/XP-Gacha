@@ -37,7 +37,7 @@ def build_vector_search_signature(query, candidate_ids):
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 with st.spinner('正在同步预处理缓存与计算引擎...'):
-    df_base, tag_freq, artist_freq, title_word_freq, preference_chart_cache = load_base_data()
+    df_base, tag_freq, artist_freq, title_word_freq, preference_chart_cache, score_cache = load_base_data()
 
 # 侧边栏
 st.sidebar.title("筛选与偏好设置")
@@ -89,7 +89,8 @@ with st.sidebar.expander("标题关键词权重配置", expanded=False):
 # 动态打分与过滤
 final_df = apply_dynamic_scores(
     df_base, dynamic_weights, dynamic_artist_weights, dynamic_title_weights, 
-    tag_freq, artist_freq, title_word_freq, global_tag_weight, global_artist_weight, global_title_weight
+    tag_freq, artist_freq, title_word_freq, global_tag_weight, global_artist_weight, global_title_weight,
+    score_cache=score_cache,
 )
 
 if blocked_tags:
