@@ -13,15 +13,12 @@ B64_CACHE_DIR = "b64_cache"
 VECTOR_FILE = "manga_vectors/manga_vectors_Qwen3.pkl"
 
 # 封面图片向量文件
-# 如果你用 data_processing/img_to_vector.py 默认 build，不传 --index-path，
-# 默认会写到 datacache/clip_image_index.pkl。
-# 如果你希望和主程序保持一致，也可以把这里改成你 build 时实际使用的路径。
 IMG_VECTOR_FILE = "manga_vectors/clip_image_index.pkl"
 
 # 本地 embedding 模型目录
 LOCAL_MODEL_PATH = r"D:\YourPath\XP-Gacha\Qwen3-Embedding-0.6B"
 
-# 本地 CLIP 模型目录（封面相似检索 / data_processing/img_to_vector.py 使用）
+# 本地 CLIP 模型目录
 CLIP_MODEL_PATH = r"D:\YourPath\XP-Gacha\clip-vit-base-patch32"
 
 # 本地漫画根目录
@@ -37,7 +34,7 @@ ONLINE_API_KEY = "your_api_key_here"
 ONLINE_MODEL = "grok-4-fast-non-reasoning"
 SYSTEM_PROMPT = (
     "你是‘地下金库’的智能助手。你的性格冷静、专业。 "
-    "‘地下金库’是一个储存大量18+本子漫画的数据库。我会为你提供一部分当前的库存数据作为参考。 "
+    "‘地下金库’是一个储存大量漫画的数据库。我会为你提供一部分当前的库存数据作为参考。 "
     "请结合这些数据回答问题。如果数据中没有相关内容，请基于你的通用知识库回答。"
 )
 
