@@ -43,11 +43,7 @@ SYSTEM_PROMPT = (
 
 # 预设Tag权重配置
 INITIAL_TAG_WEIGHTS = {
-    'TS/性转(gender bender)': 2.5,
-    '变身(transformation)': 2.0,
-    '身体改造(body modification)': 1.5,
-    '后庭(anal)': 0.8,
-    'NTR(netorare)': -2.0,
+    'NTR(netorare)': -2.0
 }
 
 # 检索结果上限
