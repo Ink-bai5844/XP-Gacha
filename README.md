@@ -24,7 +24,8 @@
 - 标签评分基于语义聚合后的标签词频
 - 支持屏蔽标签、权重调节、分数阈值筛选
 - 支持普通关键词搜索，支持检索 `ID`, `标题`, `标签`, `作者`, `团队`
-- 支持本地向量模型的自然语言语义检索(默认最多只显示向量最相关的5000条)
+- 支持本地向量模型的自然语言语义检索
+- 支持上传图片或输入库内 `ID` 的封面相似检索（CLIP）
 - 支持展示封面缩略图、来源链接和本地目录
 - 支持在界面中直接打开本地漫画文件夹
 - 支持将当前筛选结果注入给 LLM 做RAG增强检索问答
@@ -85,7 +86,18 @@ XP-Gacha/
 ├─ utils_charts.py                         # 偏好图表缓存与渲染
 ├─ utils_core.py                           # 本地目录匹配、封面缩略图与 Base64 缓存
 ├─ utils_nlp.py                            # 标题分词、语义检索模型加载
+├─ utils_cv.py                             # CLIP 封面向量读取、上传图/ID 相似检索
 ├─ utils_chat.py                           # LLM 对话与流式输出
+├─ data_processing/
+│  ├─ img_to_vector.py                     # 构建/查询 CLIP 封面向量索引
+│  ├─ add_csv_to_mysql.py                  # 增量导库
+│  ├─ addname.py                           # 从本地链接列表补文件名
+│  ├─ all_csv_to_mysql.py                  # 全量导库
+│  ├─ b64_pre_encode.py                    # 预编码 Base64 缓存
+│  ├─ build_vector_db.py                   # 重建向量库
+│  ├─ map_add_name.py
+│  ├─ tag_set.py
+│  └─ title_cut_set.py
 ├─ .streamlit/
 │  ├─ config.toml                          # Streamlit 主题配置
 │  └─ secrets.toml                         # MySQL 密钥配置
@@ -102,20 +114,11 @@ XP-Gacha/
 │  └─ local/
 │     ├─ NH_get_info_local.py              # NH 本地链接抓信息
 │     └─ NH_get_images_local.py            # NH 本地链接抓完整漫画
-├─ data_processing/
-│  ├─ all_csv_to_mysql.py                  # 全量导库
-│  ├─ add_csv_to_mysql.py                  # 增量导库
-│  ├─ addname.py                           # 从本地链接列表补文件名
-│  ├─ build_vector_db.py                   # 重建向量库
-│  ├─ b64_pre_encode.py                    # 预编码 Base64 缓存
-│  ├─ map_add_name.py
-│  ├─ tag_set.py
-│  └─ title_cut_set.py
 ├─ tools/                                  # 一些工具脚本
 ├─ Integration/
 │  ├─ ScoringFormula_local.py              # 本地整合版(old)
 │  └─ ScoringFormula_online.py             # 线上整合版
-├─ manga_vectors/                          # 向量库输出目录
+├─ manga_vectors/                          # 文本语义向量与图片向量索引
 ├─ onlineimgtmp/                           # 在线封面缩略图缓存
 ├─ localimgtmp/                            # 本地封面缩略图缓存
 ├─ b64_cache/                              # Base64 封面缓存
@@ -132,7 +135,7 @@ XP-Gacha/
 4. 数据库表以 `ID` 为唯一索引。
 5. 用数据库数据构建向量库，向量 `ids` 也使用 `ID`。
 6. 启动 `app.py` 后，从数据库读取数据并做预处理缓存。
-7. 页面中按照推荐评分、关键词、语义检索结果进行筛选和展示。
+7. 页面中按照推荐评分、关键词、语义检索、封面相似检索结果进行筛选和展示。
 8. 缩略图显示优先命中 Base64 缓存，其次在线图，最后本地图回退。
 
 ## 💻 运行环境
@@ -143,7 +146,8 @@ XP-Gacha/
 - Windows
 - 可用的 MySQL 实例
 - 本地 embedding 模型
-- 如需本地聊天：已启动的 `LM Studio` 兼容接口
+- 本地 CLIP 模型
+- 如需本地LLM聊天：已启动的 `LM Studio` 兼容接口
 
 安装依赖：
 
@@ -155,6 +159,12 @@ pip install -r requirements.txt
 
 ```bash
 pip install streamlit pandas numpy scipy sqlalchemy pymysql pillow janome sentence-transformers torch requests curl-cffi beautifulsoup4 cloudscraper tomli
+```
+
+如果你要使用 `data_processing/img_to_vector.py` 或主界面的封面相似检索，还需要：
+
+```bash
+pip install transformers
 ```
 
 ## ⚙️ 如何开始
@@ -169,7 +179,11 @@ copy config_empty.py config.py
 
 - `BASE_DIR`：本地漫画根目录
 - `LOCAL_MODEL_PATH`：本地 embedding 模型目录
-- `VECTOR_FILE`：向量文件输出位置
+- `VECTOR_FILE`：文本语义向量文件输出位置
+- `IMG_VECTOR_FILE`：封面向量索引文件位置
+- `CLIP_MODEL_PATH`：本地 CLIP 模型目录
+- `SEMANTIC_SEARCH_TOP_K`：语义检索最多保留的候选数
+- `COVER_SEARCH_TOP_K`：封面相似检索最多保留的候选数
 - `LM_STUDIO_API_BASE` / `LM_STUDIO_MODEL`
 - `ONLINE_API_BASE` / `ONLINE_API_KEY` / `ONLINE_MODEL`
 - `INITIAL_TAG_WEIGHTS`
@@ -241,7 +255,7 @@ borderColor = "#334039"
 - `dictionaries/SEMANTIC_MAP.json`
 - `dictionaries/TITLE_STOP_WORDS.txt`
 - `dictionaries/TITLE_SEMANTIC_MAP.json`
-- `config.py` 中指定的本地 embedding 模型目录
+- `config.py` 中指定的本地 embedding 模型目录与本地 CLIP 模型目录
 
 ### 📖 字典与 XP 语义聚合说明
 
@@ -349,6 +363,7 @@ streamlit run app.py
 - 标签屏蔽
 - 标签、作者、标题权重调节
 - AI 语义检索
+- 封面相似检索（支持上传图片，或输入库内已有条目的 `ID` 直接使用其封面做相似检索）
 - 当前结果集注入 LLM-RAG 问答
 - 封面缩略图显示
 - 一键打开来源链接
@@ -489,6 +504,31 @@ python data_processing/build_vector_db.py
 
 当你改了数据库主键逻辑、更新了大量数据、或者刚跑完全量导库后，建议重建一次。
 
+### 构建封面图片向量索引
+
+读取 `onlineimgtmp/` 和 `localimgtmp/` 中的图片，并生成 CLIP 封面向量索引：
+
+```powershell
+python data_processing/img_to_vector.py build --device cuda --index-path manga_vectors/clip_image_index.pkl
+```
+
+补充说明：
+
+- 首次全量构建会比较久，尤其当 `onlineimgtmp/` 图片很多时
+- 支持 `Ctrl + C` 中断，已完成批次会保存在 `*.progress` 目录，下次继续跑会自动续建
+- `--batch-size` 可调，例如 `--batch-size 128`
+- 如果中途中断，可以直接再次执行同一条 `build` 命令继续；脚本会自动从进度目录续跑。也可以先看索引状态：
+
+```powershell
+python data_processing/img_to_vector.py stats --index-path manga_vectors/clip_image_index.pkl
+```
+
+终端查询单张图片时：
+
+```powershell
+python data_processing/img_to_vector.py search --query 你的查询图.jpg --top-k 20 --index-path manga_vectors/clip_image_index.pkl
+```
+
 ### 预编码封面 Base64
 
 ```powershell
@@ -530,6 +570,10 @@ python data_processing/b64_pre_encode.py
   Base64 增量预编码临时目录
 - `manga_vectors/*.pkl`
   语义向量缓存
+- `manga_vectors/clip_image_index.pkl`
+  封面图片向量索引缓存
+- `*.pkl.progress/`
+  `data_processing/img_to_vector.py` 构建封面向量时的断点续跑进度目录
 
 数据库内容或字典文件变化后，应用会自动根据哈希重新生成预处理缓存。
 如果只是代码升级导致缓存结构扩展，而底层数据未变化，应用会优先尝试基于旧缓存自动补齐新版缓存结构，而不一定重新全量读取数据库。
@@ -539,7 +583,8 @@ python data_processing/b64_pre_encode.py
 - 当前实现对 Windows 更友好，尤其是“打开本地文件夹”功能。
 - `BASE_DIR`、模型路径等默认值是本机路径，换机器必须修改。
 - `app.py` 启动时会连接数据库；如果密钥或表不存在，页面会直接报错停止。
-- 语义检索依赖本地 embedding 模型和提前构建好的向量文件。
+- 语义检索依赖本地 embedding 模型和提前构建好的文本向量文件。
+- 封面相似检索依赖本地 CLIP 模型与 `IMG_VECTOR_FILE` 指向的图片向量索引。
 - 如果你的数据库结构发生变化，建议清空数据库，重新运行一次：
 
 ```powershell

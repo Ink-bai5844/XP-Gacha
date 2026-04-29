@@ -5,10 +5,17 @@ import hashlib
 import pandas as pd
 import streamlit as st
 
-from config import INITIAL_TAG_WEIGHTS, MAX_DISPLAY
+from config import (
+    COVER_SEARCH_TOP_K,
+    IMG_VECTOR_FILE,
+    INITIAL_TAG_WEIGHTS,
+    MAX_DISPLAY,
+    SEMANTIC_SEARCH_TOP_K,
+)
 from data_pipeline import load_base_data, apply_dynamic_scores
 from utils_charts import render_global_preference_charts
 from utils_core import get_cover_base64
+from utils_cv import search_similar_cover_items
 from utils_nlp import load_semantic_engine
 from utils_chat import render_chat_interface
 
@@ -36,6 +43,25 @@ def build_vector_search_signature(query, candidate_ids):
     raw = f"{normalized_query}\n{joined_ids}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
+
+def build_cover_search_signature(query_item_id, query_image_bytes, candidate_ids):
+    normalized_id = str(query_item_id).strip().upper()
+    image_digest = hashlib.md5(query_image_bytes).hexdigest() if query_image_bytes else ""
+    joined_ids = "\n".join(str(item_id) for item_id in candidate_ids)
+    raw = f"{normalized_id}\n{image_digest}\n{joined_ids}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def apply_similarity_result(filtered_df, matched_ids, score_map, score_column):
+    if filtered_df.empty or not matched_ids:
+        return pd.DataFrame()
+
+    normalized_matched_ids = [str(item_id) for item_id in matched_ids]
+    result_df = filtered_df[filtered_df['ID'].astype(str).isin(normalized_matched_ids)].copy()
+    result_df[score_column] = result_df['ID'].astype(str).map(score_map)
+    result_df = result_df.sort_values(score_column, ascending=False).reset_index(drop=True)
+    return result_df
+
 with st.spinner('正在同步预处理缓存与计算引擎...'):
     df_base, tag_freq, artist_freq, title_word_freq, preference_chart_cache, score_cache = load_base_data()
 
@@ -48,6 +74,21 @@ if df_base is None:
 
 search_kw = st.sidebar.text_input("实时关键词搜索 (标题/标签/作者)：", placeholder="例如: elf...")
 vector_search_kw = st.sidebar.text_input("AI 语义检索 (自然语言)：", placeholder="例如: 猫娘X狐娘...")
+with st.sidebar.expander("封面相似检索 (CLIP)", expanded=False):
+    cover_query_id = st.text_input(
+        "输入库内条目 ID：",
+        placeholder="例如: JM1426534 / NH123456",
+    )
+    cover_query_file = st.file_uploader(
+        "或上传一张图片：",
+        type=["jpg", "jpeg", "png", "webp", "bmp"],
+        accept_multiple_files=False,
+    )
+    st.caption(
+        f"上传图片优先于 ID；会在当前候选结果里按封面相似度筛到前 {COVER_SEARCH_TOP_K} 项。"
+    )
+    if cover_query_file is not None:
+        st.image(cover_query_file, caption="当前上传图片", use_container_width=True)
 st.sidebar.markdown("---")
 st.sidebar.subheader("全局评分权重分配")
 
@@ -141,10 +182,15 @@ if vector_search_kw and not filtered_df.empty:
     surviving_ids = filtered_df['ID'].astype(str).tolist()
     current_vector_signature = build_vector_search_signature(vector_search_kw, surviving_ids)
     cached_vector_signature = st.session_state.get("vector_search_signature")
-    cached_vector_df = st.session_state.get("vector_search_result_df")
+    cached_vector_payload = st.session_state.get("vector_search_result_payload")
 
-    if cached_vector_signature == current_vector_signature and cached_vector_df is not None:
-        filtered_df = cached_vector_df.copy()
+    if cached_vector_signature == current_vector_signature and cached_vector_payload is not None:
+        filtered_df = apply_similarity_result(
+            filtered_df,
+            cached_vector_payload["matched_ids"],
+            cached_vector_payload["score_map"],
+            "AI相关度",
+        )
     else:
         with st.spinner('正在唤醒 AI 引擎并载入矩阵空间 (首次唤醒需一段时间)...'):
             embed_model, corpus_embeddings, corpus_ids, id_to_index = load_semantic_engine()
@@ -162,21 +208,96 @@ if vector_search_kw and not filtered_df.empty:
                 sub_embeddings = sub_embeddings.to(query_embedding.device)
 
                 cos_scores = util.cos_sim(query_embedding, sub_embeddings)[0]
-                top_k = min(5000, len(sub_ids))
+                top_k = min(SEMANTIC_SEARCH_TOP_K, len(sub_ids))
                 top_results = torch.topk(cos_scores, k=top_k)
 
                 matched_ids = [sub_ids[idx] for idx in top_results[1]]
                 matched_scores = (top_results[0] * 100).tolist()
                 score_map = dict(zip(matched_ids, matched_scores))
 
-                filtered_df = filtered_df[filtered_df['ID'].astype(str).isin(matched_ids)].copy()
-                filtered_df['AI相关度'] = filtered_df['ID'].astype(str).map(score_map)
-                filtered_df = filtered_df.sort_values('AI相关度', ascending=False).reset_index(drop=True)
+                filtered_df = apply_similarity_result(
+                    filtered_df,
+                    matched_ids,
+                    score_map,
+                    "AI相关度",
+                )
+                st.session_state["vector_search_signature"] = current_vector_signature
+                st.session_state["vector_search_result_payload"] = {
+                    "matched_ids": matched_ids,
+                    "score_map": score_map,
+                }
             else:
                 filtered_df = pd.DataFrame()
+                st.session_state["vector_search_signature"] = current_vector_signature
+                st.session_state["vector_search_result_payload"] = {
+                    "matched_ids": [],
+                    "score_map": {},
+                }
 
-        st.session_state["vector_search_signature"] = current_vector_signature
-        st.session_state["vector_search_result_df"] = filtered_df.copy()
+cover_query_bytes = cover_query_file.getvalue() if cover_query_file is not None else None
+cover_query_id = cover_query_id.strip().upper()
+
+if (cover_query_bytes or cover_query_id) and not filtered_df.empty:
+    surviving_ids = filtered_df['ID'].astype(str).tolist()
+    current_cover_signature = build_cover_search_signature(
+        cover_query_id,
+        cover_query_bytes,
+        surviving_ids,
+    )
+    cached_cover_signature = st.session_state.get("cover_search_signature")
+    cached_cover_payload = st.session_state.get("cover_search_result_payload")
+
+    if cached_cover_signature == current_cover_signature and cached_cover_payload is not None:
+        filtered_df = apply_similarity_result(
+            filtered_df,
+            cached_cover_payload["matched_ids"],
+            cached_cover_payload["score_map"],
+            "封面相关度",
+        )
+    else:
+        with st.spinner('正在进行封面向量相似检索...'):
+            try:
+                cover_search_payload = search_similar_cover_items(
+                    query_item_id=cover_query_id,
+                    query_image_bytes=cover_query_bytes,
+                    candidate_ids=surviving_ids,
+                    top_k=COVER_SEARCH_TOP_K,
+                )
+            except FileNotFoundError:
+                st.warning(
+                    f"封面向量检索暂时不可用：未找到向量文件 `{IMG_VECTOR_FILE}`。"
+                )
+            except ValueError as exc:
+                st.warning(str(exc))
+            except Exception as exc:
+                st.error(f"封面向量检索失败：{exc}")
+            else:
+                cover_results = cover_search_payload["results"]
+                if cover_results:
+                    matched_ids = [item["item_id"] for item in cover_results]
+                    score_map = {item["item_id"]: item["score"] for item in cover_results}
+
+                    filtered_df = apply_similarity_result(
+                        filtered_df,
+                        matched_ids,
+                        score_map,
+                        "封面相关度",
+                    )
+
+                    st.session_state["cover_search_signature"] = current_cover_signature
+                    st.session_state["cover_search_result_payload"] = {
+                        "matched_ids": matched_ids,
+                        "score_map": score_map,
+                    }
+                    st.session_state["cover_search_meta"] = cover_search_payload
+                else:
+                    filtered_df = pd.DataFrame()
+                    st.session_state["cover_search_signature"] = current_cover_signature
+                    st.session_state["cover_search_result_payload"] = {
+                        "matched_ids": [],
+                        "score_map": {},
+                    }
+                    st.info("当前候选结果里没有命中可用的封面向量。")
 
 if '搜索文本' in filtered_df.columns:
     filtered_df = filtered_df.drop(columns=['搜索文本'])
@@ -199,6 +320,8 @@ current_page_opener_df = pd.DataFrame()
 
 if not filtered_df.empty:
     sort_columns = ['推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录']
+    if '封面相关度' in filtered_df.columns:
+        sort_columns.insert(0, '封面相关度')
     if 'AI相关度' in filtered_df.columns:
         sort_columns.insert(0, 'AI相关度')
     
@@ -243,7 +366,7 @@ if not filtered_df.empty:
 
     display_df = display_df.drop(columns=['文件名'], errors='ignore')
     preferred_columns = [
-        '封面', 'AI相关度', '推荐评分', 'ID', '上传日期',
+        '封面', '封面相关度', 'AI相关度', '推荐评分', 'ID', '上传日期',
         '标题', '作者', '团队', '标签', '语言', '页数',
         '本地目录', '链接'
     ]
@@ -256,6 +379,8 @@ if not filtered_df.empty:
         column_config={
             "封面": st.column_config.ImageColumn("封面", help="本地文件夹中的 1.xxx 封面图"),
             "链接": st.column_config.LinkColumn("图库链接", display_text="网络来源"),
+            "封面相关度": st.column_config.NumberColumn("封面相关度", format="%.2f"),
+            "AI相关度": st.column_config.NumberColumn("AI相关度", format="%.2f"),
             "推荐评分": st.column_config.ProgressColumn(
                 "推荐评分", 
                 format="%d", 
