@@ -789,7 +789,7 @@ if not filtered_df.empty:
             "上传日期": st.column_config.TextColumn("上传日期", help="该漫画的上传时间")
         },
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         height=600 
     )
 

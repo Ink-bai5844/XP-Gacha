@@ -637,7 +637,7 @@ if not filtered_df.empty:
             "上传日期": st.column_config.TextColumn("上传日期", help="该漫画的上传时间")
         },
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         height=600 
     )
 
@@ -663,7 +663,7 @@ with chart_col1:
         top_150_tags = tag_freq.most_common(150)
         if top_150_tags:
             top_150_tags_df = pd.DataFrame(top_150_tags, columns=['XP 标签', '出现频次'])
-            st.dataframe(top_150_tags_df, hide_index=True, use_container_width=True)
+            st.dataframe(top_150_tags_df, hide_index=True, width='stretch')
 
 with chart_col2:
     st.write("**Top 15 核心作者分布**")
@@ -676,7 +676,7 @@ with chart_col2:
         top_150_artists = artist_freq.most_common(150)
         if top_150_artists:
             top_150_artists_df = pd.DataFrame(top_150_artists, columns=['作者名', '收录册数'])
-            st.dataframe(top_150_artists_df, hide_index=True, use_container_width=True)
+            st.dataframe(top_150_artists_df, hide_index=True, width='stretch')
 
 with chart_col3:
     st.write("**Top 15 标题高频词汇**")
@@ -689,4 +689,4 @@ with chart_col3:
         top_150_words = title_word_freq.most_common(150)
         if top_150_words:
             top_150_df = pd.DataFrame(top_150_words, columns=['特征词汇', '出现频次'])
-            st.dataframe(top_150_df, hide_index=True, use_container_width=True)
+            st.dataframe(top_150_df, hide_index=True, width='stretch')

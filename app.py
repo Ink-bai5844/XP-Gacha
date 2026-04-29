@@ -88,7 +88,7 @@ with st.sidebar.expander("封面相似检索 (CLIP)", expanded=False):
         f"上传图片优先于 ID；会在当前候选结果里按封面相似度筛到前 {COVER_SEARCH_TOP_K} 项。"
     )
     if cover_query_file is not None:
-        st.image(cover_query_file, caption="当前上传图片", use_container_width=True)
+        st.image(cover_query_file, caption="当前上传图片", width="stretch")
 st.sidebar.markdown("---")
 st.sidebar.subheader("全局评分权重分配")
 
