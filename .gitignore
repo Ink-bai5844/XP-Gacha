@@ -11,6 +11,7 @@
 /onlineimgtmp
 /paraphrase-multilingual-MiniLM-L12-v2
 /Qwen3-Embedding-0.6B
+/clip-vit-base-patch32
 /__pycache__
 /logs
 /Integration/__pycache__

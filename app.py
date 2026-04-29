@@ -102,8 +102,6 @@ if '解析后标签' in final_df.columns:
 if '标题特征词' in final_df.columns:
     final_df = final_df.drop(columns=['标题特征词'])
 
-final_df = final_df.sort_values(by=['推荐评分', '上传日期'], ascending=[False, False]).reset_index(drop=True)
-
 if not final_df.empty:
     min_possible_score = int(final_df['推荐评分'].min())
     max_possible_score = int(final_df['推荐评分'].max())

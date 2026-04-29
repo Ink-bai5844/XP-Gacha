@@ -228,6 +228,20 @@ def build_empty_base_data():
     return None, empty_tag_frequencies, empty_artist_frequencies, empty_title_word_frequencies, chart_cache, None
 
 
+def build_search_text_series(df):
+    search_columns = ['ID', '标题', '标签', '作者', '团队']
+    combined_series = pd.Series('', index=df.index, dtype='object')
+
+    for column_name in search_columns:
+        if column_name in df.columns:
+            normalized_series = df[column_name].fillna('').astype(str).str.strip().str.lower()
+        else:
+            normalized_series = pd.Series('', index=df.index, dtype='object')
+        combined_series = combined_series.str.cat(normalized_series, sep=' ')
+
+    return combined_series.str.replace(r'\s+', ' ', regex=True).str.strip()
+
+
 def build_multi_value_feature_cache(parsed_items_list, frequency_counter):
     feature_names = sorted(frequency_counter.keys())
     feature_index_map = {name: idx for idx, name in enumerate(feature_names)}
@@ -305,6 +319,15 @@ def build_score_cache(df, tag_frequencies, artist_frequencies, title_word_freque
     }
 
 
+def ensure_search_text_column(df):
+    if df is None or '搜索文本' in df.columns:
+        return df, False
+
+    normalized_df = df.copy()
+    normalized_df['搜索文本'] = build_search_text_series(normalized_df)
+    return normalized_df, True
+
+
 def render_ranked_bar_chart(items, label_col, value_col):
     if not items:
         return
@@ -373,10 +396,12 @@ def render_global_preference_charts(chart_cache):
 
 
 def normalize_cached_base_data(cached_payload, cache_data_file):
-    if isinstance(cached_payload, tuple) and len(cached_payload) == 6:
-        return cached_payload
+    needs_cache_refresh = False
 
-    if isinstance(cached_payload, tuple) and len(cached_payload) == 5:
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 6:
+        normalized_payload = cached_payload
+
+    elif isinstance(cached_payload, tuple) and len(cached_payload) == 5:
         df, tag_frequencies, artist_frequencies, title_word_frequencies, score_cache = cached_payload
         chart_cache = build_preference_chart_cache(
             tag_frequencies,
@@ -391,11 +416,9 @@ def normalize_cached_base_data(cached_payload, cache_data_file):
             chart_cache,
             score_cache,
         )
-        with open(cache_data_file, 'wb') as f:
-            pickle.dump(normalized_payload, f)
-        return normalized_payload
+        needs_cache_refresh = True
 
-    if isinstance(cached_payload, tuple) and len(cached_payload) == 4:
+    elif isinstance(cached_payload, tuple) and len(cached_payload) == 4:
         df, tag_frequencies, artist_frequencies, title_word_frequencies = cached_payload
         chart_cache = build_preference_chart_cache(
             tag_frequencies,
@@ -416,11 +439,29 @@ def normalize_cached_base_data(cached_payload, cache_data_file):
             chart_cache,
             score_cache,
         )
+        needs_cache_refresh = True
+
+    else:
+        raise ValueError("服务器预处理缓存文件格式无法识别，请删除 datacache 后重试。")
+
+    df, tag_frequencies, artist_frequencies, title_word_frequencies, chart_cache, score_cache = normalized_payload
+    df, search_text_added = ensure_search_text_column(df)
+    if search_text_added:
+        normalized_payload = (
+            df,
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+            chart_cache,
+            score_cache,
+        )
+        needs_cache_refresh = True
+
+    if needs_cache_refresh:
         with open(cache_data_file, 'wb') as f:
             pickle.dump(normalized_payload, f)
-        return normalized_payload
 
-    raise ValueError("服务器预处理缓存文件格式无法识别，请删除 datacache 后重试。")
+    return normalized_payload
 
 @st.cache_data(max_entries=1, show_spinner=False)
 def load_base_data():
@@ -476,6 +517,7 @@ def load_base_data():
 
     df['解析后标签'] = parsed_tags_list
     df['标题特征词'] = parsed_title_words_list
+    df['搜索文本'] = build_search_text_series(df)
     
     tag_frequencies = Counter(all_tags)
     artist_frequencies = Counter([str(a).strip() for a in df.get('作者', []) if str(a).strip()])
@@ -603,7 +645,7 @@ def apply_dynamic_scores(df, tag_weights, artist_weights, title_weights, tag_fre
     scored_df = df.copy()
     scored_df['推荐评分'] = total_scores.astype(np.int32)
     
-    columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '链接', '文件名', '解析后标签', '标题特征词']
+    columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '链接', '文件名', '解析后标签', '标题特征词', '搜索文本']
     if '上传日期' not in scored_df.columns:
         scored_df['上传日期'] = ''
         
@@ -635,8 +677,6 @@ if '解析后标签' in final_df.columns:
 if '标题特征词' in final_df.columns:
     final_df = final_df.drop(columns=['标题特征词'])
 
-final_df = final_df.sort_values(by=['推荐评分', '上传日期'], ascending=[False, False]).reset_index(drop=True)
-
 if not final_df.empty:
     min_possible_score = int(final_df['推荐评分'].min())
     max_possible_score = int(final_df['推荐评分'].max())
@@ -654,14 +694,20 @@ filtered_df = final_df[final_df['推荐评分'] >= min_score]
 if search_kw and not filtered_df.empty:
     kw_list = [kw.strip().lower() for kw in search_kw.replace('，', ',').split(',') if kw.strip()]
     for kw in kw_list:
-        mask_search = (
-            filtered_df['ID'].str.lower().str.contains(kw, regex=False, na=False) |
-            filtered_df['标题'].str.lower().str.contains(kw, regex=False, na=False) |
-            filtered_df['标签'].str.lower().str.contains(kw, regex=False, na=False) |
-            filtered_df['作者'].str.lower().str.contains(kw, regex=False, na=False) |
-            filtered_df['团队'].str.lower().str.contains(kw, regex=False, na=False)
-        )
+        if '搜索文本' in filtered_df.columns:
+            mask_search = filtered_df['搜索文本'].str.contains(kw, regex=False, na=False)
+        else:
+            mask_search = (
+                filtered_df['ID'].str.lower().str.contains(kw, regex=False, na=False) |
+                filtered_df['标题'].str.lower().str.contains(kw, regex=False, na=False) |
+                filtered_df['标签'].str.lower().str.contains(kw, regex=False, na=False) |
+                filtered_df['作者'].str.lower().str.contains(kw, regex=False, na=False) |
+                filtered_df['团队'].str.lower().str.contains(kw, regex=False, na=False)
+            )
         filtered_df = filtered_df[mask_search]
+
+if '搜索文本' in filtered_df.columns:
+    filtered_df = filtered_df.drop(columns=['搜索文本'])
 
 # 释放用于过滤的全量 DataFrame 内存
 del final_df
