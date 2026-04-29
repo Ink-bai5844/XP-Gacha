@@ -33,6 +33,20 @@ def init_db_engine():
 engine = init_db_engine()
 
 
+def build_search_text_series(df):
+    search_columns = ['ID', '标题', '标签', '作者', '团队']
+    combined_series = pd.Series('', index=df.index, dtype='object')
+
+    for column_name in search_columns:
+        if column_name in df.columns:
+            normalized_series = df[column_name].fillna('').astype(str).str.strip().str.lower()
+        else:
+            normalized_series = pd.Series('', index=df.index, dtype='object')
+        combined_series = combined_series.str.cat(normalized_series, sep=' ')
+
+    return combined_series.str.replace(r'\s+', ' ', regex=True).str.strip()
+
+
 def build_empty_base_data():
     empty_tag_frequencies = Counter()
     empty_artist_frequencies = Counter()
@@ -128,6 +142,15 @@ def build_score_cache(df, tag_frequencies, artist_frequencies, title_word_freque
         "title_words": build_multi_value_feature_cache(parsed_title_words_list, title_word_frequencies),
     }
 
+
+def ensure_search_text_column(df):
+    if df is None or '搜索文本' in df.columns:
+        return df, False
+
+    normalized_df = df.copy()
+    normalized_df['搜索文本'] = build_search_text_series(normalized_df)
+    return normalized_df, True
+
 def get_data_hash():
     hasher = hashlib.md5()
     config_files = [
@@ -201,6 +224,7 @@ def load_base_data():
 
     df['解析后标签'] = parsed_tags_list
     df['标题特征词'] = parsed_title_words_list
+    df['搜索文本'] = build_search_text_series(df)
     
     tag_frequencies = Counter(all_tags)
     artist_frequencies = Counter([str(a).strip() for a in df.get('作者', []) if str(a).strip()])
@@ -239,10 +263,12 @@ def load_base_data():
 
 
 def normalize_cached_base_data(cached_payload, cache_data_file):
-    if isinstance(cached_payload, tuple) and len(cached_payload) == 6:
-        return cached_payload
+    needs_cache_refresh = False
 
-    if isinstance(cached_payload, tuple) and len(cached_payload) == 5:
+    if isinstance(cached_payload, tuple) and len(cached_payload) == 6:
+        normalized_payload = cached_payload
+
+    elif isinstance(cached_payload, tuple) and len(cached_payload) == 5:
         df, tag_frequencies, artist_frequencies, title_word_frequencies, chart_cache = cached_payload
         score_cache = build_score_cache(
             df,
@@ -258,11 +284,9 @@ def normalize_cached_base_data(cached_payload, cache_data_file):
             chart_cache,
             score_cache,
         )
-        with open(cache_data_file, 'wb') as f:
-            pickle.dump(normalized_payload, f)
-        return normalized_payload
+        needs_cache_refresh = True
 
-    if isinstance(cached_payload, tuple) and len(cached_payload) == 4:
+    elif isinstance(cached_payload, tuple) and len(cached_payload) == 4:
         df, tag_frequencies, artist_frequencies, title_word_frequencies = cached_payload
         chart_cache = build_preference_chart_cache(
             tag_frequencies,
@@ -283,11 +307,29 @@ def normalize_cached_base_data(cached_payload, cache_data_file):
             chart_cache,
             score_cache,
         )
+        needs_cache_refresh = True
+
+    else:
+        raise ValueError("预处理缓存文件格式无法识别，请删除 datacache 后重试。")
+
+    df, tag_frequencies, artist_frequencies, title_word_frequencies, chart_cache, score_cache = normalized_payload
+    df, search_text_added = ensure_search_text_column(df)
+    if search_text_added:
+        normalized_payload = (
+            df,
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+            chart_cache,
+            score_cache,
+        )
+        needs_cache_refresh = True
+
+    if needs_cache_refresh:
         with open(cache_data_file, 'wb') as f:
             pickle.dump(normalized_payload, f)
-        return normalized_payload
 
-    raise ValueError("预处理缓存文件格式无法识别，请删除 datacache 后重试。")
+    return normalized_payload
 
 def build_weight_vector(feature_cache, dynamic_weights, default_value):
     weight_vector = np.full(len(feature_cache["names"]), default_value, dtype=np.float32)
@@ -346,7 +388,7 @@ def apply_dynamic_scores(
     scored_df = df.copy()
     scored_df['推荐评分'] = total_scores.astype(np.int32)
     
-    columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接', '文件名', '解析后标签', '标题特征词']
+    columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接', '文件名', '解析后标签', '标题特征词', '搜索文本']
     if '上传日期' not in scored_df.columns:
         scored_df['上传日期'] = ''
         

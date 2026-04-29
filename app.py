@@ -126,13 +126,16 @@ filtered_df = final_df[final_df['推荐评分'] >= min_score]
 if search_kw and not filtered_df.empty:
     kw_list = [kw.strip().lower() for kw in search_kw.replace('，', ',').split(',') if kw.strip()]
     for kw in kw_list:
-        mask_search = (
-            filtered_df['ID'].str.lower().str.contains(kw, regex=False, na=False) |
-            filtered_df['标题'].str.lower().str.contains(kw, regex=False, na=False) |
-            filtered_df['标签'].str.lower().str.contains(kw, regex=False, na=False) |
-            filtered_df['作者'].str.lower().str.contains(kw, regex=False, na=False) |
-            filtered_df['团队'].str.lower().str.contains(kw, regex=False, na=False)
-        )
+        if '搜索文本' in filtered_df.columns:
+            mask_search = filtered_df['搜索文本'].str.contains(kw, regex=False, na=False)
+        else:
+            mask_search = (
+                filtered_df['ID'].str.lower().str.contains(kw, regex=False, na=False) |
+                filtered_df['标题'].str.lower().str.contains(kw, regex=False, na=False) |
+                filtered_df['标签'].str.lower().str.contains(kw, regex=False, na=False) |
+                filtered_df['作者'].str.lower().str.contains(kw, regex=False, na=False) |
+                filtered_df['团队'].str.lower().str.contains(kw, regex=False, na=False)
+            )
         filtered_df = filtered_df[mask_search]
 
 # AI 语义二次过滤
@@ -176,6 +179,9 @@ if vector_search_kw and not filtered_df.empty:
 
         st.session_state["vector_search_signature"] = current_vector_signature
         st.session_state["vector_search_result_df"] = filtered_df.copy()
+
+if '搜索文本' in filtered_df.columns:
+    filtered_df = filtered_df.drop(columns=['搜索文本'])
 
 # 主动释放无需再使用的全量内存
 del final_df
