@@ -174,7 +174,7 @@ XP-Gacha/
 └─ Qwen3-Embedding-0.6B/                   # embedding 预训练模型
 ```
 
-## 数据流
+### 数据流
 
 1. 通过 `NH` / `JM` 抓取脚本或本地链接脚本生成 CSV。
 2. CSV 统一规范到 `ID` 首列。
