@@ -7,15 +7,24 @@ import streamlit as st
 
 from config import (
     COVER_SEARCH_TOP_K,
+    HISTORY_RECOMMENDATION_CACHE_SIZE,
     IMG_VECTOR_FILE,
     INITIAL_TAG_WEIGHTS,
     MAX_DISPLAY,
     SEMANTIC_SEARCH_TOP_K,
 )
 from data_pipeline import load_base_data, apply_dynamic_scores
-from utils_charts import render_global_preference_charts
+from utils_charts import render_global_preference_charts, render_history_preference_charts
 from utils_core import get_cover_base64
 from utils_cv import search_similar_cover_items
+from utils_history import (
+    build_history_preference_maps,
+    build_tracked_link,
+    clear_history_entries,
+    load_history_entries,
+    record_recommendation_history,
+    start_link_tracking_server,
+)
 from utils_nlp import load_semantic_engine
 from utils_chat import render_chat_interface
 
@@ -62,8 +71,35 @@ def apply_similarity_result(filtered_df, matched_ids, score_map, score_column):
     result_df = result_df.sort_values(score_column, ascending=False).reset_index(drop=True)
     return result_df
 
+
+def _get_item_label(item_payload):
+    item_id = str(item_payload.get("ID", "")).strip()
+    title = str(item_payload.get("标题", "")).strip()
+    return f"{item_id} | {title}" if item_id and title else (title or item_id or "当前条目")
+
+
+def open_local_history_item(item_payload):
+    selected_path = str(item_payload.get("本地目录", "")).strip()
+    if selected_path != "本地目录不存在" and os.path.exists(selected_path):
+        record_recommendation_history(item_payload, "local_folder")
+        os.startfile(selected_path)
+        st.session_state["open_item_notice"] = f"已记录并打开本地目录：{_get_item_label(item_payload)}"
+    else:
+        st.session_state["open_item_error"] = f"路径失效：{selected_path}"
+
+
 with st.spinner('正在同步预处理缓存与计算引擎...'):
     df_base, tag_freq, artist_freq, title_word_freq, preference_chart_cache, score_cache = load_base_data()
+
+link_tracking_server = start_link_tracking_server()
+
+open_item_notice = st.session_state.pop("open_item_notice", None)
+if open_item_notice:
+    st.toast(open_item_notice, icon="✅")
+
+open_item_error = st.session_state.pop("open_item_error", None)
+if open_item_error:
+    st.toast(open_item_error, icon="⚠️")
 
 # 侧边栏
 st.sidebar.title("筛选与偏好设置")
@@ -95,6 +131,25 @@ st.sidebar.subheader("全局评分权重分配")
 global_tag_weight = st.sidebar.slider("标签总分倍率", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
 global_artist_weight = st.sidebar.slider("作者总分倍率", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
 global_title_weight = st.sidebar.slider("标题总分倍率", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
+
+history_entries = load_history_entries()
+with st.sidebar.expander("历史偏好加权", expanded=False):
+    global_history_weight = st.slider("历史偏好总分倍率", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
+    st.caption(f"缓存最近 {HISTORY_RECOMMENDATION_CACHE_SIZE} 次打开记录")
+    st.caption(f"当前已记录 {len(history_entries)} 次打开。")
+    if link_tracking_server is None:
+        st.caption("网络链接追踪器未启动，表格链接会直接打开但不会写入历史")
+    col_refresh_history, col_clear_history = st.columns(2)
+    with col_refresh_history:
+        if st.button("刷新记录", width="stretch"):
+            st.session_state["open_item_notice"] = "已刷新历史偏好记录"
+            st.rerun()
+    with col_clear_history:
+        if st.button("清空记录", width="stretch"):
+            clear_history_entries()
+            st.session_state["open_item_notice"] = "已清空历史偏好记录"
+            st.rerun()
+
 st.sidebar.markdown("---")
 
 all_unique_tags = sorted(list(tag_freq.keys()))
@@ -127,21 +182,32 @@ with st.sidebar.expander("标题关键词权重配置", expanded=False):
         val = st.number_input(f"词汇「{w}」权重", value=1.0, step=0.1, format="%.1f")
         dynamic_title_weights[w] = val
 
+history_preference = (
+    build_history_preference_maps(
+        history_entries,
+        tag_freq,
+        title_word_freq,
+        artist_freq,
+        tag_bonus_scale=global_tag_weight,
+        title_bonus_scale=global_title_weight,
+        artist_bonus_scale=global_artist_weight,
+    )
+    if global_history_weight > 0 and history_entries
+    else None
+)
+
 # 动态打分与过滤
 final_df = apply_dynamic_scores(
     df_base, dynamic_weights, dynamic_artist_weights, dynamic_title_weights, 
     tag_freq, artist_freq, title_word_freq, global_tag_weight, global_artist_weight, global_title_weight,
     score_cache=score_cache,
+    history_preference=history_preference,
+    global_history_w=global_history_weight,
 )
 
 if blocked_tags:
     mask_not_blocked = final_df['解析后标签'].apply(lambda x: not any(t in blocked_tags for t in x))
     final_df = final_df[mask_not_blocked]
-
-if '解析后标签' in final_df.columns:
-    final_df = final_df.drop(columns=['解析后标签'])
-if '标题特征词' in final_df.columns:
-    final_df = final_df.drop(columns=['标题特征词'])
 
 if not final_df.empty:
     min_possible_score = int(final_df['推荐评分'].min())
@@ -302,10 +368,6 @@ if (cover_query_bytes or cover_query_id) and not filtered_df.empty:
                         "score_map": {},
                     }
                     st.info("当前候选结果里没有命中可用的封面向量。")
-
-if '搜索文本' in filtered_df.columns:
-    filtered_df = filtered_df.drop(columns=['搜索文本'])
-
 # 主动释放无需再使用的全量内存
 del final_df
 gc.collect()
@@ -360,7 +422,12 @@ if not filtered_df.empty:
     slice_end = (selected_page_index + 1) * MAX_DISPLAY
     
     display_df = filtered_df.iloc[slice_start:slice_end].copy()
-    current_page_opener_df = display_df[['ID', '标题', '本地目录']].copy()
+    opener_columns = [
+        col
+        for col in ['ID', '标题', '作者', '本地目录', '链接', '解析后标签', '标题特征词']
+        if col in display_df.columns
+    ]
+    current_page_opener_df = display_df[opener_columns].copy()
 
     with st.spinner(f'正在加载 {selected_page_label} 范围的缩略图...'):
         display_df['封面'] = display_df.apply(
@@ -368,18 +435,29 @@ if not filtered_df.empty:
             axis=1
         )
 
-    display_df = display_df.drop(columns=['文件名'], errors='ignore')
+    chat_context_df = display_df.drop(
+        columns=['封面', '解析后标签', '标题特征词', '搜索文本'],
+        errors='ignore',
+    ).copy()
+
+    table_df = display_df.drop(
+        columns=['文件名', '解析后标签', '标题特征词', '搜索文本'],
+        errors='ignore',
+    )
+    if link_tracking_server is not None and '链接' in table_df.columns:
+        table_df['链接'] = display_df.apply(build_tracked_link, axis=1)
+
     preferred_columns = [
         '封面', '封面相关度', 'AI相关度', '推荐评分', 'ID', '上传日期',
         '标题', '作者', '团队', '标签', '语言', '页数',
         '本地目录', '链接'
     ]
-    display_columns = [col for col in preferred_columns if col in display_df.columns]
-    display_columns += [col for col in display_df.columns if col not in display_columns]
-    display_df = display_df[display_columns]
+    display_columns = [col for col in preferred_columns if col in table_df.columns]
+    display_columns += [col for col in table_df.columns if col not in display_columns]
+    table_df = table_df[display_columns]
 
     st.dataframe(
-        display_df,
+        table_df,
         column_config={
             "封面": st.column_config.ImageColumn("封面", help="本地文件夹中的 1.xxx 封面图"),
             "链接": st.column_config.LinkColumn("图库链接", display_text="网络来源"),
@@ -399,8 +477,7 @@ if not filtered_df.empty:
         height=600 
     )
 
-    chat_context_df = display_df.drop(columns=['封面'], errors='ignore').copy()
-
+    del table_df
     del display_df
     gc.collect()
 
@@ -418,39 +495,37 @@ st.markdown("---")
 st.markdown("### 📂 打开本地漫画")
 st.write("在下拉框中选择漫画打开本地文件夹 (已过滤屏蔽标签)")
 
-@st.fragment
-def render_local_opener(filtered_df):
+def render_item_opener(filtered_df):
     if not filtered_df.empty:
-        manga_options = {
-            str(row['ID']): {
-                "title": row['标题'],
-                "path": row['本地目录'],
-            }
-            for _, row in filtered_df.iterrows()
-        }
-        selected_manga_title = st.selectbox(
-            "选择要阅读的漫画：", 
+        manga_options = {}
+        for row_index, row in filtered_df.iterrows():
+            item_payload = row.to_dict()
+            manga_id = str(item_payload.get('ID', '')).strip() or f"row-{row_index}"
+            manga_options[manga_id] = item_payload
+
+        selected_manga_id = st.selectbox(
+            "选择要阅读的漫画：",
             options=list(manga_options.keys()),
-            format_func=lambda manga_id: f"{manga_id} | {manga_options[manga_id]['title']}",
+            format_func=lambda manga_id: _get_item_label(manga_options[manga_id]),
             key="manga_selector" # 显式指定 key 保证状态稳定
         )
         
-        selected_path = manga_options[selected_manga_title]["path"]
-        
+        selected_item = manga_options[selected_manga_id]
+        selected_path = str(selected_item.get("本地目录", "")).strip()
         col_btn, col_path = st.columns([1, 4])
         with col_btn:
-            if st.button("打开本地文件夹", width="stretch"):
-                if selected_path != "本地目录不存在" and os.path.exists(selected_path):
-                    os.startfile(selected_path)
-                    st.toast(f"已成功开启: {selected_path}", icon="✅")
-                else:
-                    st.error(f"路径失效：{selected_path}")
+            st.button(
+                "打开本地文件夹",
+                width="stretch",
+                on_click=open_local_history_item,
+                args=(selected_item,),
+            )
         with col_path:
             st.info(f"匹配路径: {selected_path}")
     else:
         st.warning("当前筛选条件下没有匹配的漫画。")
 
-# 执行局部渲染函数
-render_local_opener(current_page_opener_df)
+render_item_opener(current_page_opener_df)
 
 render_global_preference_charts(preference_chart_cache)
+render_history_preference_charts(history_entries)

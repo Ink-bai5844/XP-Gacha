@@ -9,6 +9,14 @@ IMG_CACHE_DIR = "localimgtmp"
 CACHE_DIR = "datacache"
 B64_CACHE_DIR = "b64_cache"
 
+# 历史推荐偏好配置
+# 最近 N 次通过应用打开的网络链接/本地目录会参与一条独立历史加权。
+HISTORY_RECOMMENDATION_CACHE_SIZE = 50
+HISTORY_SCORE_GLOBAL_WEIGHT = 1.0
+HISTORY_CACHE_FILE = os.path.join(CACHE_DIR, "recommendation_history.json")
+HISTORY_LINK_TRACKING_HOST = "127.0.0.1"
+HISTORY_LINK_TRACKING_PORT = 8765
+
 # 文本语义向量文件
 VECTOR_FILE = "manga_vectors/manga_vectors_Qwen3.pkl"
 

@@ -11,4 +11,5 @@ torch
 requests
 curl-cffi
 beautifulsoup4
+cryptography
 tomli; python_version < "3.11"

@@ -340,6 +340,49 @@ def build_weight_vector(feature_cache, dynamic_weights, default_value):
     return weight_vector
 
 
+def build_score_vector(feature_cache, feature_scores):
+    score_vector = np.zeros(len(feature_cache["names"]), dtype=np.float32)
+    for feature_name, feature_score in feature_scores.items():
+        feature_idx = feature_cache["index_map"].get(feature_name)
+        if feature_idx is not None:
+            score_vector[feature_idx] = float(feature_score)
+    return score_vector
+
+
+def apply_history_scores(total_scores, score_cache, history_preference, global_history_w):
+    if not history_preference or float(global_history_w) == 0.0:
+        return total_scores
+
+    history_multiplier = float(global_history_w)
+
+    tag_cache = score_cache["tags"]
+    tag_history_scores = history_preference.get("tags", {})
+    if tag_cache["names"] and tag_history_scores:
+        tag_history_vector = build_score_vector(tag_cache, tag_history_scores)
+        if tag_history_vector.any():
+            tag_history_sum = np.asarray(tag_cache["matrix"].dot(tag_history_vector)).reshape(-1)
+            total_scores += (tag_history_sum / tag_cache["row_norms"]) * history_multiplier
+
+    title_cache = score_cache["title_words"]
+    title_history_scores = history_preference.get("title_words", {})
+    if title_cache["names"] and title_history_scores:
+        title_history_vector = build_score_vector(title_cache, title_history_scores)
+        if title_history_vector.any():
+            title_history_sum = np.asarray(title_cache["matrix"].dot(title_history_vector)).reshape(-1)
+            total_scores += (title_history_sum / title_cache["row_norms"]) * history_multiplier
+
+    artist_cache = score_cache["artists"]
+    artist_history_scores = history_preference.get("artists", {})
+    if artist_cache["names"] and artist_history_scores:
+        artist_history_vector = build_score_vector(artist_cache, artist_history_scores)
+        valid_artist_mask = artist_cache["codes"] >= 0
+        if valid_artist_mask.any() and artist_history_vector.any():
+            artist_codes = artist_cache["codes"][valid_artist_mask]
+            total_scores[valid_artist_mask] += artist_history_vector[artist_codes] * history_multiplier
+
+    return total_scores
+
+
 def apply_dynamic_scores(
     df,
     tag_weights,
@@ -352,6 +395,8 @@ def apply_dynamic_scores(
     global_artist_w,
     global_title_w,
     score_cache=None,
+    history_preference=None,
+    global_history_w=0.0,
 ):
     if score_cache is None:
         score_cache = build_score_cache(df, tag_freq, artist_freq, title_word_freq)
@@ -384,6 +429,13 @@ def apply_dynamic_scores(
         title_effective_scores = title_cache["base_scores"] * title_weight_vector
         title_score_sum = np.asarray(title_cache["matrix"].dot(title_effective_scores)).reshape(-1)
         total_scores += (title_score_sum / title_cache["row_norms"]) * float(global_title_w)
+
+    total_scores = apply_history_scores(
+        total_scores,
+        score_cache,
+        history_preference,
+        global_history_w,
+    )
 
     scored_df = df.copy()
     scored_df['推荐评分'] = total_scores.astype(np.int32)

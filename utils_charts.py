@@ -1,6 +1,34 @@
 import altair as alt
 import pandas as pd
 import streamlit as st
+from collections import Counter
+
+
+def _coerce_history_list(value):
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    if isinstance(value, str):
+        stripped_value = value.strip()
+        if not stripped_value:
+            return []
+        return [item.strip() for item in stripped_value.split(",") if item.strip()]
+
+    return []
+
+
+def _unique_history_items(items):
+    seen_items = set()
+    unique_items = []
+    for item in items:
+        if item in seen_items:
+            continue
+        seen_items.add(item)
+        unique_items.append(item)
+    return unique_items
 
 
 def build_preference_chart_cache(tag_freq, artist_freq, title_word_freq):
@@ -34,6 +62,56 @@ def build_preference_chart_cache(tag_freq, artist_freq, title_word_freq):
             "table_label_col": "特征词汇",
             "table_value_col": "出现频次",
             "expander_label": "🔍 查看 Top 150 标题高频词汇",
+        },
+    }
+
+
+def build_history_preference_chart_data(history_entries):
+    tag_counter = Counter()
+    artist_counter = Counter()
+    title_word_counter = Counter()
+
+    for entry in history_entries:
+        if not isinstance(entry, dict):
+            continue
+
+        tag_counter.update(_unique_history_items(_coerce_history_list(entry.get("tags"))))
+        title_word_counter.update(_unique_history_items(_coerce_history_list(entry.get("title_words"))))
+
+        author = str(entry.get("author", "")).strip()
+        if author:
+            artist_counter[author] += 1
+
+    return {
+        "tags": {
+            "title": "Top 15 历史偏好标签",
+            "top_15": tag_counter.most_common(15),
+            "top_150": tag_counter.most_common(150),
+            "label_col": "标签",
+            "value_col": "打开频次",
+            "table_label_col": "历史偏好标签",
+            "table_value_col": "打开频次",
+            "expander_label": "🔍 查看 Top 150 历史偏好标签",
+        },
+        "artists": {
+            "title": "Top 15 历史偏好作者",
+            "top_15": artist_counter.most_common(15),
+            "top_150": artist_counter.most_common(150),
+            "label_col": "作者",
+            "value_col": "打开频次",
+            "table_label_col": "历史偏好作者",
+            "table_value_col": "打开频次",
+            "expander_label": "🔍 查看 Top 150 历史偏好作者",
+        },
+        "title_words": {
+            "title": "Top 15 历史偏好标题词",
+            "top_15": title_word_counter.most_common(15),
+            "top_150": title_word_counter.most_common(150),
+            "label_col": "词汇",
+            "value_col": "打开频次",
+            "table_label_col": "历史偏好标题词",
+            "table_value_col": "打开频次",
+            "expander_label": "🔍 查看 Top 150 历史偏好标题词",
         },
     }
 
@@ -103,3 +181,22 @@ def render_global_preference_charts(chart_cache):
 
     with chart_col3:
         render_preference_chart_block(chart_cache["title_words"])
+
+
+def render_history_preference_charts(history_entries):
+    chart_data = build_history_preference_chart_data(history_entries)
+
+    st.markdown("---")
+    st.subheader("用户历史偏好数据")
+    st.caption("数据来源：datacache/recommendation_history.json")
+
+    chart_col1, chart_col2, chart_col3 = st.columns(3)
+
+    with chart_col1:
+        render_preference_chart_block(chart_data["tags"])
+
+    with chart_col2:
+        render_preference_chart_block(chart_data["artists"])
+
+    with chart_col3:
+        render_preference_chart_block(chart_data["title_words"])
