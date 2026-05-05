@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 import logging
 import os
 import re
@@ -6,7 +6,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -15,10 +15,10 @@ from requests.exceptions import HTTPError
 
 MAX_WORKERS = 5
 BASE_URL = "https://18comic.vip"
-START_URL = "https://18comic.vip/search/photos?main_tag=0&search_query=%E5%85%BD%E8%80%B3"
-MAX_PAGES = 100
+START_URL = "https://18comic.vip/search/photos?search_query=%E7%99%BE%E5%90%88"
+MAX_PAGES = 80
 OUTPUT_DIR = "output1"
-CSV_PATH = "JM_info_kemonomimi.csv"
+CSV_PATH = "JM_info_yuri.csv"
 LOG_DIR = "logs"
 RETRY_TIMES = 3
 BACKOFF_BASE_SECONDS = 1
@@ -146,6 +146,34 @@ def request_with_retry(url, timeout, request_name):
             time.sleep(wait_seconds)
 
     raise last_exc
+
+
+def build_page_url(search_url, page_number):
+    if page_number <= 1:
+        return search_url
+
+    url_parts = urlsplit(search_url)
+    query_items = parse_qsl(url_parts.query, keep_blank_values=True)
+    page_found = False
+
+    for index, (key, _value) in enumerate(query_items):
+        if key == "page":
+            query_items[index] = (key, str(page_number))
+            page_found = True
+            break
+
+    if not page_found:
+        query_items.append(("page", str(page_number)))
+
+    return urlunsplit(
+        (
+            url_parts.scheme,
+            url_parts.netloc,
+            url_parts.path,
+            urlencode(query_items),
+            url_parts.fragment,
+        )
+    )
 
 
 def extract_page_count(detail_soup):
@@ -331,7 +359,15 @@ def fetch_comic(task):
             else:
                 logger.warning("%s 下载图片失败 %s: %s", progress, img_url, exc, exc_info=True)
 
-    detail_data = parse_detail(detail_url, progress=progress)
+    try:
+        detail_data = parse_detail(detail_url, progress=progress)
+    except Exception as exc:
+        if is_http_403(exc):
+            logger.warning("%s 获取详情页被拒绝(403): %s", progress, detail_url)
+        else:
+            logger.error("%s 获取详情页失败 %s: %s", progress, detail_url, exc, exc_info=True)
+        return None
+
     row = [
         jm_id,
         detail_url,
@@ -467,7 +503,11 @@ def scrape_18comic():
                 for future in as_completed(futures):
                     task = futures[future]
                     try:
-                        title, row = future.result()
+                        result = future.result()
+                        if result is None:
+                            continue
+
+                        title, row = result
                         csv_writer.writerow(row)
                         csv_file.flush()
                         existing_ids.add(row[0])
@@ -478,12 +518,7 @@ def scrape_18comic():
                         else:
                             logger.error("%s 获取详情页失败 %s: %s", format_task_progress(task), task["detail_url"], exc, exc_info=True)
 
-            next_page_a = soup.find("a", string=re.compile("下一"))
-            if next_page_a and "href" in next_page_a.attrs:
-                current_url = urljoin(BASE_URL, next_page_a["href"])
-            else:
-                logger.info("没有更多页数。")
-                break
+            current_url = build_page_url(START_URL, page_count + 1)
 
     logger.info("=== 抓取完成，详情页使用 %s 个线程并发 ===", MAX_WORKERS)
 
