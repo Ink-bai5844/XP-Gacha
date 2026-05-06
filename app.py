@@ -650,7 +650,7 @@ with tab_library:
             )
 
         table_df = display_df.drop(
-            columns=['文件名', '解析后标签', '标题特征词', '搜索文本', '本地目录'],
+            columns=['文件名', '解析后标签', '标题特征词', '搜索文本'],
             errors='ignore',
         )
         if link_tracking_server is not None and '链接' in table_df.columns:
@@ -658,7 +658,7 @@ with tab_library:
 
         preferred_columns = [
             '封面', '选中', '封面相关度', 'AI相关度', '推荐评分', 'ID', '上传日期',
-            '标题', '作者', '团队', '标签', '语言', '页数', '链接'
+            '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接'
         ]
         table_df = make_selectable_table(table_df)
         display_columns = [col for col in preferred_columns if col in table_df.columns]
@@ -680,7 +680,8 @@ with tab_library:
                     max_value=max_possible_score
                 ),
                 "ID": st.column_config.TextColumn("ID", help="唯一标识符"),
-                "上传日期": st.column_config.TextColumn("上传日期", help="该漫画的上传时间")
+                "上传日期": st.column_config.TextColumn("上传日期", help="该漫画的上传时间"),
+                "本地目录": st.column_config.TextColumn("本地目录", help="匹配到的本地漫画目录")
             },
             column_order=display_columns,
             disabled=[col for col in table_df.columns if col != "选中"],

@@ -28,11 +28,13 @@
 - 支持本地向量模型的自然语言语义检索
 - 支持上传图片或输入库内 `ID` 的封面相似检索（CLIP）
 - 支持展示封面缩略图、来源链接和本地目录
-- 支持在界面中直接打开本地漫画文件夹
+- 主界面支持勾选漫画；选中只用于详情查看，不会写入历史记录
+- 漫画详情页集中展示主列表未展开的完整信息，并提供本地目录打开入口
+- LLM 助手、漫画详情、历史记录、数据处理均已拆成独立页面
 - 支持全局偏好图表和历史偏好图表，均提供 Top 15 图表与 Top 150 展开表
 - 支持将当前筛选结果注入给 LLM 做RAG增强检索问答
 - 支持 nhentai源(以下简称`NH`) / 禁漫天堂源(以下简称`JM`) 双源抓取、修复抓取和本地链接补抓
-- 支持全量导库、增量导库、向量库重建与封面 Base64 预编码
+- 数据处理页支持数据抓取、全量导库、增量导库、向量库重建、封面 Base64 预编码、缓存维护、脚本实时输出等功能
 
 ### 检索排序
 
@@ -79,7 +81,9 @@
 应用会把最近 `HISTORY_RECOMMENDATION_CACHE_SIZE` 次通过页面打开的条目记录到 `datacache/recommendation_history.json`：
 
 - 点击库存列表中的 `图库链接 -> 网络来源`
-- 点击下方的 `打开本地文件夹`
+- 在漫画详情页点击 `打开本地目录`
+
+库存列表里的 `选中` 只用于切换当前漫画详情，不会写入历史记录，也不会影响历史偏好统计。
 
 每条历史记录会保存：
 
@@ -114,7 +118,7 @@ feature_bonus =
 127.0.0.1:8765
 ```
 
-如果该端口被占用，来源链接仍会直接打开，但网络链接点击不会写入历史记录；本地文件夹打开记录不受影响。
+如果该端口被占用，来源链接仍会直接打开，但网络链接点击不会写入历史记录；漫画详情页里的本地目录打开记录不受影响。
 
 默认展示排序为：
 
@@ -126,6 +130,7 @@ feature_bonus =
 ```text
 XP-Gacha/
 ├─ app.py                                  # 本地主界面
+├─ ui_data_processing.py                   # 数据处理可视化页面与脚本输出
 ├─ config_empty.py                         # 配置模板
 ├─ config.py                               # 本地实际配置
 ├─ data_pipeline.py                        # 数据读取、缓存、标签/标题处理、动态评分
@@ -186,7 +191,7 @@ XP-Gacha/
 6. 启动 `app.py` 后，从数据库读取数据并做预处理缓存。
 7. 页面中按照推荐评分、关键词、语义检索、封面相似检索结果进行筛选和展示。
 8. 缩略图显示优先命中 Base64 缓存，其次在线图，最后本地图回退。
-9. 点击来源链接或打开本地文件夹时，会把条目的聚合标签、标题词、作者等写入 `datacache/recommendation_history.json`，供历史偏好加权和历史偏好图表使用。
+9. 点击来源链接或在漫画详情页打开本地目录时，会把条目的聚合标签、标题词、作者等写入 `datacache/recommendation_history.json`，供历史偏好加权和历史偏好图表使用；仅勾选漫画不会写入历史。
 
 ## 💻 运行环境
 
@@ -328,17 +333,16 @@ streamlit run app.py
 
 页面当前支持：
 
-- 推荐评分排序
-- ID / 标题 / 标签 / 作者 / 团队关键词检索
-- 标签屏蔽
-- 标签、作者、标题权重调节
-- 历史偏好加权倍率调节、刷新历史记录、清空历史记录
+- `库存列表`：推荐评分排序、ID / 标题 / 标签 / 作者 / 团队关键词检索、选中漫画、来源链接、本地目录列、封面缩略图显示
+- `漫画详情`：展示当前选中漫画的完整信息，左侧显示封面与本地目录打开入口
+- `LLM 助手`：将当前结果集注入 LLM-RAG 问答
+- `历史记录`：刷新历史记录、清空历史记录、查看和删除历史条目
+- `数据处理`：CSV 整理、数据库同步、缓存与向量、维护工具、采集入口，以及每个脚本的实时输出
+- 侧边栏：标签屏蔽，标签/作者/标题权重调节，历史偏好总分倍率调节
 - AI 语义检索
 - 封面相似检索（支持上传图片，或输入库内已有条目的 `ID` 直接使用其封面做相似检索）
-- 当前结果集注入 LLM-RAG 问答
-- 封面缩略图显示
 - 点击库存列表中的来源链接，并记录历史偏好
-- 一键打开本地漫画目录，并记录历史偏好
+- 在漫画详情页一键打开本地漫画目录，并记录历史偏好
 - 全局偏好统计图表
 - 用户历史偏好统计图表
 
@@ -435,14 +439,22 @@ streamlit run app.py
 
 ## 🛠️ 数据准备与维护
 
-注：均需按照自己想法修改相应代码中的参数【链接/保存名称/最大循环页数/读取错误报告名称】
+推荐优先使用应用内的 `数据处理` 页面操作。该页面已经把常用流程做成可视化表单，并提供脚本实时输出：
+
+- CSV 整理：补文件名、标签/标题词整理、Base64 预编码等
+- 数据库同步：全量导入 MySQL、增量同步 MySQL
+- 缓存与向量：重建文本向量库、构建/查看封面图片向量索引
+- 维护工具：刷新缓存统计、清理缓存、合并 Base64 增量缓存
+- 采集入口：NH/JM 在线抓信息、失败页重试、NH 本地链接抓信息、NH 本地链接抓完整漫画
+
+采集入口里的链接、起始网址、保存 CSV 路径、抓取页数、线程数、错误日志、失败报告等参数都可以直接在页面里填写。脚本内也保留了同名全局变量，方便直接运行脚本或临时覆写。
 
 ### NH 在线抓取
 
 循环抓取指定页数范围，自动写入 `ID`、下载缩略图，并按 `ID` 查重：
 
 ```powershell
-python data_get/NH_get_info_online.py 100
+python data_get/NH_get_info_online.py --max-page 100 --start-url "https://nhentai.net/language/chinese/?sort=date" --output-csv "gallery_info_chinese.csv" --image-dir "onlineimgtmp" --error-log "logs/NH_error_log_online.txt" --max-workers 10 --once
 ```
 
 ### NH 失败页重试
@@ -453,6 +465,8 @@ python data_get/NH_get_info_online.py 100
 python data_get/NH_get_info_online_fix.py
 ```
 
+可在脚本顶部全局变量或 `数据处理` 页面里调整读取的错误日志、重试错误日志、输出 CSV、缩略图目录、起始网址等参数。
+
 ### JM 在线抓取
 
 抓取JM数据，自动写 `JM...` 的 `ID`，自动清洗语言标签和上传日期：
@@ -460,6 +474,8 @@ python data_get/NH_get_info_online_fix.py
 ```powershell
 python data_get/JM_get_info_online.py
 ```
+
+可在脚本顶部全局变量或 `数据处理` 页面里调整 `BASE_URL`、`START_URL`、`MAX_PAGES`、`CSV_PATH`、`OUTPUT_DIR`、`MAX_WORKERS` 等参数。
 
 ### JM 失败页重试
 
@@ -469,6 +485,8 @@ python data_get/JM_get_info_online.py
 python data_get/JM_get_info_online_fix.py
 ```
 
+可在脚本顶部全局变量或 `数据处理` 页面里调整读取的错误日志、重试日志、失败页报告 CSV、输出 CSV、起始网址等参数。
+
 ### NH 本地链接抓信息
 
 如果你已经有本地链接列表：
@@ -477,11 +495,15 @@ python data_get/JM_get_info_online_fix.py
 python data_get/local/NH_get_info_local.py
 ```
 
+可在脚本顶部全局变量或 `数据处理` 页面里调整输入链接文件、输出 CSV、错误日志、请求间隔等参数。
+
 ### NH 本地链接抓完整漫画
 
 ```powershell
 python data_get/local/NH_get_images_local.py
 ```
+
+可在脚本顶部全局变量或 `数据处理` 页面里调整输入链接文件、本地漫画根目录、错误日志、最大页数、请求间隔与重试次数等参数。
 
 ### 给 CSV 补文件名
 
@@ -526,6 +548,12 @@ python data_processing/build_vector_db.py
 ```
 
 当你改了数据库主键逻辑、更新了大量数据、或者刚跑完全量导库后，建议重建一次。
+
+常用参数示例：
+
+```powershell
+python data_processing/build_vector_db.py --model-path "models/Qwen3-Embedding-0.6B" --vector-file "manga_vectors/manga_vectors.pkl" --batch-size 16 --max-text-length 800
+```
 
 ### 构建封面图片向量索引
 
