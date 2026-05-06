@@ -8,7 +8,12 @@ from bs4 import BeautifulSoup
 ID_COLUMN = "ID"
 LINK_COLUMN = "链接"
 ID_PREFIX = "NH"
+INPUT_FILE = "data/local_data/NH_all.txt"
+OUTPUT_CSV = "gallery_info_local.csv"
+ERROR_LOG = "logs/NH_error_log_local.txt"
+REQUEST_INTERVAL_SECONDS = 2.0
 GALLERY_URL_PATTERN = re.compile(r"/g/(\d+)/?")
+LOCAL_LINK_PATTERN = re.compile(r'<A HREF="(https://nhentai\.net/g/\d+/)"')
 
 PROXIES = {
     "http": "http://127.0.0.1:7890",
@@ -142,24 +147,26 @@ def get_gallery_info(url, retries=3):
                 return None
 
 def main():
-    input_file = 'data/local_data/NH_all.txt'
-    output_csv = 'gallery_info_local.csv'
-    error_log = 'logs/NH_error_log_local.txt'
-    
+    input_file = INPUT_FILE
+    output_csv = OUTPUT_CSV
+    error_log = ERROR_LOG
+
     # 检查输入文件是否存在
     if not os.path.exists(input_file):
         print(f"未找到 {input_file} 文件！")
         return
+
+    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(error_log) or ".", exist_ok=True)
 
     # 读取包含链接的txt文件
     with open(input_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
         
     # 用正则提取所有 A HREF 中的链接
-    pattern = r'<A HREF="(https://nhentai\.net/g/\d+/)"'
     urls = []
     for line in lines:
-        match = re.search(pattern, line)
+        match = LOCAL_LINK_PATTERN.search(line)
         if match:
             urls.append(match.group(1))
             
@@ -202,7 +209,7 @@ def main():
                 with open(error_log, 'a', encoding='utf-8') as f_err:
                     f_err.write(f"解析失败: {url}\n")
             
-            time.sleep(2)
+            time.sleep(REQUEST_INTERVAL_SECONDS)
 
     print("\n==============================")
     print(f"所有任务处理完成！数据已保存至 {output_csv}")

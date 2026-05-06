@@ -17,7 +17,7 @@ MAX_WORKERS = 5
 BASE_URL = "https://18comic.vip"
 START_URL = "https://18comic.vip/search/photos?search_query=%E7%99%BE%E5%90%88"
 MAX_PAGES = 80
-OUTPUT_DIR = "output1"
+OUTPUT_DIR = "onlineimgtmp"
 CSV_PATH = "JM_info_yuri.csv"
 LOG_DIR = "logs"
 RETRY_TIMES = 3

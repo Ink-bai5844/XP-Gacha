@@ -4,17 +4,22 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from NH_get_info_online import (
-    CSV_HEADERS,
-    IMG_DIR,
-    MAX_WORKERS,
-    csv_lock,
-    ensure_csv_has_id_column,
-    get_page_urls,
-    load_existing_ids,
-    log_lock,
-    process_single_gallery,
-)
+try:
+    from data_get import NH_get_info_online as source_module
+except ModuleNotFoundError:
+    import NH_get_info_online as source_module
+
+CSV_HEADERS = source_module.CSV_HEADERS
+BASE_URL = source_module.BASE_URL
+START_URL = source_module.START_URL
+IMG_DIR = source_module.IMG_DIR
+MAX_WORKERS = source_module.MAX_WORKERS
+csv_lock = source_module.csv_lock
+ensure_csv_has_id_column = source_module.ensure_csv_has_id_column
+get_page_urls = source_module.get_page_urls
+load_existing_ids = source_module.load_existing_ids
+log_lock = source_module.log_lock
+process_single_gallery = source_module.process_single_gallery
 
 OUTPUT_CSV = "gallery_info_chinese.csv"
 SOURCE_ERROR_LOG = "logs/NH_error_log_online.txt"
@@ -47,18 +52,26 @@ def load_error_pages(log_path):
 
 def append_error_log(log_path, message):
     """线程安全地写入修复任务的错误日志。"""
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     with log_lock:
         with open(log_path, "a", encoding="utf-8") as f_err:
             f_err.write(message.rstrip("\n") + "\n")
 
 
 def main():
+    source_module.BASE_URL = BASE_URL
+    source_module.START_URL = START_URL
+    source_module.IMG_DIR = IMG_DIR
+    source_module.MAX_WORKERS = MAX_WORKERS
+
     error_pages = load_error_pages(SOURCE_ERROR_LOG)
     if not error_pages:
         print("错误日志中没有可重试的页码，程序结束。")
         return
 
     os.makedirs(IMG_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(OUTPUT_CSV) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(RETRY_ERROR_LOG) or ".", exist_ok=True)
     ensure_csv_has_id_column(OUTPUT_CSV)
     processed_ids = load_existing_ids(OUTPUT_CSV)
     page_preview = ", ".join(str(page) for page in error_pages[:20])

@@ -5,11 +5,17 @@ import threading
 import argparse
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from curl_cffi import requests 
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://nhentai.net"
-IMG_DIR = "onlineimgtmp_c"
+START_URL = f"{BASE_URL}/language/chinese/?sort=date"
+IMG_DIR = "onlineimgtmp"
+OUTPUT_CSV = "gallery_info_chinese.csv"
+ERROR_LOG = "logs/NH_error_log_online.txt"
+MAX_PAGE = 1
+LOOP_CRAWL = True
 LINK_COLUMN = "链接"
 ID_COLUMN = "ID"
 ID_PREFIX = "NH"
@@ -24,8 +30,8 @@ MAX_WORKERS = 10
 csv_lock = threading.Lock()  # 保护 CSV 写入
 log_lock = threading.Lock()  # 保护 Error Log 写入
 
-def parse_max_page():
-    """Read max page n from command line or interactive input."""
+def parse_cli_args():
+    """Read crawler options from command line or interactive input."""
     parser = argparse.ArgumentParser(
         description="Loop crawl pages 1..n until manually stopped."
     )
@@ -33,6 +39,7 @@ def parse_max_page():
         "max_page",
         nargs="?",
         type=int,
+        default=MAX_PAGE,
         help="Max page n. The crawler loops from page 1 to n until Ctrl+C.",
     )
     parser.add_argument(
@@ -42,6 +49,17 @@ def parse_max_page():
         type=int,
         help="Max page n. Takes priority over positional max_page.",
     )
+    parser.add_argument(
+        "--start-url",
+        default=START_URL,
+        help="List/search URL used as page 1. The page query parameter is overwritten per page.",
+    )
+    parser.add_argument("--base-url", default=BASE_URL, help="Site base URL used for relative links.")
+    parser.add_argument("--output-csv", default=OUTPUT_CSV, help="Output CSV path.")
+    parser.add_argument("--image-dir", default=IMG_DIR, help="Thumbnail output directory.")
+    parser.add_argument("--error-log", default=ERROR_LOG, help="Error log path.")
+    parser.add_argument("--max-workers", type=int, default=MAX_WORKERS, help="Detail worker count.")
+    parser.add_argument("--once", action="store_true", help="Stop after crawling 1..max_page once.")
     args = parser.parse_args()
 
     max_page = args.max_page_option if args.max_page_option is not None else args.max_page
@@ -56,7 +74,35 @@ def parse_max_page():
         if max_page < 1:
             print("页码必须大于等于 1，请重新输入。")
 
-    return max_page
+    args.max_page = max_page
+    return args
+
+
+def build_page_url(start_url, page_num):
+    if page_num <= 1:
+        return start_url
+
+    url_parts = urlsplit(start_url)
+    query_items = parse_qsl(url_parts.query, keep_blank_values=True)
+    page_found = False
+    for index, (key, _value) in enumerate(query_items):
+        if key == "page":
+            query_items[index] = (key, str(page_num))
+            page_found = True
+            break
+
+    if not page_found:
+        query_items.append(("page", str(page_num)))
+
+    return urlunsplit(
+        (
+            url_parts.scheme,
+            url_parts.netloc,
+            url_parts.path,
+            urlencode(query_items),
+            url_parts.fragment,
+        )
+    )
 
 
 def load_existing_ids(csv_path):
@@ -216,9 +262,11 @@ def get_gallery_info(url, retries=3):
             else:
                 return None
 
-def get_page_urls(page_num, retries=3):
+def get_page_urls(page_num, retries=3, start_url=None, base_url=None):
     """获取指定页码上的所有漫画链接及其对应的缩略图"""
-    page_url = f"{BASE_URL}/language/chinese/?sort=date&page={page_num}"
+    start_url = start_url or START_URL
+    base_url = base_url or BASE_URL
+    page_url = build_page_url(start_url, page_num)
     print(f"\n[{time.strftime('%H:%M:%S')}] 正在扫描列表页: {page_url}")
     
     for attempt in range(1, retries + 1):
@@ -250,8 +298,8 @@ def get_page_urls(page_num, retries=3):
                     href = a_tag['href']
                     if href.startswith('/g/'):
                         items.append({
-                            'url': BASE_URL + href,
-                            'id': extract_nh_id(BASE_URL + href),
+                            'url': base_url + href,
+                            'id': extract_nh_id(base_url + href),
                             'thumb_url': img_tag.get('src', img_tag.get('data-src', '')) if img_tag else ""
                         })
             return items
@@ -322,15 +370,48 @@ def process_single_gallery(item, index, total, page, processed_ids, writer, f_cs
     return new_record_added
 
 
-def main():
-    output_csv = 'gallery_info_chinese.csv'
-    error_log = 'logs/NH_error_log_online.txt'
-    max_page = parse_max_page()
+def main(
+    max_page=None,
+    start_url=None,
+    base_url=None,
+    output_csv=None,
+    image_dir=None,
+    error_log=None,
+    max_workers=None,
+    loop=None,
+):
+    global BASE_URL, IMG_DIR, MAX_WORKERS
+
+    if max_page is None:
+        args = parse_cli_args()
+        max_page = args.max_page
+        start_url = args.start_url
+        base_url = args.base_url
+        output_csv = args.output_csv
+        image_dir = args.image_dir
+        error_log = args.error_log
+        max_workers = args.max_workers
+        loop = False if args.once else LOOP_CRAWL
+
+    BASE_URL = (base_url or BASE_URL).rstrip("/")
+    IMG_DIR = image_dir or IMG_DIR
+    MAX_WORKERS = int(max_workers or MAX_WORKERS)
+    output_csv = output_csv or OUTPUT_CSV
+    error_log = error_log or ERROR_LOG
+    start_url = start_url or START_URL
+    if max_page is None:
+        max_page = MAX_PAGE
+    loop = LOOP_CRAWL if loop is None else bool(loop)
     
     os.makedirs(IMG_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(error_log) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     ensure_csv_has_id_column(output_csv)
     processed_ids = load_existing_ids(output_csv)
-    print(f"循环模式：将从第 1 页爬到第 {max_page} 页，完成后重新从第 1 页开始。按 Ctrl+C 手动停止。")
+    if loop:
+        print(f"循环模式：将从第 1 页爬到第 {max_page} 页，完成后重新从第 1 页开始。按 Ctrl+C 手动停止。")
+    else:
+        print(f"单轮模式：将从第 1 页爬到第 {max_page} 页后停止。")
     print(f"初始化查重：已在本地CSV发现 {len(processed_ids)} 条历史记录。")
     
     csv_headers = CSV_HEADERS
@@ -349,11 +430,13 @@ def main():
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             while True:
                 if page > max_page:
+                    if not loop:
+                        break
                     cycle_count += 1
                     page = 1
                     print(f"\n========== 开始第 {cycle_count} 轮循环爬取 1..{max_page} ==========")
 
-                items = get_page_urls(page)
+                items = get_page_urls(page, start_url=start_url, base_url=BASE_URL)
                 
                 if items is None:
                     print(f"\n第 {page} 页不存在或没有漫画数据 (404)，停止扫描。")

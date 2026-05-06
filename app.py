@@ -2,6 +2,7 @@ import os
 import math
 import gc
 import hashlib
+import html
 import pandas as pd
 import streamlit as st
 
@@ -23,10 +24,14 @@ from utils_history import (
     clear_history_entries,
     load_history_entries,
     record_recommendation_history,
+    save_history_entries,
     start_link_tracking_server,
 )
 from utils_nlp import load_semantic_engine
 from utils_chat import render_chat_interface
+from ui_data_processing import render_data_processing_interface
+
+SELECTED_MANGA_STATE_KEY = "selected_manga_id"
 
 st.set_page_config(page_title="地下金库(Local)", layout="wide")
 st.markdown(
@@ -39,6 +44,25 @@ st.markdown(
         border-radius: 8px !important;
         box-shadow: 5px 5px 15px rgba(0, 0, 0, 0.4) !important;
         overflow: hidden !important;
+    }
+    .block-container {
+        padding-top: 1.4rem;
+        padding-bottom: 2rem;
+    }
+    [data-testid="stMetric"] {
+        border: 1px solid rgba(49, 51, 63, 0.14);
+        border-radius: 8px;
+        padding: 0.75rem 0.9rem;
+        background: rgba(250, 250, 250, 0.72);
+    }
+    .manga-title {
+        font-size: 1.45rem;
+        font-weight: 750;
+        margin-bottom: 0.1rem;
+    }
+    .muted-line {
+        color: rgba(49, 51, 63, 0.70);
+        margin-bottom: 0.55rem;
     }
     </style>
     """,
@@ -78,6 +102,112 @@ def _get_item_label(item_payload):
     return f"{item_id} | {title}" if item_id and title else (title or item_id or "当前条目")
 
 
+def current_selected_manga_id():
+    selected_manga_id = st.session_state.get(SELECTED_MANGA_STATE_KEY)
+    return str(selected_manga_id) if selected_manga_id else ""
+
+
+def make_selectable_table(table_df):
+    editable_df = table_df.copy()
+    selected_manga_id = current_selected_manga_id()
+    editable_df["选中"] = editable_df["ID"].astype(str).eq(selected_manga_id)
+    return editable_df
+
+
+def apply_table_selection(edited_df, source_df):
+    if "选中" not in edited_df.columns or "ID" not in edited_df.columns:
+        return
+
+    selected_rows = edited_df[edited_df["选中"].fillna(False)]
+    if selected_rows.empty:
+        return
+
+    current_manga_id = current_selected_manga_id()
+    newly_selected = selected_rows[selected_rows["ID"].astype(str) != current_manga_id]
+    chosen_row = newly_selected.iloc[0] if not newly_selected.empty else selected_rows.iloc[0]
+    chosen_manga_id = str(chosen_row["ID"])
+
+    if chosen_manga_id != current_manga_id:
+        matched_rows = source_df[source_df["ID"].astype(str) == chosen_manga_id]
+        history_row = matched_rows.iloc[0] if not matched_rows.empty else chosen_row
+        st.session_state[SELECTED_MANGA_STATE_KEY] = chosen_manga_id
+        st.toast(f"已选中：{_get_item_label(history_row)}", icon="✅")
+        st.rerun()
+
+
+def get_selected_manga(filtered_df):
+    selected_manga_id = current_selected_manga_id()
+    if not selected_manga_id or filtered_df.empty:
+        return None
+
+    matched_rows = filtered_df[filtered_df["ID"].astype(str) == selected_manga_id]
+    if matched_rows.empty:
+        return None
+
+    return matched_rows.iloc[0]
+
+
+def coerce_display_list(value):
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    return []
+
+
+def build_history_table(history_entries):
+    rows = []
+    for index, entry in enumerate(history_entries):
+        if not isinstance(entry, dict):
+            continue
+
+        tags = coerce_display_list(entry.get("tags"))
+        title_words = coerce_display_list(entry.get("title_words"))
+        rows.append(
+            {
+                "删除": False,
+                "序号": index + 1,
+                "打开时间": str(entry.get("opened_at", "")).strip(),
+                "动作": str(entry.get("action", "")).strip(),
+                "ID": str(entry.get("id", "")).strip(),
+                "标题": str(entry.get("title", "")).strip(),
+                "作者": str(entry.get("author", "")).strip(),
+                "本地目录": str(entry.get("local_path", "")).strip(),
+                "链接": str(entry.get("link", "")).strip(),
+                "标签": " | ".join(str(tag).strip() for tag in tags[:8] if str(tag).strip()),
+                "标题词": " | ".join(str(word).strip() for word in title_words[:8] if str(word).strip()),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def format_detail_value(value):
+    if value is None:
+        return ""
+
+    if isinstance(value, (list, tuple, set)):
+        return " | ".join(str(item).strip() for item in value if str(item).strip())
+
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    return str(value).strip()
+
+
+def is_valid_web_link(link):
+    normalized_link = str(link or "").strip().lower()
+    return normalized_link.startswith(("http://", "https://"))
+
+
 def open_local_history_item(item_payload):
     selected_path = str(item_payload.get("本地目录", "")).strip()
     if selected_path != "本地目录不存在" and os.path.exists(selected_path):
@@ -86,6 +216,92 @@ def open_local_history_item(item_payload):
         st.session_state["open_item_notice"] = f"已记录并打开本地目录：{_get_item_label(item_payload)}"
     else:
         st.session_state["open_item_error"] = f"路径失效：{selected_path}"
+
+
+def render_manga_detail(manga):
+    left, right = st.columns([1.1, 2.4], gap="large")
+    manga_payload = manga.to_dict() if hasattr(manga, "to_dict") else dict(manga)
+
+    with left:
+        cover_data = get_cover_base64(
+            manga_payload.get("本地目录", ""),
+            manga_payload.get("ID", ""),
+            manga_payload.get("链接", ""),
+        )
+        if cover_data:
+            st.image(cover_data, width="stretch")
+        else:
+            st.info("暂时没有可用封面。")
+
+        link = format_detail_value(manga_payload.get("链接"))
+        if is_valid_web_link(link):
+            detail_link = build_tracked_link(manga_payload) if link_tracking_server is not None else link
+            st.link_button("打开网络来源", detail_link, width="stretch")
+
+        local_path = format_detail_value(manga_payload.get("本地目录"))
+        if local_path and local_path != "本地目录不存在" and os.path.exists(local_path):
+            st.button(
+                "打开本地目录",
+                width="stretch",
+                key=f"open-local-{manga_payload.get('ID')}",
+                on_click=open_local_history_item,
+                args=(manga_payload,),
+            )
+            st.caption("本地目录")
+            st.code(local_path)
+        else:
+            st.warning(f"本地目录不可用：{local_path or '未匹配'}")
+
+    with right:
+        st.markdown(
+            f"<div class='manga-title'>{html.escape(format_detail_value(manga_payload.get('标题')))}</div>",
+            unsafe_allow_html=True,
+        )
+        subtitle_parts = [
+            format_detail_value(manga_payload.get("ID")),
+            format_detail_value(manga_payload.get("作者")),
+            format_detail_value(manga_payload.get("团队")),
+        ]
+        subtitle = " · ".join(part for part in subtitle_parts if part)
+        st.markdown(
+            f"<div class='muted-line'>{html.escape(subtitle)}</div>",
+            unsafe_allow_html=True,
+        )
+
+        meta_cols = st.columns(4)
+        meta_cols[0].metric("推荐分", format_detail_value(manga_payload.get("推荐评分")) or "0")
+        meta_cols[1].metric("上传日期", format_detail_value(manga_payload.get("上传日期")) or "-")
+        meta_cols[2].metric("语言", format_detail_value(manga_payload.get("语言")) or "-")
+        meta_cols[3].metric("页数", format_detail_value(manga_payload.get("页数")) or "-")
+
+        priority_fields = [
+            "推荐评分",
+            "封面相关度",
+            "AI相关度",
+            "ID",
+            "标题",
+            "作者",
+            "团队",
+            "上传日期",
+            "语言",
+            "页数",
+            "标签",
+            "解析后标签",
+            "标题特征词",
+            "本地目录",
+            "文件名",
+            "链接",
+            "搜索文本",
+        ]
+        ordered_fields = [field for field in priority_fields if field in manga_payload]
+        ordered_fields += [field for field in manga_payload if field not in ordered_fields and field != "封面"]
+        info_rows = [
+            (field, format_detail_value(manga_payload.get(field)))
+            for field in ordered_fields
+            if field != "封面"
+        ]
+        info_df = pd.DataFrame(info_rows, columns=["字段", "内容"])
+        st.dataframe(info_df, hide_index=True, width="stretch", height=560)
 
 
 with st.spinner('正在同步预处理缓存与计算引擎...'):
@@ -131,24 +347,9 @@ st.sidebar.subheader("全局评分权重分配")
 global_tag_weight = st.sidebar.slider("标签总分倍率", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
 global_artist_weight = st.sidebar.slider("作者总分倍率", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
 global_title_weight = st.sidebar.slider("标题总分倍率", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
+global_history_weight = st.sidebar.slider("历史偏好总分倍率", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
 
 history_entries = load_history_entries()
-with st.sidebar.expander("历史偏好加权", expanded=False):
-    global_history_weight = st.slider("历史偏好总分倍率", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
-    st.caption(f"缓存最近 {HISTORY_RECOMMENDATION_CACHE_SIZE} 次打开记录")
-    st.caption(f"当前已记录 {len(history_entries)} 次打开。")
-    if link_tracking_server is None:
-        st.caption("网络链接追踪器未启动，表格链接会直接打开但不会写入历史")
-    col_refresh_history, col_clear_history = st.columns(2)
-    with col_refresh_history:
-        if st.button("刷新记录", width="stretch"):
-            st.session_state["open_item_notice"] = "已刷新历史偏好记录"
-            st.rerun()
-    with col_clear_history:
-        if st.button("清空记录", width="stretch"):
-            clear_history_entries()
-            st.session_state["open_item_notice"] = "已清空历史偏好记录"
-            st.rerun()
 
 st.sidebar.markdown("---")
 
@@ -381,151 +582,196 @@ col2.metric("总收录作者数", f"{len(artist_freq)} 位")
 col3.metric("总标签种类", f"{len(tag_freq)} 种")
 col4.metric("解析标题词汇数", f"{len(title_word_freq)} 种")
 
-st.subheader("库存列表")
-current_page_opener_df = pd.DataFrame()
-
-if not filtered_df.empty:
-    sort_columns = ['推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录']
-    if '封面相关度' in filtered_df.columns:
-        sort_columns.insert(0, '封面相关度')
-    if 'AI相关度' in filtered_df.columns:
-        sort_columns.insert(0, 'AI相关度')
-    
-    col_sort1, col_sort2, col_page, col_empty = st.columns([1.5, 1, 1.5, 2])
-    
-    with col_sort1:
-        global_sort_by = st.selectbox("全局排序依据：", options=sort_columns, index=0)
-    with col_sort2:
-        global_sort_order = st.radio("顺序：", options=["降序 ↓", "升序 ↑"], horizontal=True)
-        
-    is_ascending = (global_sort_order == "升序 ↑")
-    
-    if global_sort_by == '推荐评分':
-        filtered_df = filtered_df.sort_values(by=['推荐评分', '上传日期'], ascending=[is_ascending, False]).reset_index(drop=True)
-    else:
-        filtered_df = filtered_df.sort_values(by=[global_sort_by], ascending=[is_ascending]).reset_index(drop=True)
-
-    total_items = len(filtered_df)
-    total_pages = math.ceil(total_items / MAX_DISPLAY)
-    
-    page_options = []
-    for i in range(total_pages):
-        start_idx = i * MAX_DISPLAY
-        end_idx = min((i + 1) * MAX_DISPLAY - 1, total_items - 1)
-        page_options.append(f"{start_idx} ~ {end_idx}")
-        
-    with col_page:
-        selected_page_label = st.selectbox("选择显示范围：", options=page_options)
-    
-    selected_page_index = page_options.index(selected_page_label)
-    slice_start = selected_page_index * MAX_DISPLAY
-    slice_end = (selected_page_index + 1) * MAX_DISPLAY
-    
-    display_df = filtered_df.iloc[slice_start:slice_end].copy()
-    opener_columns = [
-        col
-        for col in ['ID', '标题', '作者', '本地目录', '链接', '解析后标签', '标题特征词']
-        if col in display_df.columns
-    ]
-    current_page_opener_df = display_df[opener_columns].copy()
-
-    with st.spinner(f'正在加载 {selected_page_label} 范围的缩略图...'):
-        display_df['封面'] = display_df.apply(
-            lambda row: get_cover_base64(row['本地目录'], row.get('ID', ''), row.get('链接', '')), 
-            axis=1
-        )
-
-    chat_context_df = display_df.drop(
+chat_context_df = (
+    filtered_df.drop(
         columns=['封面', '解析后标签', '标题特征词', '搜索文本'],
         errors='ignore',
     ).copy()
+    if not filtered_df.empty
+    else None
+)
 
-    table_df = display_df.drop(
-        columns=['文件名', '解析后标签', '标题特征词', '搜索文本'],
-        errors='ignore',
-    )
-    if link_tracking_server is not None and '链接' in table_df.columns:
-        table_df['链接'] = display_df.apply(build_tracked_link, axis=1)
+tab_library, tab_llm, tab_detail, tab_history, tab_data_processing = st.tabs(
+    ["库存列表", "LLM 助手", "漫画详情", "历史记录", "数据处理"]
+)
 
-    preferred_columns = [
-        '封面', '封面相关度', 'AI相关度', '推荐评分', 'ID', '上传日期',
-        '标题', '作者', '团队', '标签', '语言', '页数',
-        '本地目录', '链接'
-    ]
-    display_columns = [col for col in preferred_columns if col in table_df.columns]
-    display_columns += [col for col in table_df.columns if col not in display_columns]
-    table_df = table_df[display_columns]
+with tab_library:
+    st.subheader("库存列表")
 
-    st.dataframe(
-        table_df,
-        column_config={
-            "封面": st.column_config.ImageColumn("封面", help="本地文件夹中的 1.xxx 封面图"),
-            "链接": st.column_config.LinkColumn("图库链接", display_text="网络来源"),
-            "封面相关度": st.column_config.NumberColumn("封面相关度", format="%.2f"),
-            "AI相关度": st.column_config.NumberColumn("AI相关度", format="%.2f"),
-            "推荐评分": st.column_config.ProgressColumn(
-                "推荐评分", 
-                format="%d", 
-                min_value=min_possible_score, 
-                max_value=max_possible_score
-            ),
-            "ID": st.column_config.TextColumn("ID", help="唯一标识符"),
-            "上传日期": st.column_config.TextColumn("上传日期", help="该漫画的上传时间")
-        },
-        hide_index=True,
-        width='stretch',
-        height=600 
-    )
-
-    del table_df
-    del display_df
-    gc.collect()
-
-else:
-    st.info("没有可以显示的数据喔。")
-
-# 传入纯文本上下文 df 进行渲染
-if 'chat_context_df' in locals():
-    render_chat_interface(chat_context_df)
-else:
-    render_chat_interface(None)
-
-st.markdown("---")
-
-st.markdown("### 📂 打开本地漫画")
-st.write("在下拉框中选择漫画打开本地文件夹 (已过滤屏蔽标签)")
-
-def render_item_opener(filtered_df):
     if not filtered_df.empty:
-        manga_options = {}
-        for row_index, row in filtered_df.iterrows():
-            item_payload = row.to_dict()
-            manga_id = str(item_payload.get('ID', '')).strip() or f"row-{row_index}"
-            manga_options[manga_id] = item_payload
+        sort_columns = ['推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录']
+        if '封面相关度' in filtered_df.columns:
+            sort_columns.insert(0, '封面相关度')
+        if 'AI相关度' in filtered_df.columns:
+            sort_columns.insert(0, 'AI相关度')
 
-        selected_manga_id = st.selectbox(
-            "选择要阅读的漫画：",
-            options=list(manga_options.keys()),
-            format_func=lambda manga_id: _get_item_label(manga_options[manga_id]),
-            key="manga_selector" # 显式指定 key 保证状态稳定
-        )
-        
-        selected_item = manga_options[selected_manga_id]
-        selected_path = str(selected_item.get("本地目录", "")).strip()
-        col_btn, col_path = st.columns([1, 4])
-        with col_btn:
-            st.button(
-                "打开本地文件夹",
-                width="stretch",
-                on_click=open_local_history_item,
-                args=(selected_item,),
+        col_sort1, col_sort2, col_page, col_empty = st.columns([1.5, 1, 1.5, 2])
+
+        with col_sort1:
+            global_sort_by = st.selectbox("全局排序依据：", options=sort_columns, index=0)
+        with col_sort2:
+            global_sort_order = st.radio("顺序：", options=["降序 ↓", "升序 ↑"], horizontal=True)
+
+        is_ascending = (global_sort_order == "升序 ↑")
+
+        if global_sort_by == '推荐评分':
+            sorted_df = filtered_df.sort_values(
+                by=['推荐评分', '上传日期'],
+                ascending=[is_ascending, False],
+            ).reset_index(drop=True)
+        else:
+            sorted_df = filtered_df.sort_values(
+                by=[global_sort_by],
+                ascending=[is_ascending],
+            ).reset_index(drop=True)
+
+        total_items = len(sorted_df)
+        total_pages = math.ceil(total_items / MAX_DISPLAY)
+
+        page_options = []
+        for i in range(total_pages):
+            start_idx = i * MAX_DISPLAY
+            end_idx = min((i + 1) * MAX_DISPLAY - 1, total_items - 1)
+            page_options.append(f"{start_idx} ~ {end_idx}")
+
+        with col_page:
+            selected_page_label = st.selectbox("选择显示范围：", options=page_options)
+
+        selected_page_index = page_options.index(selected_page_label)
+        slice_start = selected_page_index * MAX_DISPLAY
+        slice_end = (selected_page_index + 1) * MAX_DISPLAY
+
+        display_df = sorted_df.iloc[slice_start:slice_end].copy()
+
+        with st.spinner(f'正在加载 {selected_page_label} 范围的缩略图...'):
+            display_df['封面'] = display_df.apply(
+                lambda row: get_cover_base64(row['本地目录'], row.get('ID', ''), row.get('链接', '')),
+                axis=1
             )
-        with col_path:
-            st.info(f"匹配路径: {selected_path}")
+
+        table_df = display_df.drop(
+            columns=['文件名', '解析后标签', '标题特征词', '搜索文本', '本地目录'],
+            errors='ignore',
+        )
+        if link_tracking_server is not None and '链接' in table_df.columns:
+            table_df['链接'] = display_df.apply(build_tracked_link, axis=1)
+
+        preferred_columns = [
+            '封面', '选中', '封面相关度', 'AI相关度', '推荐评分', 'ID', '上传日期',
+            '标题', '作者', '团队', '标签', '语言', '页数', '链接'
+        ]
+        table_df = make_selectable_table(table_df)
+        display_columns = [col for col in preferred_columns if col in table_df.columns]
+        display_columns += [col for col in table_df.columns if col not in display_columns]
+        table_df = table_df[display_columns]
+
+        edited_table = st.data_editor(
+            table_df,
+            column_config={
+                "封面": st.column_config.ImageColumn("封面", help="本地文件夹或线上缓存中的封面图"),
+                "选中": st.column_config.CheckboxColumn("选中", width="small"),
+                "链接": st.column_config.LinkColumn("图库链接", display_text="网络来源"),
+                "封面相关度": st.column_config.NumberColumn("封面相关度", format="%.2f"),
+                "AI相关度": st.column_config.NumberColumn("AI相关度", format="%.2f"),
+                "推荐评分": st.column_config.ProgressColumn(
+                    "推荐评分",
+                    format="%d",
+                    min_value=min_possible_score,
+                    max_value=max_possible_score
+                ),
+                "ID": st.column_config.TextColumn("ID", help="唯一标识符"),
+                "上传日期": st.column_config.TextColumn("上传日期", help="该漫画的上传时间")
+            },
+            column_order=display_columns,
+            disabled=[col for col in table_df.columns if col != "选中"],
+            hide_index=True,
+            width='stretch',
+            height=650,
+            key=f"library-select-{current_selected_manga_id()}-{selected_page_index}-{global_sort_by}-{global_sort_order}",
+        )
+        apply_table_selection(edited_table, display_df)
+
+        del table_df
+        del display_df
+        del sorted_df
+        gc.collect()
+
+        render_global_preference_charts(preference_chart_cache)
     else:
-        st.warning("当前筛选条件下没有匹配的漫画。")
+        st.info("没有可以显示的数据喔。")
 
-render_item_opener(current_page_opener_df)
+with tab_llm:
+    render_chat_interface(chat_context_df)
 
-render_global_preference_charts(preference_chart_cache)
-render_history_preference_charts(history_entries)
+with tab_detail:
+    st.subheader("漫画详情")
+    selected_manga = get_selected_manga(filtered_df)
+    if selected_manga is None:
+        if current_selected_manga_id():
+            st.warning("当前选中的漫画不在筛选结果中，请调整筛选条件或在库存列表重新选中。")
+        else:
+            st.info("先在库存列表里勾选一部漫画，详情和本地打开入口会显示在这里。")
+    else:
+        render_manga_detail(selected_manga)
+
+with tab_history:
+    st.subheader("历史记录")
+    st.caption(f"缓存最近 {HISTORY_RECOMMENDATION_CACHE_SIZE} 次来源链接或本地打开记录，当前已保存 {len(history_entries)} 条。")
+
+    col_refresh_history, col_clear_history = st.columns(2)
+    with col_refresh_history:
+        if st.button("刷新记录", width="stretch", key="history-refresh"):
+            st.rerun()
+    with col_clear_history:
+        if st.button("清空记录", width="stretch", key="history-clear"):
+            clear_history_entries()
+            st.toast("已清空历史偏好记录", icon="✅")
+            st.rerun()
+
+    history_table = build_history_table(history_entries)
+    if history_table.empty:
+        st.info("暂时还没有保存的历史记录。")
+    else:
+        edited_history = st.data_editor(
+            history_table,
+            column_config={
+                "删除": st.column_config.CheckboxColumn("删除", width="small"),
+                "序号": st.column_config.NumberColumn("序号", format="%d", width="small"),
+                "打开时间": "打开时间",
+                "动作": "动作",
+                "ID": "ID",
+                "标题": "标题",
+                "作者": "作者",
+                "本地目录": "本地目录",
+                "链接": st.column_config.LinkColumn("链接", display_text="打开"),
+                "标签": "标签",
+                "标题词": "标题词",
+            },
+            column_order=["删除", "序号", "打开时间", "ID", "标题", "作者", "标签", "标题词", "动作", "本地目录", "链接"],
+            disabled=[col for col in history_table.columns if col != "删除"],
+            hide_index=True,
+            width="stretch",
+            height=560,
+            key=f"history-record-editor-{len(history_entries)}",
+        )
+
+        rows_to_delete = edited_history[edited_history["删除"].fillna(False)]
+        selected_delete_count = len(rows_to_delete)
+        if st.button(
+            f"删除选中的 {selected_delete_count} 条记录",
+            width="stretch",
+            disabled=selected_delete_count == 0,
+            key="history-delete-selected",
+        ):
+            indices_to_delete = set((rows_to_delete["序号"].astype(int) - 1).tolist())
+            remaining_entries = [
+                entry for index, entry in enumerate(history_entries) if index not in indices_to_delete
+            ]
+            save_history_entries(remaining_entries)
+            st.toast(f"已删除 {selected_delete_count} 条历史记录", icon="✅")
+            st.rerun()
+
+    render_history_preference_charts(history_entries)
+
+with tab_data_processing:
+    render_data_processing_interface()

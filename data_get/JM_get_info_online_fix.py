@@ -3,37 +3,55 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
-from JM_get_info_online import (
-    BASE_URL,
-    CSV_HEADERS,
-    CSV_PATH,
-    ERROR_LOG_PATH,
-    FAILED_PAGES_REPORT_PATH,
-    LOG_DIR,
-    MAX_WORKERS,
-    OUTPUT_DIR,
-    START_URL,
-    collect_page_tasks,
-    ensure_csv_schema,
-    filter_pending_tasks,
-    format_task_progress,
-    init_failed_pages_report,
-    is_http_403,
-    load_existing_csv_ids,
-    logger,
-    request_with_retry,
-    write_failed_page_report,
-    fetch_comic,
-)
+try:
+    from data_get import JM_get_info_online as source_module
+except ModuleNotFoundError:
+    import JM_get_info_online as source_module
+
+BASE_URL = source_module.BASE_URL
+CSV_HEADERS = source_module.CSV_HEADERS
+CSV_PATH = source_module.CSV_PATH
+ERROR_LOG_PATH = source_module.ERROR_LOG_PATH
+FAILED_PAGES_REPORT_PATH = source_module.FAILED_PAGES_REPORT_PATH
+LOG_DIR = source_module.LOG_DIR
+MAX_WORKERS = source_module.MAX_WORKERS
+OUTPUT_DIR = source_module.OUTPUT_DIR
+START_URL = source_module.START_URL
+collect_page_tasks = source_module.collect_page_tasks
+ensure_csv_schema = source_module.ensure_csv_schema
+filter_pending_tasks = source_module.filter_pending_tasks
+format_task_progress = source_module.format_task_progress
+init_failed_pages_report = source_module.init_failed_pages_report
+is_http_403 = source_module.is_http_403
+load_existing_csv_ids = source_module.load_existing_csv_ids
+logger = source_module.logger
+request_with_retry = source_module.request_with_retry
+fetch_comic = source_module.fetch_comic
 
 
 SOURCE_ERROR_LOG = os.path.join(LOG_DIR, "getjm_errors_20260427_141729.log")
 RETRY_ERROR_LOG = os.path.join(LOG_DIR, "getjm_fix_retry.log")
 PAGE_PATTERN = re.compile(r"\[第(\d+)页\s*/")
+
+
+def write_retry_failed_page_report(page_number, page_url, exc):
+    os.makedirs(os.path.dirname(FAILED_PAGES_REPORT_PATH) or ".", exist_ok=True)
+    with open(FAILED_PAGES_REPORT_PATH, "a", newline="", encoding="utf-8-sig") as report_file:
+        writer = csv.writer(report_file)
+        writer.writerow(
+            [
+                page_number,
+                page_url,
+                type(exc).__name__,
+                str(exc),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ]
+        )
 
 
 def load_error_pages(log_path):
@@ -80,17 +98,28 @@ def get_page_tasks(page_number, start_index=0):
 
 
 def append_retry_error(message):
+    os.makedirs(os.path.dirname(RETRY_ERROR_LOG) or ".", exist_ok=True)
     with open(RETRY_ERROR_LOG, "a", encoding="utf-8") as log_file:
         log_file.write(message.rstrip("\n") + "\n")
 
 
 def retry_failed_pages():
+    source_module.BASE_URL = BASE_URL
+    source_module.START_URL = START_URL
+    source_module.CSV_PATH = CSV_PATH
+    source_module.OUTPUT_DIR = OUTPUT_DIR
+    source_module.MAX_WORKERS = MAX_WORKERS
+    source_module.FAILED_PAGES_REPORT_PATH = FAILED_PAGES_REPORT_PATH
+
     error_pages = load_error_pages(SOURCE_ERROR_LOG)
     if not error_pages:
         print("错误日志中没有可重试的页码，程序结束。")
         return
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(CSV_PATH) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(RETRY_ERROR_LOG) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(FAILED_PAGES_REPORT_PATH) or ".", exist_ok=True)
     ensure_csv_schema(CSV_PATH)
     existing_ids = load_existing_csv_ids(CSV_PATH)
     init_failed_pages_report(FAILED_PAGES_REPORT_PATH)
@@ -121,7 +150,7 @@ def retry_failed_pages():
                 try:
                     page_url, tasks = get_page_tasks(page, start_index=total_seen)
                 except Exception as exc:
-                    write_failed_page_report(page, build_page_url(page), exc)
+                    write_retry_failed_page_report(page, build_page_url(page), exc)
                     if is_http_403(exc):
                         logger.warning("重试列表页被拒绝(403): %s", build_page_url(page))
                     else:
