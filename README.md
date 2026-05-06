@@ -166,12 +166,14 @@ XP-Gacha/
 │  ├─ ScoringFormula_local.py              # 本地整合版(old)
 │  └─ ScoringFormula_online.py             # 线上整合版
 ├─ manga_vectors/                          # 文本语义向量与图片向量索引
+├─ models/                                 # 本地模型统一存放目录
+│  ├─ Qwen3-Embedding-0.6B/                # embedding 预训练模型
+│  └─ clip-vit-base-patch32/               # CLIP 预训练模型
 ├─ onlineimgtmp/                           # 在线封面缩略图缓存
 ├─ localimgtmp/                            # 本地封面缩略图缓存
 ├─ b64_cache/                              # Base64 封面缓存
 ├─ b64_tmp/                                # Base64 增量临时目录
-├─ datacache/                              # DataFrame 预处理缓存
-└─ Qwen3-Embedding-0.6B/                   # embedding 预训练模型
+└─ datacache/                              # DataFrame 预处理缓存
 ```
 
 ### 数据流
@@ -226,10 +228,10 @@ copy config_empty.py config.py
 然后按本机环境修改：
 
 - `BASE_DIR`：本地漫画根目录
-- `LOCAL_MODEL_PATH`：本地 embedding 模型目录
+- `LOCAL_MODEL_PATH`：本地 embedding 模型目录，默认 `models/Qwen3-Embedding-0.6B`
 - `VECTOR_FILE`：文本语义向量文件输出位置
 - `IMG_VECTOR_FILE`：封面向量索引文件位置
-- `CLIP_MODEL_PATH`：本地 CLIP 模型目录
+- `CLIP_MODEL_PATH`：本地 CLIP 模型目录，默认 `models/clip-vit-base-patch32`
 - `SEMANTIC_SEARCH_TOP_K`：语义检索最多保留的候选数
 - `COVER_SEARCH_TOP_K`：封面相似检索最多保留的候选数
 - `LM_STUDIO_API_BASE` / `LM_STUDIO_MODEL`
@@ -307,6 +309,14 @@ borderColor = "#334039"
 - `dictionaries/TITLE_STOP_WORDS.txt`
 - `dictionaries/TITLE_SEMANTIC_MAP.json`
 - `config.py` 中指定的本地 embedding 模型目录与本地 CLIP 模型目录
+
+本地下载的模型统一放在项目根目录的 `models/` 下。默认使用下面两个目录，其他本地模型也建议继续放在 `models/` 内：
+
+```text
+models/
+├─ Qwen3-Embedding-0.6B/
+└─ clip-vit-base-patch32/
+```
 
 ## 🚀 启动应用
 

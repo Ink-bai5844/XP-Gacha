@@ -8,6 +8,7 @@ ONLINE_IMG_DIR = "onlineimgtmp"
 IMG_CACHE_DIR = "localimgtmp"
 CACHE_DIR = "datacache"
 B64_CACHE_DIR = "b64_cache"
+MODEL_DIR = "models"
 
 # 历史推荐偏好配置
 # 最近 N 次通过应用打开的网络链接/本地目录会参与一条独立历史加权。
@@ -23,10 +24,10 @@ VECTOR_FILE = "manga_vectors/manga_vectors_Qwen3.pkl"
 IMG_VECTOR_FILE = "manga_vectors/clip_image_index.pkl"
 
 # 本地 embedding 模型目录
-LOCAL_MODEL_PATH = r"D:\YourPath\XP-Gacha\Qwen3-Embedding-0.6B"
+LOCAL_MODEL_PATH = os.path.join(MODEL_DIR, "Qwen3-Embedding-0.6B")
 
 # 本地 CLIP 模型目录
-CLIP_MODEL_PATH = r"D:\YourPath\XP-Gacha\clip-vit-base-patch32"
+CLIP_MODEL_PATH = os.path.join(MODEL_DIR, "clip-vit-base-patch32")
 
 # 本地漫画根目录
 BASE_DIR = r"D:\YourMangaLibrary"
@@ -61,7 +62,7 @@ COVER_SEARCH_TOP_K = 5000
 MAX_DISPLAY = 500
 
 # 初始化目录
-for directory in [ONLINE_IMG_DIR, IMG_CACHE_DIR, CACHE_DIR, B64_CACHE_DIR]:
+for directory in [ONLINE_IMG_DIR, IMG_CACHE_DIR, CACHE_DIR, B64_CACHE_DIR, MODEL_DIR]:
     if not os.path.exists(directory):
         os.makedirs(directory)
 

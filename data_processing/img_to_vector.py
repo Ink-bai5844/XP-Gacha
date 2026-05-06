@@ -6,6 +6,7 @@ import json
 import math
 import pickle
 import shutil
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -18,13 +19,26 @@ from PIL import Image, UnidentifiedImageError
 from transformers import AutoProcessor, CLIPModel
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from config import CLIP_MODEL_PATH, IMG_CACHE_DIR, IMG_VECTOR_FILE, ONLINE_IMG_DIR
+
+
+def resolve_config_path(path: str | Path) -> Path:
+    path = Path(path)
+    if path.is_absolute():
+        return path
+    return (PROJECT_ROOT / path).resolve()
+
+
 DEFAULT_IMAGE_DIRS = [
-    PROJECT_ROOT / "onlineimgtmp",
-    PROJECT_ROOT / "localimgtmp",
+    resolve_config_path(ONLINE_IMG_DIR),
+    resolve_config_path(IMG_CACHE_DIR),
 ]
-DEFAULT_INDEX_PATH = PROJECT_ROOT / "datacache" / "clip_image_index.pkl"
-DEFAULT_MODEL_DIR = PROJECT_ROOT / "clip-vit-base-patch32"
+DEFAULT_INDEX_PATH = resolve_config_path(IMG_VECTOR_FILE)
+DEFAULT_MODEL_DIR = resolve_config_path(CLIP_MODEL_PATH)
 DEFAULT_MODEL_NAME = str(DEFAULT_MODEL_DIR)
 PROGRESS_VERSION = 1
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -645,12 +659,12 @@ def add_shared_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL_NAME,
-        help="Local CLIP model directory. Defaults to ./clip-vit-base-patch32.",
+        help="Local CLIP model directory. Defaults to CLIP_MODEL_PATH in config.py.",
     )
     parser.add_argument(
         "--index-path",
         default=str(DEFAULT_INDEX_PATH),
-        help="Where the cached image index will be stored.",
+        help="Where the cached image index will be stored. Defaults to IMG_VECTOR_FILE in config.py.",
     )
     parser.add_argument(
         "--batch-size",
@@ -668,7 +682,7 @@ def add_shared_arguments(parser: argparse.ArgumentParser) -> None:
         "--image-dir",
         action="append",
         default=None,
-        help="Override image directories. Can be used multiple times.",
+        help="Override image directories. Defaults to ONLINE_IMG_DIR and IMG_CACHE_DIR in config.py.",
     )
 
 
