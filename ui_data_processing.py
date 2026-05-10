@@ -98,6 +98,7 @@ def run_command(command: list[str], timeout: int = DEFAULT_TIMEOUT, live_output=
             "stdout": "",
             "stderr": str(exc),
             "timed_out": False,
+            "run_id": str(time.time_ns()),
         }
 
     output_queue: queue.Queue[str | None] = queue.Queue()
@@ -158,6 +159,7 @@ def run_command(command: list[str], timeout: int = DEFAULT_TIMEOUT, live_output=
         "stdout": "".join(output_parts).strip(),
         "stderr": "",
         "timed_out": timed_out,
+        "run_id": str(time.time_ns()),
     }
 
 
@@ -206,7 +208,8 @@ def render_result(key: str, empty_label: str | None = None) -> None:
         if result["stderr"]:
             output_parts.append("[stderr]\n" + result["stderr"])
         output_text = "\n\n".join(output_parts) or "脚本没有输出。"
-        st.text_area("输出内容", output_text, height=320, key=f"{key}-script-output")
+        output_key = f"{key}-script-output-{result.get('run_id', 'legacy')}"
+        st.text_area("输出内容", output_text, height=320, key=output_key)
 
 
 def save_inline_result(key: str, command_label: str, stdout: str, returncode: int = 0, stderr: str = "") -> None:
@@ -216,6 +219,7 @@ def save_inline_result(key: str, command_label: str, stdout: str, returncode: in
         "stdout": stdout,
         "stderr": stderr,
         "timed_out": False,
+        "run_id": str(time.time_ns()),
     }
 
 
@@ -679,8 +683,8 @@ def render_collection_tools() -> None:
                     ")"
                 ),
             )
-            submit_python_code("开始抓取 NH 信息", "collection", code, timeout, require_confirm=confirm)
-        render_result("collection", "脚本输出会显示在这里。")
+            submit_python_code("开始抓取 NH 信息", "collection-nh-online", code, timeout, require_confirm=confirm)
+        render_result("collection-nh-online", "脚本输出会显示在这里。")
         return
 
     if mode == "JM 在线抓信息":
@@ -714,8 +718,8 @@ def render_collection_tools() -> None:
                     "mod.scrape_18comic()"
                 ),
             )
-            submit_python_code("开始抓取 JM 信息", "collection", code, timeout, require_confirm=confirm)
-        render_result("collection", "脚本输出会显示在这里。")
+            submit_python_code("开始抓取 JM 信息", "collection-jm-online", code, timeout, require_confirm=confirm)
+        render_result("collection-jm-online", "脚本输出会显示在这里。")
         return
 
     if mode == "NH 本地链接抓信息":
@@ -736,8 +740,8 @@ def render_collection_tools() -> None:
                 },
                 "mod.main()",
             )
-            submit_python_code("开始解析本地链接", "collection", code, timeout, require_confirm=confirm)
-        render_result("collection", "脚本输出会显示在这里。")
+            submit_python_code("开始解析本地链接", "collection-nh-local-info", code, timeout, require_confirm=confirm)
+        render_result("collection-nh-local-info", "脚本输出会显示在这里。")
         return
 
     if mode == "NH 本地链接抓图片":
@@ -762,8 +766,8 @@ def render_collection_tools() -> None:
                 },
                 "mod.main()",
             )
-            submit_python_code("开始抓取本地链接图片", "collection", code, timeout, require_confirm=confirm)
-        render_result("collection", "脚本输出会显示在这里。")
+            submit_python_code("开始抓取本地链接图片", "collection-nh-local-images", code, timeout, require_confirm=confirm)
+        render_result("collection-nh-local-images", "脚本输出会显示在这里。")
         return
 
     if mode == "NH 在线失败页重试":
@@ -795,8 +799,8 @@ def render_collection_tools() -> None:
                 },
                 "mod.main()",
             )
-            submit_python_code("开始 NH 失败页重试", "collection", code, timeout, require_confirm=confirm)
-        render_result("collection", "脚本输出会显示在这里。")
+            submit_python_code("开始 NH 失败页重试", "collection-nh-retry", code, timeout, require_confirm=confirm)
+        render_result("collection-nh-retry", "脚本输出会显示在这里。")
         return
 
     if mode == "JM 在线失败页重试":
@@ -830,8 +834,8 @@ def render_collection_tools() -> None:
                 },
                 "mod.retry_failed_pages()",
             )
-            submit_python_code("开始 JM 失败页重试", "collection", code, timeout, require_confirm=confirm)
-        render_result("collection", "脚本输出会显示在这里。")
+            submit_python_code("开始 JM 失败页重试", "collection-jm-retry", code, timeout, require_confirm=confirm)
+        render_result("collection-jm-retry", "脚本输出会显示在这里。")
         return
 
     st.info("请选择一个采集流程。")
