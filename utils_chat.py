@@ -66,7 +66,6 @@ def get_ai_response_stream(user_query, context_df, api_mode="本地 (LM Studio)"
         yield f"\n\n❌ API连接失败 ({api_mode}): {e}"
 
 def render_chat_interface(chat_context_df):
-    st.markdown("---")
     st.subheader("🤖 何不试试LLM呢？")
 
     col_mode, col_n, col_temp, col_tok = st.columns([1.5, 1.2, 1, 1])

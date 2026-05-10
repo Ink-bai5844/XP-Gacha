@@ -3,6 +3,7 @@ import math
 import gc
 import hashlib
 import html
+import json
 import pandas as pd
 import streamlit as st
 
@@ -133,6 +134,122 @@ def apply_table_selection(edited_df, source_df):
         st.session_state[SELECTED_MANGA_STATE_KEY] = chosen_manga_id
         st.toast(f"已选中：{_get_item_label(history_row)}", icon="✅")
         st.rerun()
+
+
+def _normalize_copy_value(value):
+    try:
+        is_missing = pd.isna(value)
+    except TypeError:
+        is_missing = False
+    if isinstance(is_missing, bool) and is_missing:
+        return ""
+    text = str(value)
+    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    text = text.replace("\t", " ")
+    return " ".join(text.split())
+
+
+def build_current_page_copy_text(table_df):
+    copy_df = table_df.drop(columns=["封面", "选中"], errors="ignore").copy()
+    for column in copy_df.columns:
+        copy_df[column] = copy_df[column].map(_normalize_copy_value)
+    return copy_df.to_csv(sep="\t", index=False).rstrip()
+
+
+def render_copy_page_button(copy_text, row_count):
+    payload = json.dumps(copy_text, ensure_ascii=False).replace("</", "<\\/")
+    disabled = "true" if not copy_text else "false"
+    button_label = f"复制当前页 {row_count} 条" if row_count else "复制当前页"
+    st.iframe(
+        f"""
+        <div class="copy-wrap">
+            <button id="copy-current-page" type="button" {"disabled" if not copy_text else ""}>
+                {html.escape(button_label)}
+            </button>
+            <span id="copy-status"></span>
+            <textarea id="copy-payload" aria-hidden="true"></textarea>
+        </div>
+        <style>
+            body {{
+                margin: 0;
+                font-family: "Source Sans Pro", sans-serif;
+            }}
+            .copy-wrap {{
+                height: 42px;
+                display: flex;
+                justify-content: flex-end;
+                align-items: center;
+                gap: 8px;
+            }}
+            #copy-current-page {{
+                border: 1px solid rgba(49, 51, 63, 0.22);
+                border-radius: 8px;
+                background: #ffffff;
+                color: rgb(49, 51, 63);
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: 600;
+                line-height: 1;
+                padding: 0.55rem 0.75rem;
+                white-space: nowrap;
+            }}
+            #copy-current-page:hover:not(:disabled) {{
+                border-color: rgba(255, 75, 75, 0.75);
+                color: rgb(255, 75, 75);
+            }}
+            #copy-current-page:disabled {{
+                cursor: not-allowed;
+                opacity: 0.45;
+            }}
+            #copy-status {{
+                color: rgba(49, 51, 63, 0.70);
+                font-size: 13px;
+                min-width: 42px;
+            }}
+            #copy-payload {{
+                position: fixed;
+                left: -9999px;
+                top: -9999px;
+                width: 1px;
+                height: 1px;
+                opacity: 0;
+            }}
+        </style>
+        <script>
+            const copyText = {payload};
+            const disabled = {disabled};
+            const button = document.getElementById("copy-current-page");
+            const status = document.getElementById("copy-status");
+            const payloadBox = document.getElementById("copy-payload");
+
+            async function copyCurrentPage() {{
+                if (disabled || !copyText) {{
+                    return;
+                }}
+                try {{
+                    if (navigator.clipboard && window.isSecureContext) {{
+                        await navigator.clipboard.writeText(copyText);
+                    }} else {{
+                        payloadBox.value = copyText;
+                        payloadBox.focus();
+                        payloadBox.select();
+                        document.execCommand("copy");
+                    }}
+                    status.textContent = "已复制";
+                    window.setTimeout(() => {{
+                        status.textContent = "";
+                    }}, 1800);
+                }} catch (error) {{
+                    status.textContent = "复制失败";
+                    console.error(error);
+                }}
+            }}
+
+            button.addEventListener("click", copyCurrentPage);
+        </script>
+        """,
+        height=46,
+    )
 
 
 def get_selected_manga(filtered_df):
@@ -596,7 +713,10 @@ tab_library, tab_llm, tab_detail, tab_history, tab_data_processing = st.tabs(
 )
 
 with tab_library:
-    st.subheader("库存列表")
+    title_col, copy_col = st.columns([4, 1.6])
+    with title_col:
+        st.subheader("库存列表")
+    copy_button_slot = copy_col.empty()
 
     if not filtered_df.empty:
         sort_columns = ['推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录']
@@ -664,6 +784,8 @@ with tab_library:
         display_columns = [col for col in preferred_columns if col in table_df.columns]
         display_columns += [col for col in table_df.columns if col not in display_columns]
         table_df = table_df[display_columns]
+        with copy_button_slot.container():
+            render_copy_page_button(build_current_page_copy_text(table_df), len(table_df))
 
         edited_table = st.data_editor(
             table_df,
@@ -699,6 +821,8 @@ with tab_library:
 
         render_global_preference_charts(preference_chart_cache)
     else:
+        with copy_button_slot.container():
+            render_copy_page_button("", 0)
         st.info("没有可以显示的数据喔。")
 
 with tab_llm:
