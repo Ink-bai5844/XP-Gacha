@@ -7,6 +7,8 @@ import pandas as pd
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL
 
+from data_processing.optimize_mysql_schema import optimize_gallery_schema
+
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -174,6 +176,8 @@ def sync_csv_to_db():
         
         # 销毁临时表
         conn.execute(text("DROP TABLE temp_gallery_info;"))
+
+    optimize_gallery_schema(engine)
 
     print("🎉 增量同步完成！")
 

@@ -453,6 +453,18 @@ def render_database_tools() -> None:
             submit_python_code("覆盖重建", "db-rebuild", code, timeout, require_confirm=confirm)
         render_result("db-rebuild", "脚本输出会显示在这里。")
 
+    with st.expander("优化 MySQL 表结构与全文索引", expanded=False):
+        with st.form("process-db-optimize"):
+            confirm = st.checkbox("确认执行 ALTER TABLE 与 FULLTEXT 索引维护", value=False)
+            timeout = st.number_input("超时秒数", 10, 14400, 3600, 10, key="db-optimize-timeout")
+            code = module_call_code(
+                "data_processing.optimize_mysql_schema",
+                {},
+                "mod.optimize_gallery_schema()",
+            )
+            submit_python_code("执行优化", "db-optimize", code, timeout, require_confirm=confirm)
+        render_result("db-optimize", "脚本输出会显示在这里。")
+
 
 def render_cache_tools() -> None:
     with st.expander("Base64 预编码", expanded=True):

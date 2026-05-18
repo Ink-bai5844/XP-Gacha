@@ -3,16 +3,20 @@ import math
 import hashlib
 import pickle
 import gc
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 from collections import Counter
 from scipy.sparse import csr_matrix
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, create_engine, text
 from config import CACHE_DIR, STOP_TAGS, SEMANTIC_MAP
 from utils_core import get_local_folders, match_local_folder
 from utils_charts import build_preference_chart_cache
 from utils_nlp import extract_and_map_title_words
+
+SEARCH_COLUMNS = ["标题", "标签", "作者", "团队"]
+FULLTEXT_INDEX_NAME = "ft_gallery_search"
 
 @st.cache_resource
 def init_db_engine():
@@ -45,6 +49,233 @@ def build_search_text_series(df):
         combined_series = combined_series.str.cat(normalized_series, sep=' ')
 
     return combined_series.str.replace(r'\s+', ' ', regex=True).str.strip()
+
+
+def parse_search_keywords(search_text):
+    return [
+        keyword.strip()
+        for keyword in str(search_text or "").replace("，", ",").split(",")
+        if keyword.strip()
+    ]
+
+
+def build_id_to_row_map(df):
+    if df is None or df.empty or "ID" not in df.columns:
+        return {}
+    return {str(item_id): row_idx for row_idx, item_id in enumerate(df["ID"].astype(str))}
+
+
+def get_row_indices_for_ids(df, item_ids, id_to_row=None):
+    id_to_row = id_to_row or build_id_to_row_map(df)
+    row_indices = []
+    seen = set()
+    for item_id in item_ids:
+        normalized_id = str(item_id).strip()
+        if not normalized_id or normalized_id in seen:
+            continue
+        row_idx = id_to_row.get(normalized_id)
+        if row_idx is not None:
+            row_indices.append(row_idx)
+            seen.add(normalized_id)
+    return np.array(row_indices, dtype=np.int32)
+
+
+def escape_like_keyword(keyword):
+    return (
+        str(keyword)
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
+def build_boolean_fulltext_query(keyword):
+    normalized = re.sub(r'\s+', ' ', str(keyword or "").strip())
+    normalized = normalized.replace('"', " ")
+    normalized = normalized.replace("+", " ").replace("-", " ")
+    normalized = normalized.replace("@", " ").replace("~", " ")
+    normalized = normalized.replace(">", " ").replace("<", " ")
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    if not normalized:
+        return ""
+    if " " in normalized:
+        return f'"{normalized}"'
+    return f"{normalized}*"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def has_gallery_fulltext_index():
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'gallery_info'
+                      AND INDEX_NAME = :index_name
+                    """
+                ),
+                {"index_name": FULLTEXT_INDEX_NAME},
+            ).scalar()
+        return bool(result)
+    except Exception as exc:
+        print(f"全文索引状态检查失败: {exc}")
+        return False
+
+
+def search_gallery_ids_with_like(keywords):
+    if not keywords:
+        return [], {}
+
+    where_parts = []
+    params = {}
+    search_columns = ["ID", *SEARCH_COLUMNS]
+    for idx, keyword in enumerate(keywords):
+        part_conditions = []
+        params[f"kw{idx}"] = f"%{escape_like_keyword(keyword.lower())}%"
+        for column in search_columns:
+            part_conditions.append(f"LOWER(`{column}`) LIKE :kw{idx} ESCAPE '\\\\'")
+        where_parts.append("(" + " OR ".join(part_conditions) + ")")
+
+    sql = f"""
+        SELECT ID
+        FROM gallery_info
+        WHERE {" AND ".join(where_parts)}
+        ORDER BY ID
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql), params).mappings().all()
+
+    matched_ids = [str(row["ID"]) for row in rows]
+    return matched_ids, {item_id: 0.0 for item_id in matched_ids}
+
+
+def search_gallery_ids_with_fulltext(keywords, include_relevance=True):
+    if not keywords:
+        return [], {}
+
+    match_expr = "MATCH(`标题`, `标签`, `作者`, `团队`)"
+    where_parts = []
+    score_parts = []
+    params = {}
+
+    for idx, keyword in enumerate(keywords):
+        ft_query = build_boolean_fulltext_query(keyword)
+        if not ft_query:
+            continue
+        params[f"ft{idx}"] = ft_query
+        params[f"id_exact{idx}"] = str(keyword).strip().upper()
+        params[f"id_prefix{idx}"] = f"{escape_like_keyword(str(keyword).strip().upper())}%"
+        ft_condition = f"{match_expr} AGAINST (:ft{idx} IN BOOLEAN MODE)"
+        where_parts.append(
+            f"(`ID` = :id_exact{idx} OR `ID` LIKE :id_prefix{idx} ESCAPE '\\\\' OR {ft_condition})"
+        )
+        if include_relevance:
+            score_parts.append(f"{ft_condition}")
+
+    if not where_parts:
+        return [], {}
+
+    if include_relevance and score_parts:
+        score_expr = " + ".join(score_parts)
+        sql = f"""
+            SELECT ID, ({score_expr}) AS search_score
+            FROM gallery_info
+            WHERE {" AND ".join(where_parts)}
+            ORDER BY search_score DESC, ID
+        """
+    else:
+        sql = f"""
+            SELECT ID
+            FROM gallery_info
+            WHERE {" AND ".join(where_parts)}
+            ORDER BY ID
+        """
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql), params).mappings().all()
+
+    matched_ids = [str(row["ID"]) for row in rows]
+    if not include_relevance:
+        return matched_ids, {}
+
+    score_map = {
+        str(row["ID"]): float(row["search_score"] or 0.0)
+        for row in rows
+    }
+    return matched_ids, score_map
+
+
+def search_gallery_candidate_ids(search_text, include_relevance=True):
+    keywords = parse_search_keywords(search_text)
+    if not keywords:
+        return {
+            "ids": [],
+            "score_map": {},
+            "keywords": [],
+            "mode": "none",
+            "used_fulltext": False,
+        }
+
+    used_fulltext = has_gallery_fulltext_index()
+    try:
+        if used_fulltext:
+            matched_ids, score_map = search_gallery_ids_with_fulltext(
+                keywords,
+                include_relevance=include_relevance,
+            )
+            if matched_ids:
+                return {
+                    "ids": matched_ids,
+                    "score_map": score_map,
+                    "keywords": keywords,
+                    "mode": "FULLTEXT",
+                    "used_fulltext": True,
+                }
+        matched_ids, score_map = search_gallery_ids_with_like(keywords)
+        return {
+            "ids": matched_ids,
+            "score_map": score_map,
+            "keywords": keywords,
+            "mode": "LIKE fallback" if used_fulltext else "LIKE",
+            "used_fulltext": False,
+        }
+    except Exception as exc:
+        print(f"数据库关键词召回失败: {exc}")
+        matched_ids, score_map = search_gallery_ids_with_like(keywords)
+        return {
+            "ids": matched_ids,
+            "score_map": score_map,
+            "keywords": keywords,
+            "mode": "LIKE fallback",
+            "used_fulltext": False,
+        }
+
+
+def fetch_gallery_rows_by_ids(item_ids):
+    normalized_ids = []
+    seen = set()
+    for item_id in item_ids:
+        normalized_id = str(item_id).strip()
+        if normalized_id and normalized_id not in seen:
+            normalized_ids.append(normalized_id)
+            seen.add(normalized_id)
+
+    if not normalized_ids:
+        return pd.DataFrame()
+
+    statement = text("SELECT * FROM gallery_info WHERE ID IN :item_ids").bindparams(
+        bindparam("item_ids", expanding=True)
+    )
+    page_df = pd.read_sql(statement, con=engine, params={"item_ids": normalized_ids}).fillna("")
+    if page_df.empty or "ID" not in page_df.columns:
+        return page_df
+
+    order = {item_id: idx for idx, item_id in enumerate(normalized_ids)}
+    page_df["_page_order"] = page_df["ID"].astype(str).map(order)
+    return page_df.sort_values("_page_order").drop(columns=["_page_order"]).reset_index(drop=True)
 
 
 def build_empty_base_data():
@@ -137,6 +368,7 @@ def build_score_cache(df, tag_frequencies, artist_frequencies, title_word_freque
     parsed_title_words_list = df['标题特征词'].tolist() if '标题特征词' in df.columns else [[] for _ in range(len(df))]
 
     return {
+        "id_to_row": build_id_to_row_map(df),
         "tags": build_multi_value_feature_cache(parsed_tags_list, tag_frequencies),
         "artists": build_artist_feature_cache(df, artist_frequencies),
         "title_words": build_multi_value_feature_cache(parsed_title_words_list, title_word_frequencies),
@@ -314,7 +546,19 @@ def normalize_cached_base_data(cached_payload, cache_data_file):
 
     df, tag_frequencies, artist_frequencies, title_word_frequencies, chart_cache, score_cache = normalized_payload
     df, search_text_added = ensure_search_text_column(df)
+    if not isinstance(score_cache, dict) or "id_to_row" not in score_cache:
+        score_cache = build_score_cache(
+            df,
+            tag_frequencies,
+            artist_frequencies,
+            title_word_frequencies,
+        )
+        needs_cache_refresh = True
+
     if search_text_added:
+        needs_cache_refresh = True
+
+    if needs_cache_refresh:
         normalized_payload = (
             df,
             tag_frequencies,
@@ -323,9 +567,7 @@ def normalize_cached_base_data(cached_payload, cache_data_file):
             chart_cache,
             score_cache,
         )
-        needs_cache_refresh = True
 
-    if needs_cache_refresh:
         with open(cache_data_file, 'wb') as f:
             pickle.dump(normalized_payload, f)
 
@@ -349,7 +591,7 @@ def build_score_vector(feature_cache, feature_scores):
     return score_vector
 
 
-def apply_history_scores(total_scores, score_cache, history_preference, global_history_w):
+def apply_history_scores(total_scores, score_cache, history_preference, global_history_w, row_indices=None):
     if not history_preference or float(global_history_w) == 0.0:
         return total_scores
 
@@ -360,25 +602,88 @@ def apply_history_scores(total_scores, score_cache, history_preference, global_h
     if tag_cache["names"] and tag_history_scores:
         tag_history_vector = build_score_vector(tag_cache, tag_history_scores)
         if tag_history_vector.any():
-            tag_history_sum = np.asarray(tag_cache["matrix"].dot(tag_history_vector)).reshape(-1)
-            total_scores += (tag_history_sum / tag_cache["row_norms"]) * history_multiplier
+            tag_matrix = tag_cache["matrix"][row_indices] if row_indices is not None else tag_cache["matrix"]
+            tag_row_norms = tag_cache["row_norms"][row_indices] if row_indices is not None else tag_cache["row_norms"]
+            tag_history_sum = np.asarray(tag_matrix.dot(tag_history_vector)).reshape(-1)
+            total_scores += (tag_history_sum / tag_row_norms) * history_multiplier
 
     title_cache = score_cache["title_words"]
     title_history_scores = history_preference.get("title_words", {})
     if title_cache["names"] and title_history_scores:
         title_history_vector = build_score_vector(title_cache, title_history_scores)
         if title_history_vector.any():
-            title_history_sum = np.asarray(title_cache["matrix"].dot(title_history_vector)).reshape(-1)
-            total_scores += (title_history_sum / title_cache["row_norms"]) * history_multiplier
+            title_matrix = title_cache["matrix"][row_indices] if row_indices is not None else title_cache["matrix"]
+            title_row_norms = title_cache["row_norms"][row_indices] if row_indices is not None else title_cache["row_norms"]
+            title_history_sum = np.asarray(title_matrix.dot(title_history_vector)).reshape(-1)
+            total_scores += (title_history_sum / title_row_norms) * history_multiplier
 
     artist_cache = score_cache["artists"]
     artist_history_scores = history_preference.get("artists", {})
     if artist_cache["names"] and artist_history_scores:
         artist_history_vector = build_score_vector(artist_cache, artist_history_scores)
-        valid_artist_mask = artist_cache["codes"] >= 0
+        artist_codes_all = artist_cache["codes"][row_indices] if row_indices is not None else artist_cache["codes"]
+        valid_artist_mask = artist_codes_all >= 0
         if valid_artist_mask.any() and artist_history_vector.any():
-            artist_codes = artist_cache["codes"][valid_artist_mask]
+            artist_codes = artist_codes_all[valid_artist_mask]
             total_scores[valid_artist_mask] += artist_history_vector[artist_codes] * history_multiplier
+
+    return total_scores
+
+
+def compute_dynamic_score_array(
+    row_count,
+    tag_weights,
+    artist_weights,
+    title_weights,
+    global_tag_w,
+    global_artist_w,
+    global_title_w,
+    score_cache,
+    history_preference=None,
+    global_history_w=0.0,
+    row_indices=None,
+):
+    total_scores = np.zeros(row_count, dtype=np.float32)
+
+    tag_cache = score_cache["tags"]
+    if tag_cache["names"]:
+        tag_matrix = tag_cache["matrix"][row_indices] if row_indices is not None else tag_cache["matrix"]
+        tag_row_norms = tag_cache["row_norms"][row_indices] if row_indices is not None else tag_cache["row_norms"]
+        tag_weight_vector = build_weight_vector(tag_cache, tag_weights, 1.0)
+        tag_effective_scores = tag_cache["base_scores"] * tag_weight_vector
+        tag_score_sum = np.asarray(tag_matrix.dot(tag_effective_scores)).reshape(-1)
+        total_scores += (tag_score_sum / tag_row_norms) * float(global_tag_w) * 0.5
+
+    artist_cache = score_cache["artists"]
+    if artist_cache["names"]:
+        artist_codes_all = artist_cache["codes"][row_indices] if row_indices is not None else artist_cache["codes"]
+        artist_weight_vector = build_weight_vector(artist_cache, artist_weights, 5.0)
+        valid_artist_mask = artist_codes_all >= 0
+        if valid_artist_mask.any():
+            artist_codes = artist_codes_all[valid_artist_mask]
+            artist_scores = (
+                artist_cache["base_scores"][artist_codes]
+                * artist_weight_vector[artist_codes]
+                * float(global_artist_w)
+            )
+            total_scores[valid_artist_mask] += artist_scores
+
+    title_cache = score_cache["title_words"]
+    if title_cache["names"]:
+        title_matrix = title_cache["matrix"][row_indices] if row_indices is not None else title_cache["matrix"]
+        title_row_norms = title_cache["row_norms"][row_indices] if row_indices is not None else title_cache["row_norms"]
+        title_weight_vector = build_weight_vector(title_cache, title_weights, 1.0)
+        title_effective_scores = title_cache["base_scores"] * title_weight_vector
+        title_score_sum = np.asarray(title_matrix.dot(title_effective_scores)).reshape(-1)
+        total_scores += (title_score_sum / title_row_norms) * float(global_title_w)
+
+    total_scores = apply_history_scores(
+        total_scores,
+        score_cache,
+        history_preference,
+        global_history_w,
+        row_indices=row_indices,
+    )
 
     return total_scores
 
@@ -397,47 +702,32 @@ def apply_dynamic_scores(
     score_cache=None,
     history_preference=None,
     global_history_w=0.0,
+    row_indices=None,
 ):
     if score_cache is None:
         score_cache = build_score_cache(df, tag_freq, artist_freq, title_word_freq)
 
-    total_scores = np.zeros(len(df), dtype=np.float32)
+    if row_indices is not None:
+        row_indices = np.asarray(row_indices, dtype=np.int32)
+        source_df = df.iloc[row_indices]
+    else:
+        source_df = df
 
-    tag_cache = score_cache["tags"]
-    if tag_cache["names"]:
-        tag_weight_vector = build_weight_vector(tag_cache, tag_weights, 1.0)
-        tag_effective_scores = tag_cache["base_scores"] * tag_weight_vector
-        tag_score_sum = np.asarray(tag_cache["matrix"].dot(tag_effective_scores)).reshape(-1)
-        total_scores += (tag_score_sum / tag_cache["row_norms"]) * float(global_tag_w) * 0.5
-
-    artist_cache = score_cache["artists"]
-    if artist_cache["names"]:
-        artist_weight_vector = build_weight_vector(artist_cache, artist_weights, 5.0)
-        valid_artist_mask = artist_cache["codes"] >= 0
-        if valid_artist_mask.any():
-            artist_codes = artist_cache["codes"][valid_artist_mask]
-            artist_scores = (
-                artist_cache["base_scores"][artist_codes]
-                * artist_weight_vector[artist_codes]
-                * float(global_artist_w)
-            )
-            total_scores[valid_artist_mask] += artist_scores
-
-    title_cache = score_cache["title_words"]
-    if title_cache["names"]:
-        title_weight_vector = build_weight_vector(title_cache, title_weights, 1.0)
-        title_effective_scores = title_cache["base_scores"] * title_weight_vector
-        title_score_sum = np.asarray(title_cache["matrix"].dot(title_effective_scores)).reshape(-1)
-        total_scores += (title_score_sum / title_cache["row_norms"]) * float(global_title_w)
-
-    total_scores = apply_history_scores(
-        total_scores,
+    total_scores = compute_dynamic_score_array(
+        len(source_df),
+        tag_weights,
+        artist_weights,
+        title_weights,
+        global_tag_w,
+        global_artist_w,
+        global_title_w,
         score_cache,
-        history_preference,
-        global_history_w,
+        history_preference=history_preference,
+        global_history_w=global_history_w,
+        row_indices=row_indices,
     )
 
-    scored_df = df.copy()
+    scored_df = source_df.copy()
     scored_df['推荐评分'] = total_scores.astype(np.int32)
     
     columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接', '文件名', '解析后标签', '标题特征词', '搜索文本']

@@ -15,7 +15,13 @@ from config import (
     MAX_DISPLAY,
     SEMANTIC_SEARCH_TOP_K,
 )
-from data_pipeline import load_base_data, apply_dynamic_scores
+from data_pipeline import (
+    apply_dynamic_scores,
+    fetch_gallery_rows_by_ids,
+    get_row_indices_for_ids,
+    load_base_data,
+    search_gallery_candidate_ids,
+)
 from utils_charts import render_global_preference_charts, render_history_preference_charts
 from utils_core import get_cover_base64
 from utils_cv import search_similar_cover_items
@@ -84,6 +90,47 @@ def build_cover_search_signature(query_item_id, query_image_bytes, candidate_ids
     joined_ids = "\n".join(str(item_id) for item_id in candidate_ids)
     raw = f"{normalized_id}\n{image_digest}\n{joined_ids}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def build_score_state_signature(
+    tag_weights,
+    artist_weights,
+    title_weights,
+    global_weights,
+    history_entries,
+    candidate_ids=None,
+):
+    if candidate_ids is None:
+        candidate_digest = "ALL"
+    else:
+        joined_ids = "\n".join(str(item_id) for item_id in candidate_ids)
+        candidate_digest = hashlib.md5(joined_ids.encode("utf-8")).hexdigest()
+
+    history_digest = hashlib.md5(
+        json.dumps(history_entries, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    payload = {
+        "tag_weights": tag_weights,
+        "artist_weights": artist_weights,
+        "title_weights": title_weights,
+        "global_weights": global_weights,
+        "history_digest": history_digest,
+        "candidate_digest": candidate_digest,
+    }
+    return hashlib.md5(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def build_keyword_recall_signature(search_text, include_relevance):
+    normalized_search = " ".join(str(search_text or "").strip().split())
+    payload = {
+        "search": normalized_search,
+        "include_relevance": bool(include_relevance),
+    }
+    return hashlib.md5(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 def apply_similarity_result(filtered_df, matched_ids, score_map, score_column):
@@ -393,6 +440,7 @@ def render_manga_detail(manga):
 
         priority_fields = [
             "推荐评分",
+            "关键词相关度",
             "封面相关度",
             "AI相关度",
             "ID",
@@ -442,6 +490,11 @@ if df_base is None:
     st.stop()
 
 search_kw = st.sidebar.text_input("实时关键词搜索 (标题/标签/作者)：", placeholder="例如: elf...")
+keyword_relevance_enabled = st.sidebar.toggle(
+    "启用关键词相关度",
+    value=False,
+    help="开启后会显示并可按数据库全文相关度排序；关闭时只用关键词做候选召回。",
+)
 vector_search_kw = st.sidebar.text_input("AI 语义检索 (自然语言)：", placeholder="例如: 猫娘X狐娘...")
 with st.sidebar.expander("封面相似检索 (CLIP)", expanded=False):
     cover_query_id = st.text_input(
@@ -514,14 +567,73 @@ history_preference = (
     else None
 )
 
-# 动态打分与过滤
-final_df = apply_dynamic_scores(
-    df_base, dynamic_weights, dynamic_artist_weights, dynamic_title_weights, 
-    tag_freq, artist_freq, title_word_freq, global_tag_weight, global_artist_weight, global_title_weight,
-    score_cache=score_cache,
-    history_preference=history_preference,
-    global_history_w=global_history_weight,
+# 数据库候选召回 + 动态打分
+search_payload = None
+candidate_row_indices = None
+if search_kw:
+    recall_signature = build_keyword_recall_signature(search_kw, keyword_relevance_enabled)
+    cached_recall_payload = st.session_state.get("keyword_recall_payload")
+    if (
+        isinstance(cached_recall_payload, dict)
+        and cached_recall_payload.get("signature") == recall_signature
+        and cached_recall_payload.get("payload") is not None
+    ):
+        search_payload = cached_recall_payload["payload"]
+    else:
+        with st.spinner("正在从 MySQL 召回关键词候选集..."):
+            search_payload = search_gallery_candidate_ids(
+                search_kw,
+                include_relevance=keyword_relevance_enabled,
+            )
+        st.session_state["keyword_recall_payload"] = {
+            "signature": recall_signature,
+            "payload": search_payload,
+        }
+    candidate_row_indices = get_row_indices_for_ids(
+        df_base,
+        search_payload["ids"],
+        score_cache.get("id_to_row") if score_cache else None,
+    )
+
+score_signature = build_score_state_signature(
+    dynamic_weights,
+    dynamic_artist_weights,
+    dynamic_title_weights,
+    {
+        "tag": global_tag_weight,
+        "artist": global_artist_weight,
+        "title": global_title_weight,
+        "history": global_history_weight,
+        "keyword_relevance": keyword_relevance_enabled,
+    },
+    history_entries,
+    candidate_ids=([search_kw, *search_payload["ids"]] if search_payload is not None else None),
 )
+cached_score_payload = st.session_state.get("score_result_payload")
+
+if (
+    isinstance(cached_score_payload, dict)
+    and cached_score_payload.get("signature") == score_signature
+    and cached_score_payload.get("df") is not None
+):
+    final_df = cached_score_payload["df"].copy()
+else:
+    final_df = apply_dynamic_scores(
+        df_base, dynamic_weights, dynamic_artist_weights, dynamic_title_weights,
+        tag_freq, artist_freq, title_word_freq, global_tag_weight, global_artist_weight, global_title_weight,
+        score_cache=score_cache,
+        history_preference=history_preference,
+        global_history_w=global_history_weight,
+        row_indices=candidate_row_indices,
+    )
+
+    if keyword_relevance_enabled and search_payload is not None and not final_df.empty:
+        final_df["关键词相关度"] = final_df["ID"].astype(str).map(search_payload["score_map"]).fillna(0.0)
+
+    st.session_state["score_result_payload"] = {
+        "signature": score_signature,
+        "df": final_df.copy(),
+    }
 
 if blocked_tags:
     mask_not_blocked = final_df['解析后标签'].apply(lambda x: not any(t in blocked_tags for t in x))
@@ -545,21 +657,6 @@ min_score = st.sidebar.slider(
     value=default_min_slider
 )
 filtered_df = final_df[final_df['推荐评分'] >= min_score]
-
-if search_kw and not filtered_df.empty:
-    kw_list = [kw.strip().lower() for kw in search_kw.replace('，', ',').split(',') if kw.strip()]
-    for kw in kw_list:
-        if '搜索文本' in filtered_df.columns:
-            mask_search = filtered_df['搜索文本'].str.contains(kw, regex=False, na=False)
-        else:
-            mask_search = (
-                filtered_df['ID'].str.lower().str.contains(kw, regex=False, na=False) |
-                filtered_df['标题'].str.lower().str.contains(kw, regex=False, na=False) |
-                filtered_df['标签'].str.lower().str.contains(kw, regex=False, na=False) |
-                filtered_df['作者'].str.lower().str.contains(kw, regex=False, na=False) |
-                filtered_df['团队'].str.lower().str.contains(kw, regex=False, na=False)
-            )
-        filtered_df = filtered_df[mask_search]
 
 # AI 语义二次过滤
 if vector_search_kw and not filtered_df.empty:
@@ -699,6 +796,13 @@ col2.metric("总收录作者数", f"{len(artist_freq)} 位")
 col3.metric("总标签种类", f"{len(tag_freq)} 种")
 col4.metric("解析标题词汇数", f"{len(title_word_freq)} 种")
 
+if search_payload is not None:
+    st.caption(
+        f"关键词召回：{search_payload['mode']} · "
+        f"{len(search_payload['ids'])} 个候选 · "
+        f"{'已使用全文索引' if search_payload['used_fulltext'] else '未使用全文索引'}"
+    )
+
 chat_context_df = (
     filtered_df.drop(
         columns=['封面', '解析后标签', '标题特征词', '搜索文本'],
@@ -720,6 +824,8 @@ with tab_library:
 
     if not filtered_df.empty:
         sort_columns = ['推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录']
+        if '关键词相关度' in filtered_df.columns:
+            sort_columns.insert(0, '关键词相关度')
         if '封面相关度' in filtered_df.columns:
             sort_columns.insert(0, '封面相关度')
         if 'AI相关度' in filtered_df.columns:
@@ -762,6 +868,16 @@ with tab_library:
         slice_end = (selected_page_index + 1) * MAX_DISPLAY
 
         display_df = sorted_df.iloc[slice_start:slice_end].copy()
+        page_ids = display_df["ID"].astype(str).tolist()
+        fresh_page_df = fetch_gallery_rows_by_ids(page_ids)
+        if not fresh_page_df.empty:
+            fresh_page_df = fresh_page_df.set_index("ID").reindex(page_ids).reset_index()
+            for column_name in fresh_page_df.columns:
+                if column_name == "ID":
+                    continue
+                if column_name in display_df.columns:
+                    fresh_values = fresh_page_df[column_name]
+                    display_df[column_name] = fresh_values.where(fresh_values.notna(), display_df[column_name])
 
         with st.spinner(f'正在加载 {selected_page_label} 范围的缩略图...'):
             display_df['封面'] = display_df.apply(
@@ -777,7 +893,7 @@ with tab_library:
             table_df['链接'] = display_df.apply(build_tracked_link, axis=1)
 
         preferred_columns = [
-            '封面', '选中', '封面相关度', 'AI相关度', '推荐评分', 'ID', '上传日期',
+            '封面', '选中', '封面相关度', 'AI相关度', '关键词相关度', '推荐评分', 'ID', '上传日期',
             '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接'
         ]
         table_df = make_selectable_table(table_df)
@@ -795,6 +911,7 @@ with tab_library:
                 "链接": st.column_config.LinkColumn("图库链接", display_text="网络来源"),
                 "封面相关度": st.column_config.NumberColumn("封面相关度", format="%.2f"),
                 "AI相关度": st.column_config.NumberColumn("AI相关度", format="%.2f"),
+                "关键词相关度": st.column_config.NumberColumn("关键词相关度", format="%.2f"),
                 "推荐评分": st.column_config.ProgressColumn(
                     "推荐评分",
                     format="%d",

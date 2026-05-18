@@ -7,6 +7,8 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 
+from data_processing.optimize_mysql_schema import optimize_gallery_schema
+
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -120,6 +122,8 @@ def migrate_data():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE gallery_info MODIFY COLUMN ID VARCHAR(64);"))
         conn.execute(text("ALTER TABLE gallery_info ADD UNIQUE INDEX idx_id (ID);"))
+
+    optimize_gallery_schema(engine)
 
     print(f"迁移完成！共写入 {len(df)} 条数据。")
 
