@@ -867,11 +867,16 @@ with tab_library:
         slice_start = selected_page_index * MAX_DISPLAY
         slice_end = (selected_page_index + 1) * MAX_DISPLAY
 
-        display_df = sorted_df.iloc[slice_start:slice_end].copy()
+        display_df = sorted_df.iloc[slice_start:slice_end].copy().reset_index(drop=True)
         page_ids = display_df["ID"].astype(str).tolist()
         fresh_page_df = fetch_gallery_rows_by_ids(page_ids)
         if not fresh_page_df.empty:
-            fresh_page_df = fresh_page_df.set_index("ID").reindex(page_ids).reset_index()
+            fresh_page_df = (
+                fresh_page_df.assign(_lookup_id=fresh_page_df["ID"].astype(str))
+                .set_index("_lookup_id")
+                .reindex(page_ids)
+                .reset_index(drop=True)
+            )
             for column_name in fresh_page_df.columns:
                 if column_name == "ID":
                     continue
