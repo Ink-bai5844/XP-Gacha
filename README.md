@@ -24,18 +24,19 @@
 - 标签/标题评分基于语义聚合后的标签/关键词词频
 - 支持记录最近 N 次点击来源链接/打开本地目录，并基于历史偏好自动加权推荐
 - 支持屏蔽标签、权重调节、分数阈值筛选
-- 支持 MySQL 关键词候选召回，优先使用 `FULLTEXT` 全文索引，支持检索 `ID`, `标题`, `标签`, `作者`, `团队`
+- 支持 MySQL 关键词候选召回，优先使用 `FULLTEXT` 全文索引，支持检索 `ID`, `标题`, `标题译文`, `标签`, `作者`, `团队`
 - 关键词搜索结果支持可选的 `关键词相关度` 列；关闭时不会让数据库额外计算全文相关度
-- 支持本地向量模型的自然语言语义检索
+- 支持本地向量模型的自然语言语义检索，向量文本会纳入 `标题译文`
 - 支持上传图片或输入库内 `ID` 的封面相似检索（CLIP）
 - 支持展示封面缩略图、来源链接和本地目录，并可一键复制库存列表当前页内容
+- 库存列表支持手动保存列宽配置到 `.streamlit/library_column_widths.json`，下次启动自动加载
 - 主界面支持勾选漫画；选中只用于详情查看，不会写入历史记录
 - 漫画详情页集中展示主列表未展开的完整信息，并提供本地目录打开入口
 - LLM 助手、漫画详情、历史记录、数据处理均已拆成独立页面
 - 支持全局偏好图表和历史偏好图表，均提供 Top 15 图表与 Top 150 展开表
-- 支持将当前筛选结果注入给 LLM 做RAG增强检索问答
+- 支持将当前筛选结果注入给 LLM 做RAG增强检索问答，注入字段包含 `标题译文`，并兼容部分接口流式返回空片段
 - 支持 nhentai源(以下简称`NH`) / 禁漫天堂源(以下简称`JM`) 双源抓取、修复抓取和本地链接补抓
-- 数据处理页支持数据抓取、全量导库、增量导库、MySQL 表结构与全文索引优化、向量库重建、封面 Base64 预编码、缓存维护、脚本实时输出等功能
+- 数据处理页支持数据抓取、全量导库、增量导库、MySQL 表结构与全文索引优化、标题 AI 翻译、向量库重建、封面 Base64 预编码、缓存维护、脚本实时输出等功能
 
 ### 检索排序
 
@@ -86,7 +87,9 @@
 1. 启动时从 MySQL 读取 `gallery_info`，生成预处理 DataFrame、词频统计、图表缓存和评分矩阵缓存。
 2. 用户输入普通关键词时，先由 MySQL 召回候选 `ID`。
    - 如果存在 `ft_gallery_search`，优先走 `FULLTEXT`。
+   - 全文索引字段为 `标题`、`标题译文`、`标签`、`作者`、`团队`。
    - 如果全文索引不存在或没有命中，会回退到 `LIKE`。
+   - `LIKE` 回退也会在当前数据库实际存在的 `标题译文` 列中搜索。
 3. 应用把候选 `ID` 映射到预处理 DataFrame 行号，只对候选集进行推荐评分。
 4. 页面展示时仅对当前分页的 `ID` 批量读取一次 MySQL 原始行，再加载当前页封面。
 5. 关键词召回结果会按“搜索词 + 是否启用关键词相关度”缓存在当前 Streamlit 会话中；调权重时不会重复查 MySQL。
@@ -96,7 +99,7 @@
 - 关闭：只召回候选 `ID`，不计算 `MATCH ... AGAINST` 分数，也不会显示 `关键词相关度` 列。
 - 开启：会额外计算全文相关度，显示 `关键词相关度` 列，并允许按该列排序。
 
-AI 语义检索和封面相似检索仍然是当前结果集上的二次过滤。它们会缓存最近一次“查询词/图片 + 候选 ID 集合”的结果；如果调权重导致候选 ID 集合变化，可能会重新计算相似度。
+AI 语义检索和封面相似检索仍然是当前结果集上的二次过滤。文本语义向量构建时会把 `标题译文` 拼入语料，因此翻译更新后建议重建一次文本向量库。它们会缓存最近一次“查询词/图片 + 候选 ID 集合”的结果；如果调权重导致候选 ID 集合变化，可能会重新计算相似度。
 
 ### 历史偏好加权
 
@@ -170,11 +173,13 @@ XP-Gacha/
 │  ├─ b64_pre_encode.py                    # 预编码 Base64 缓存
 │  ├─ build_vector_db.py                   # 重建向量库
 │  ├─ optimize_mysql_schema.py             # 优化 gallery_info 字段类型、主键与 FULLTEXT 索引
+│  ├─ translate_titles.py                  # 批量调用 OpenAI 兼容接口生成标题译文
 │  ├─ map_add_name.py
 │  ├─ tag_set.py
 │  └─ title_cut_set.py
 ├─ .streamlit/
 │  ├─ config.toml                          # Streamlit 主题配置
+│  ├─ library_column_widths.json            # 库存列表列宽配置，应用内保存后生成
 │  └─ secrets.toml                         # MySQL 密钥配置
 ├─ dictionaries/                           # 停用词、语义映射等字典资源
 ├─ data/
@@ -189,7 +194,10 @@ XP-Gacha/
 │  └─ local/
 │     ├─ NH_get_info_local.py              # NH 本地链接抓信息
 │     └─ NH_get_images_local.py            # NH 本地链接抓完整漫画
-├─ tools/                                  # 一些工具脚本
+├─ tools/                                  # 工具脚本
+│  ├─ clean_failed_title_translation_jsonl.py
+│  ├─ clear_title_translation_by_error_ids.py
+│  └─ delete_gallery_rows_by_id.py
 ├─ Integration/
 │  ├─ ScoringFormula_local.py              # 本地整合版(old)
 │  └─ ScoringFormula_online.py             # 线上整合版
@@ -209,13 +217,15 @@ XP-Gacha/
 1. 通过 `NH` / `JM` 抓取脚本或本地链接脚本生成 CSV。
 2. CSV 统一规范到 `ID` 首列。
 3. 将 `data/gallery_info/*.csv` 导入 MySQL 表 `gallery_info`。
-4. 数据库表以 `ID` 为主键或唯一索引，并可建立 `ft_gallery_search` 全文索引。
-5. 用数据库数据构建向量库，向量 `ids` 也使用 `ID`。
-6. 启动 `app.py` 后，从数据库读取数据并做预处理缓存。
-7. 普通关键词先由 MySQL 召回候选 `ID`，再对候选集进行推荐评分。
-8. 页面中按照推荐评分、关键词、语义检索、封面相似检索结果进行筛选和展示。
-9. 当前分页会按 `ID` 批量读取 MySQL 原始行，缩略图显示优先命中 Base64 缓存，其次在线图，最后本地图回退。
-10. 点击来源链接或在漫画详情页打开本地目录时，会把条目的聚合标签、标题词、作者等写入 `datacache/recommendation_history.json`，供历史偏好加权和历史偏好图表使用；仅勾选漫画不会写入历史。
+4. 数据库表以 `ID` 为主键或唯一索引，并在 `标题` 后保留 `标题译文` 列。
+5. 可用标题 AI 翻译脚本批量生成 `标题译文`，成功与失败批次分别写入 JSONL，便于审查和重试。
+6. 建立包含 `标题译文` 的 `ft_gallery_search` 全文索引。
+7. 用数据库数据构建向量库，向量 `ids` 也使用 `ID`，向量文本包含 `标题译文`。
+8. 启动 `app.py` 后，从数据库读取数据并做预处理缓存。
+9. 普通关键词先由 MySQL 召回候选 `ID`，再对候选集进行推荐评分。
+10. 页面中按照推荐评分、关键词、语义检索、封面相似检索结果进行筛选和展示。
+11. 当前分页会按 `ID` 批量读取 MySQL 原始行，缩略图显示优先命中 Base64 缓存，其次在线图，最后本地图回退。
+12. 点击来源链接或在漫画详情页打开本地目录时，会把条目的聚合标签、标题词、作者等写入 `datacache/recommendation_history.json`，供历史偏好加权和历史偏好图表使用；仅勾选漫画不会写入历史。
 
 ## 💻 运行环境
 
@@ -263,8 +273,8 @@ copy config_empty.py config.py
 - `CLIP_MODEL_PATH`：本地 CLIP 模型目录，默认 `models/clip-vit-base-patch32`
 - `SEMANTIC_SEARCH_TOP_K`：语义检索最多保留的候选数
 - `COVER_SEARCH_TOP_K`：封面相似检索最多保留的候选数
-- `LM_STUDIO_API_BASE` / `LM_STUDIO_MODEL`
-- `ONLINE_API_BASE` / `ONLINE_API_KEY` / `ONLINE_MODEL`
+- `LM_STUDIO_API_BASE` / `LM_STUDIO_MODEL`：本地 LLM 助手和标题翻译 `--lm-studio` 模式使用
+- `ONLINE_API_BASE` / `ONLINE_API_KEY` / `ONLINE_MODEL`：线上 LLM 助手默认配置
 - `INITIAL_TAG_WEIGHTS`
 - `MAX_DISPLAY`
 - `HISTORY_RECOMMENDATION_CACHE_SIZE`：参与历史偏好加权的最近打开记录数上限
@@ -357,11 +367,11 @@ streamlit run app.py
 
 页面当前支持：
 
-- `库存列表`：推荐评分排序、ID / 标题 / 标签 / 作者 / 团队关键词检索、关键词相关度开关、选中漫画、来源链接、本地目录列、封面缩略图显示，并支持一键复制当前页列表信息
+- `库存列表`：推荐评分排序、ID / 标题 / 标题译文 / 标签 / 作者 / 团队关键词检索、关键词相关度开关、选中漫画、来源链接、本地目录列、封面缩略图显示、列宽配置保存，并支持一键复制当前页列表信息
 - `漫画详情`：展示当前选中漫画的完整信息，左侧显示封面与本地目录打开入口
-- `LLM 助手`：将当前结果集注入 LLM-RAG 问答
+- `LLM 助手`：将当前结果集注入 LLM-RAG 问答，参考库存数据中包含 `标题译文`
 - `历史记录`：刷新历史记录、清空历史记录、查看和删除历史条目
-- `数据处理`：CSV 整理、数据库同步、缓存与向量、维护工具、采集入口，以及每个脚本的实时输出
+- `数据处理`：CSV 整理、数据库同步、标题AI翻译、缓存与向量、维护工具、采集入口，以及每个脚本的实时输出
 - 侧边栏：标签屏蔽，标签/作者/标题权重调节，历史偏好总分倍率调节
 - AI 语义检索
 - 封面相似检索（支持上传图片，或输入库内已有条目的 `ID` 直接使用其封面做相似检索）
@@ -369,6 +379,14 @@ streamlit run app.py
 - 在漫画详情页一键打开本地漫画目录，并记录历史偏好
 - 全局偏好统计图表
 - 用户历史偏好统计图表
+
+库存列表底部有 `列宽配置` 折叠面板，可以手动设置各列像素宽度并保存到：
+
+```text
+.streamlit/library_column_widths.json
+```
+
+之后重新打开应用会自动加载这些列宽。Streamlit 当前不会把前端拖拽列宽回传给 Python，因此这里采用的是“表单保存列宽”的持久化方式。
 
 ## 📖 字典与 XP 语义聚合说明
 
@@ -467,8 +485,9 @@ streamlit run app.py
 
 - CSV 整理：补文件名、标签/标题词整理、Base64 预编码等
 - 数据库同步：全量导入 MySQL、增量同步 MySQL、优化 MySQL 表结构与全文索引
+- 标题AI翻译：按序号范围批量调用 OpenAI 兼容接口，将标题中文译文写入 MySQL，并同步保存成功/失败 JSONL
 - 缓存与向量：重建文本向量库、构建/查看封面图片向量索引
-- 维护工具：刷新缓存统计、清理缓存、合并 Base64 增量缓存
+- 维护工具：刷新缓存统计、清理缓存、合并 Base64 增量缓存、清理标题翻译 JSONL、按 ID 删除数据库条目、按 `error.json` 清空标题译文
 - 采集入口：NH/JM 在线抓信息、失败页重试、NH 本地链接抓信息、NH 本地链接抓完整漫画
 
 采集入口里的链接、起始网址、保存 CSV 路径、抓取页数、线程数、错误日志、失败报告等参数都可以直接在页面里填写。脚本内也保留了同名全局变量，方便直接运行脚本或临时覆写。
@@ -548,6 +567,7 @@ python data_processing/all_csv_to_mysql.py
 当前会：
 
 - 自动补缺失 `ID`
+- 在 `标题` 后保留 `标题译文` 列
 - 按 `ID` 去重
 - 优化 `gallery_info` 字段类型
 - 将 `ID` 优化为主键或唯一索引
@@ -563,8 +583,41 @@ python data_processing/add_csv_to_mysql.py
 
 - 自动补缺失 `ID`
 - 按 `ID` 去重
-- 按 `ID` 的主键 / 唯一索引做 `REPLACE INTO`
+- 按 `ID` 的主键 / 唯一索引做增量插入与更新
+- CSV 未提供 `标题译文` 时保留数据库里已有的标题译文
 - 同步完成后自动执行表结构与全文索引优化
+
+### 标题 AI 翻译
+
+读取 `gallery_info` 中的 `标题`，按 ID 排序后的序号范围筛选，将多个标题拼成一组请求 OpenAI 兼容的 Chat Completions 接口，并把返回的 JSON 拆分写入 `标题译文`。已有 `标题译文` 的条目会自动跳过。
+
+当前行为：
+
+- 多个标题组成一批请求，`--batch-size` 控制每批数量
+- 线上接口可用 `--concurrency` 并发多个批次
+- `--start-index` / `--end-index` 控制按 ID 排序后的翻译序号范围
+- 每个成功批次会追加到成功 JSONL，默认 `data_processing/title_translation_results.jsonl`
+- 失败批次会单独追加到 `data_processing/title_translation_failed_results.jsonl`
+- `429 Too many requests` 会用短错误输出，便于看日志
+- 内容安全拒绝、HTTP 错误、格式错误等不会写入数据库，只会进入失败 JSONL
+- 返回字段兼容 `title_zh`，也兼容部分模型误返回的 `title`
+- 如果只想先审查 JSONL，不写数据库，可追加 `--jsonl-only` 或 `--no-db-write`
+
+```powershell
+python data_processing/translate_titles.py --api-url "https://api.openai.com/v1/chat/completions" --api-key "sk-..." --model "gpt-4o-mini" --batch-size 20 --concurrency 3 --start-index 1 --end-index 200 --jsonl-output "data_processing/title_translation_results.jsonl" --failed-jsonl-output "data_processing/title_translation_failed_results.jsonl"
+```
+
+`--api-url` 可填完整 `/chat/completions` 地址，也可填 OpenAI 兼容 Base URL。`--api-key` 为空时会读取 `OPENAI_API_KEY`。
+
+本地 LM Studio 单线程模式示例：
+
+```powershell
+python data_processing/translate_titles.py --lm-studio --batch-size 5 --start-index 1 --end-index 50 --jsonl-only
+```
+
+启用 `--lm-studio` 时默认读取 `config.py` 里的 `LM_STUDIO_API_BASE` / `LM_STUDIO_MODEL`，API Key 可为空，并强制单线程请求；如果命令行显式传入 `--api-url` 或 `--model`，则以命令行参数为准。
+
+应用内 `数据处理 -> 标题AI翻译` 选项卡也提供同样参数。勾选 `LM Studio 本地单线程模式` 后，URL 和模型名直接读取 `config.py`，并强制单线程，适合本地 LM Studio 兼容接口。
 
 ### 优化 MySQL 表结构与全文索引
 
@@ -577,12 +630,12 @@ python data_processing/optimize_mysql_schema.py
 当前会尝试：
 
 - 清理并优化 `ID` 字段，优先将 `ID` 设置为主键
-- 缩短明显不需要 `TEXT` 的字段类型，例如 `链接`、`标题`、`语言`、`上传日期`
+- 补齐 `标题译文` 列，并缩短明显不需要 `TEXT` 的字段类型，例如 `链接`、`标题`、`标题译文`、`语言`、`上传日期`
 - 将 `页数` 优化为整数类型
 - 创建 `ft_gallery_search` 全文索引：
 
 ```sql
-FULLTEXT INDEX ft_gallery_search (`标题`, `标签`, `作者`, `团队`) WITH PARSER ngram
+FULLTEXT INDEX ft_gallery_search (`标题`, `标题译文`, `标签`, `作者`, `团队`) WITH PARSER ngram
 ```
 
 如果当前 MySQL 环境不支持 `ngram` parser，脚本会回退为普通 `FULLTEXT` 索引。首次建索引会对整张 `gallery_info` 扫描，数据量大时需要等待一段时间。
@@ -596,6 +649,7 @@ python data_processing/build_vector_db.py
 ```
 
 当你改了数据库主键逻辑、更新了大量数据、或者刚跑完全量导库后，建议重建一次。
+如果批量更新了 `标题译文`，也建议重建一次，因为文本语义向量会纳入 `标题译文`。
 
 常用参数示例：
 
@@ -640,6 +694,36 @@ python data_processing/b64_pre_encode.py
 - `localimgtmp`
 
 并为 `ID.*` 图片生成对应的增量 Base64 文本缓存到 `b64_tmp` 文件夹下，检查无误后需手动拷贝至 `b64_cache` 文件夹下。
+
+### 标题翻译维护工具
+
+这些工具也已接入应用内 `数据处理 -> 维护工具` 选项卡。
+
+清理标题翻译成功 JSONL 里混入的 `status == "failed"` 行，默认会生成 `.bak`：
+
+```powershell
+python tools/clean_failed_title_translation_jsonl.py --jsonl-path "data_processing/title_translation_results.jsonl"
+```
+
+按输入 ID 删除数据库中的整条 `gallery_info` 记录。默认只预览，确认删除必须追加 `--confirm`：
+
+```powershell
+python tools/delete_gallery_rows_by_id.py NH123456 NH234567 --confirm
+```
+
+也可以从文本文件读取 ID：
+
+```powershell
+python tools/delete_gallery_rows_by_id.py --id-file "tools/delete_ids.txt" --confirm
+```
+
+从 `tools/error.json` 中识别所有 `"id": "NH..."` 文本段，并清空这些 ID 的 `标题译文`。默认只预览，确认清空必须追加 `--confirm`：
+
+```powershell
+python tools/clear_title_translation_by_error_ids.py --input "tools/error.json" --confirm
+```
+
+默认清空为 `NULL`；如果想清空为空字符串，可追加 `--empty-string`。
 
 *注：若想跳过数据爬取阶段直接获得数据，请移步tools/datasets.txt(无封面)*
 
@@ -714,6 +798,12 @@ python data_processing/b64_pre_encode.py
   语义向量缓存
 - `manga_vectors/clip_image_index.pkl`
   封面图片向量索引缓存
+- `data_processing/title_translation_results.jsonl`
+  标题 AI 翻译成功批次记录，包含输入标题、原始返回 JSON、规范化译文字段和数据库写入数量
+- `data_processing/title_translation_failed_results.jsonl`
+  标题 AI 翻译失败批次记录，包含输入标题和错误原因，便于后续重试或清理
+- `.streamlit/library_column_widths.json`
+  库存列表列宽配置，使用列表下方的 `列宽配置` 面板保存后生成
 - `*.pkl.progress/`
   `data_processing/img_to_vector.py` 构建封面向量时的断点续跑进度目录
 - Streamlit 会话缓存
@@ -729,9 +819,11 @@ python data_processing/b64_pre_encode.py
 - `app.py` 启动时会连接数据库；如果密钥或表不存在，页面会直接报错停止。
 - 关键词检索建议执行一次 `data_processing/optimize_mysql_schema.py`，确保存在 `ft_gallery_search` 全文索引；没有全文索引时会自动回退到 `LIKE`，但宽泛关键词可能较慢。
 - `启用关键词相关度` 会让 MySQL 额外计算并排序全文相关度。宽泛关键词命中很多时，开启它可能比只召回候选 `ID` 更慢。
+- `标题译文` 更新后，关键词搜索会随数据库即时生效；AI 语义检索需要重建文本向量库才会纳入新译文。
 - 语义检索依赖本地 embedding 模型和提前构建好的文本向量文件。
 - 封面相似检索依赖本地 CLIP 模型与 `IMG_VECTOR_FILE` 指向的图片向量索引。
 - 库存列表的来源链接点击追踪依赖本地 `HISTORY_LINK_TRACKING_HOST:HISTORY_LINK_TRACKING_PORT` 追踪服务，默认 `127.0.0.1:8765`；端口被占用时不会记录网络链接点击。
+- 库存列表列宽保存采用应用内表单写入 `.streamlit/library_column_widths.json`；Streamlit 当前不会把鼠标拖拽后的列宽变化回传到 Python。
 - 如果你的数据库结构发生变化，建议清空数据库，重新运行一次：
 
 ```powershell

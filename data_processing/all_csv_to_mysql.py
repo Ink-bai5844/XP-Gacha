@@ -19,7 +19,20 @@ SECRETS_FILE = PROJECT_ROOT / ".streamlit" / "secrets.toml"
 CSV_DIR = "data/gallery_info"
 ID_COLUMN = "ID"
 LINK_COLUMN = "链接"
-DB_COLUMNS = [ID_COLUMN, LINK_COLUMN, "文件名", "标题", "标签", "作者", "团队", "语言", "页数", "上传日期"]
+TITLE_TRANSLATION_COLUMN = "标题译文"
+DB_COLUMNS = [
+    ID_COLUMN,
+    LINK_COLUMN,
+    "文件名",
+    "标题",
+    TITLE_TRANSLATION_COLUMN,
+    "标签",
+    "作者",
+    "团队",
+    "语言",
+    "页数",
+    "上传日期",
+]
 
 
 def load_db_uri():

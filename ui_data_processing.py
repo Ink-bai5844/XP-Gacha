@@ -19,6 +19,8 @@ from config import (
     IMG_CACHE_DIR,
     IMG_VECTOR_FILE,
     LOCAL_MODEL_PATH,
+    LM_STUDIO_API_BASE,
+    LM_STUDIO_MODEL,
     ONLINE_IMG_DIR,
     VECTOR_FILE,
 )
@@ -74,10 +76,18 @@ def result_key(key: str) -> str:
     return f"data-process-result-{key}"
 
 
-def run_command(command: list[str], timeout: int = DEFAULT_TIMEOUT, live_output=None) -> dict:
+def run_command(
+    command: list[str],
+    timeout: int = DEFAULT_TIMEOUT,
+    live_output=None,
+    extra_env: dict[str, str] | None = None,
+    display_command: list[str] | None = None,
+) -> dict:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    if extra_env:
+        env.update({key: str(value) for key, value in extra_env.items() if value is not None})
 
     try:
         process = subprocess.Popen(
@@ -94,6 +104,7 @@ def run_command(command: list[str], timeout: int = DEFAULT_TIMEOUT, live_output=
     except OSError as exc:
         return {
             "command": command,
+            "display_command": display_command or command,
             "returncode": 1,
             "stdout": "",
             "stderr": str(exc),
@@ -155,6 +166,7 @@ def run_command(command: list[str], timeout: int = DEFAULT_TIMEOUT, live_output=
 
     return {
         "command": command,
+        "display_command": display_command or command,
         "returncode": returncode,
         "stdout": "".join(output_parts).strip(),
         "stderr": "",
@@ -192,7 +204,8 @@ def render_result(key: str, empty_label: str | None = None) -> None:
             st.info(empty_label)
         return
 
-    command_text = " ".join(str(part) for part in result["command"])
+    display_command = result.get("display_command") or result["command"]
+    command_text = " ".join(str(part) for part in display_command)
     with st.expander("脚本输出", expanded=True):
         st.code(command_text, language="powershell")
         if result["timed_out"]:
@@ -230,6 +243,8 @@ def submit_subprocess(
     timeout: int,
     disabled: bool = False,
     require_confirm: bool = True,
+    extra_env: dict[str, str] | None = None,
+    display_command: list[str] | None = None,
 ) -> None:
     if st.form_submit_button(button_label, width="stretch", disabled=disabled):
         if not require_confirm:
@@ -241,6 +256,8 @@ def submit_subprocess(
                 command,
                 timeout=timeout,
                 live_output=live_output,
+                extra_env=extra_env,
+                display_command=display_command,
             )
             live_output.empty()
 
@@ -466,6 +483,140 @@ def render_database_tools() -> None:
         render_result("db-optimize", "脚本输出会显示在这里。")
 
 
+def render_title_translation_tools() -> None:
+    with st.expander("标题 AI 翻译", expanded=True):
+        with st.form("process-title-translate"):
+            lm_studio = st.checkbox(
+                "LM Studio 本地单线程模式",
+                value=False,
+                help="默认读取 config.py 的 LM_STUDIO_API_BASE / LM_STUDIO_MODEL，强制单线程请求，API Key 可为空。",
+            )
+            api_url = st.text_input(
+                "调用 URL / Base URL",
+                LM_STUDIO_API_BASE
+                if lm_studio
+                else os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions"),
+                help="可填完整 /chat/completions 地址，也可填兼容 OpenAI 的 Base URL。",
+                disabled=lm_studio,
+            )
+            api_key = st.text_input(
+                "API Key",
+                value="",
+                type="password",
+                help="为空时读取当前环境变量 OPENAI_API_KEY。",
+            )
+            model = st.text_input(
+                "模型名",
+                LM_STUDIO_MODEL if lm_studio else os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                disabled=lm_studio,
+            )
+            jsonl_output = st.text_input(
+                "成功 JSONL 输出",
+                "data_processing/title_translation_results.jsonl",
+                help="每个成功批次会追加保存一行，包含输入标题和 LLM 返回的 JSON。",
+            )
+            failed_jsonl_output = st.text_input(
+                "失败 JSONL 输出",
+                "data_processing/title_translation_failed_results.jsonl",
+                help="每个失败批次会追加保存一行，包含输入标题和错误原因。",
+            )
+            jsonl_only = st.checkbox(
+                "仅写 JSONL，不回写数据库",
+                value=False,
+                help="适合先审查翻译质量；数据库中已有标题译文的条目仍会被跳过。",
+            )
+            batch_size = st.number_input("每组标题数量", 1, 200, 20, 1, key="title-translate-batch")
+            concurrency = st.number_input(
+                "并发组数",
+                1,
+                32,
+                1 if lm_studio else 3,
+                1,
+                disabled=lm_studio,
+                key="title-translate-concurrency",
+            )
+            start_index = st.number_input("起始序号", 1, 100000000, 1, 1, key="title-translate-start")
+            end_index = st.number_input(
+                "结束序号（0 表示不限制）",
+                0,
+                100000000,
+                0,
+                1,
+                key="title-translate-end",
+            )
+            request_timeout = st.number_input(
+                "单次请求超时秒数",
+                10,
+                3600,
+                120,
+                10,
+                key="title-translate-request-timeout",
+            )
+            max_retries = st.number_input("失败重试次数", 0, 10, 2, 1, key="title-translate-retries")
+            temperature = st.number_input(
+                "Temperature",
+                0.0,
+                2.0,
+                0.2,
+                0.1,
+                key="title-translate-temperature",
+            )
+            timeout = st.number_input(
+                "整批任务超时秒数",
+                10,
+                86400,
+                7200,
+                60,
+                key="title-translate-timeout",
+            )
+            confirm_label = (
+                "确认调用 LLM 并只写入 JSONL"
+                if jsonl_only
+                else "确认调用 LLM 并写入 gallery_info.标题译文"
+            )
+            confirm = st.checkbox(confirm_label, value=False)
+
+            command = [
+                PYTHON,
+                str(PROJECT_ROOT / "data_processing" / "translate_titles.py"),
+                "--jsonl-output",
+                jsonl_output,
+                "--failed-jsonl-output",
+                failed_jsonl_output,
+                "--batch-size",
+                str(int(batch_size)),
+                "--concurrency",
+                str(int(concurrency)),
+                "--start-index",
+                str(int(start_index)),
+                "--request-timeout",
+                str(int(request_timeout)),
+                "--max-retries",
+                str(int(max_retries)),
+                "--temperature",
+                str(float(temperature)),
+            ]
+            if not lm_studio:
+                command.extend(["--api-url", api_url, "--model", model])
+            if int(end_index) > 0:
+                command.extend(["--end-index", str(int(end_index))])
+            if jsonl_only:
+                command.append("--jsonl-only")
+            if lm_studio:
+                command.append("--lm-studio")
+
+            extra_env = {"OPENAI_API_KEY": api_key} if api_key else None
+            submit_subprocess(
+                "开始翻译标题",
+                "title-translate",
+                command,
+                timeout,
+                require_confirm=confirm,
+                extra_env=extra_env,
+            )
+        render_result("title-translate", "脚本输出会显示在这里。")
+
+
 def render_cache_tools() -> None:
     with st.expander("Base64 预编码", expanded=True):
         with st.form("process-b64"):
@@ -639,6 +790,134 @@ def render_maintenance_tools() -> None:
                 f"已合并 {moved} 个文件，跳过 {skipped} 个文件。\n来源目录：{source_dir}\n目标目录：{target_dir}",
             )
         render_result("merge-b64", "操作输出会显示在这里。")
+
+    with st.expander("清理标题翻译 JSONL failed 条目", expanded=False):
+        with st.form("maintenance-clean-title-jsonl"):
+            jsonl_path = st.text_input(
+                "JSONL 文件",
+                "data_processing/title_translation_results.jsonl",
+                key="clean-title-jsonl-path",
+            )
+            keep_backup = st.checkbox("生成 .bak 备份", value=True, key="clean-title-jsonl-backup")
+            timeout = st.number_input("超时秒数", 10, 7200, 600, 10, key="clean-title-jsonl-timeout")
+            confirm = st.checkbox("确认清理 failed 条目", value=False, key="clean-title-jsonl-confirm")
+            command = [
+                PYTHON,
+                str(PROJECT_ROOT / "tools" / "clean_failed_title_translation_jsonl.py"),
+                "--jsonl-path",
+                jsonl_path,
+            ]
+            if not keep_backup:
+                command.append("--no-backup")
+            submit_subprocess(
+                "清理 failed 条目",
+                "clean-title-jsonl",
+                command,
+                timeout,
+                require_confirm=confirm,
+            )
+        render_result("clean-title-jsonl", "脚本输出会显示在这里。")
+
+    with st.expander("按 ID 删除数据库条目", expanded=False):
+        with st.form("maintenance-delete-gallery-rows"):
+            ids_text = st.text_area(
+                "ID 列表",
+                "",
+                height=100,
+                help="多个 ID 可用空格、换行、英文逗号或中文逗号分隔。",
+                key="delete-gallery-ids",
+            )
+            id_file = st.text_input(
+                "ID 文件",
+                "",
+                help="可选：从文本文件读取 ID，路径相对项目根目录。",
+                key="delete-gallery-id-file",
+            )
+            timeout = st.number_input("超时秒数", 10, 7200, 600, 10, key="delete-gallery-timeout")
+            confirm_delete = st.checkbox(
+                "确认执行 DELETE 删除整条数据库记录",
+                value=False,
+                key="delete-gallery-confirm",
+            )
+            command = [
+                PYTHON,
+                str(PROJECT_ROOT / "tools" / "delete_gallery_rows_by_id.py"),
+            ]
+            if ids_text.strip():
+                command.append(ids_text)
+            if id_file.strip():
+                command.extend(["--id-file", id_file.strip()])
+            if confirm_delete:
+                command.append("--confirm")
+            has_delete_input = bool(ids_text.strip() or id_file.strip())
+            submit_subprocess(
+                "预览/删除数据库条目",
+                "delete-gallery-rows",
+                command,
+                timeout,
+                disabled=not has_delete_input,
+                require_confirm=True,
+            )
+        render_result("delete-gallery-rows", "脚本输出会显示在这里。")
+
+    with st.expander("按 error.json 清空标题译文", expanded=False):
+        with st.form("maintenance-clear-title-translation"):
+            input_file = st.text_input(
+                "错误 JSON 文件",
+                "tools/error.json",
+                help='会识别文件中所有 `"id": "NH..."` 文本段。',
+                key="clear-title-translation-input",
+            )
+            preview_limit = st.number_input(
+                "预览条数",
+                1,
+                1000,
+                30,
+                1,
+                key="clear-title-translation-preview-limit",
+            )
+            chunk_size = st.number_input(
+                "每批 ID 数量",
+                1,
+                5000,
+                500,
+                50,
+                key="clear-title-translation-chunk-size",
+            )
+            empty_string = st.checkbox(
+                "清空为空字符串（默认清空为 NULL）",
+                value=False,
+                key="clear-title-translation-empty-string",
+            )
+            timeout = st.number_input("超时秒数", 10, 7200, 600, 10, key="clear-title-translation-timeout")
+            confirm_clear = st.checkbox(
+                "确认清空这些 ID 的标题译文",
+                value=False,
+                key="clear-title-translation-confirm",
+            )
+            command = [
+                PYTHON,
+                str(PROJECT_ROOT / "tools" / "clear_title_translation_by_error_ids.py"),
+                "--input",
+                input_file,
+                "--preview-limit",
+                str(int(preview_limit)),
+                "--chunk-size",
+                str(int(chunk_size)),
+            ]
+            if empty_string:
+                command.append("--empty-string")
+            if confirm_clear:
+                command.append("--confirm")
+            submit_subprocess(
+                "预览/清空标题译文",
+                "clear-title-translation",
+                command,
+                timeout,
+                disabled=not input_file.strip(),
+                require_confirm=True,
+            )
+        render_result("clear-title-translation", "脚本输出会显示在这里。")
 
 
 def render_collection_tools() -> None:
@@ -857,8 +1136,8 @@ def render_data_processing_interface() -> None:
     st.subheader("数据处理")
     render_overview()
 
-    tab_csv, tab_db, tab_cache, tab_maintenance, tab_collection = st.tabs(
-        ["CSV 整理", "数据库同步", "缓存与向量", "维护工具", "采集入口"]
+    tab_csv, tab_db, tab_title_translate, tab_cache, tab_maintenance, tab_collection = st.tabs(
+        ["CSV 整理", "数据库同步", "标题AI翻译", "缓存与向量", "维护工具", "采集入口"]
     )
 
     with tab_csv:
@@ -866,6 +1145,9 @@ def render_data_processing_interface() -> None:
 
     with tab_db:
         render_database_tools()
+
+    with tab_title_translate:
+        render_title_translation_tools()
 
     with tab_cache:
         render_cache_tools()

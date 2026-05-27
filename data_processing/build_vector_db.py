@@ -78,13 +78,17 @@ def build_vectors(
     print("正在拼接语义文本...")
     for _, row in df.iterrows():
         title = row.get("标题", "")
+        title_translation = row.get("标题译文", "")
         artist = row.get("作者", "")
         tags = row.get("标签", "")
         team = row.get("团队", "")
         lang = row.get("语言", "")
 
         # 精简语义字符串，提高模型注意力集中度
-        semantic_text = f"标题《{title}》，作者 {artist}，团队 {team}，语言 {lang}，元素标签：{tags}。"
+        semantic_text = (
+            f"标题《{title}》，标题译文《{title_translation}》，"
+            f"作者 {artist}，团队 {team}，语言 {lang}，元素标签：{tags}。"
+        )
         if max_text_length > 0 and len(semantic_text) > max_text_length:
             semantic_text = semantic_text[:max_text_length]
 

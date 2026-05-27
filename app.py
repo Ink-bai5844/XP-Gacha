@@ -4,6 +4,7 @@ import gc
 import hashlib
 import html
 import json
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 
@@ -39,6 +40,27 @@ from utils_chat import render_chat_interface
 from ui_data_processing import render_data_processing_interface
 
 SELECTED_MANGA_STATE_KEY = "selected_manga_id"
+COLUMN_WIDTH_CONFIG_FILE = ".streamlit/library_column_widths.json"
+COLUMN_WIDTH_SESSION_KEY = "library_column_widths"
+DEFAULT_LIBRARY_COLUMN_WIDTHS = {
+    "封面": 88,
+    "选中": 62,
+    "封面相关度": 96,
+    "AI相关度": 96,
+    "关键词相关度": 108,
+    "推荐评分": 140,
+    "ID": 92,
+    "上传日期": 110,
+    "标题译文": 320,
+    "标题": 360,
+    "作者": 150,
+    "团队": 150,
+    "标签": 320,
+    "语言": 84,
+    "页数": 74,
+    "本地目录": 260,
+    "链接": 96,
+}
 
 st.set_page_config(page_title="地下金库(Local)", layout="wide")
 st.markdown(
@@ -153,6 +175,154 @@ def _get_item_label(item_payload):
 def current_selected_manga_id():
     selected_manga_id = st.session_state.get(SELECTED_MANGA_STATE_KEY)
     return str(selected_manga_id) if selected_manga_id else ""
+
+
+def load_library_column_widths():
+    if COLUMN_WIDTH_SESSION_KEY in st.session_state:
+        return dict(st.session_state[COLUMN_WIDTH_SESSION_KEY])
+
+    widths = dict(DEFAULT_LIBRARY_COLUMN_WIDTHS)
+    config_path = Path(COLUMN_WIDTH_CONFIG_FILE)
+    if config_path.exists():
+        try:
+            saved_widths = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(saved_widths, dict):
+                for column_name, width in saved_widths.items():
+                    try:
+                        width_value = int(width)
+                    except (TypeError, ValueError):
+                        continue
+                    if width_value > 0:
+                        widths[str(column_name)] = width_value
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    st.session_state[COLUMN_WIDTH_SESSION_KEY] = widths
+    return dict(widths)
+
+
+def save_library_column_widths(widths):
+    normalized_widths = {}
+    for column_name, width in widths.items():
+        try:
+            width_value = int(width)
+        except (TypeError, ValueError):
+            continue
+        if width_value > 0:
+            normalized_widths[str(column_name)] = width_value
+
+    config_path = Path(COLUMN_WIDTH_CONFIG_FILE)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps(normalized_widths, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    st.session_state[COLUMN_WIDTH_SESSION_KEY] = normalized_widths
+
+
+def build_width_kwargs(column_name, widths):
+    width = widths.get(column_name)
+    return {"width": int(width)} if width else {}
+
+
+def build_library_column_config(display_columns, min_possible_score, max_possible_score, widths):
+    column_config = {}
+    for column_name in display_columns:
+        width_kwargs = build_width_kwargs(column_name, widths)
+        column_config[column_name] = st.column_config.Column(column_name, **width_kwargs)
+
+    column_config.update(
+        {
+            "封面": st.column_config.ImageColumn(
+                "封面",
+                help="本地文件夹或线上缓存中的封面图",
+                **build_width_kwargs("封面", widths),
+            ),
+            "选中": st.column_config.CheckboxColumn(
+                "选中",
+                **build_width_kwargs("选中", widths),
+            ),
+            "链接": st.column_config.LinkColumn(
+                "图库链接",
+                display_text="网络来源",
+                **build_width_kwargs("链接", widths),
+            ),
+            "封面相关度": st.column_config.NumberColumn(
+                "封面相关度",
+                format="%.2f",
+                **build_width_kwargs("封面相关度", widths),
+            ),
+            "AI相关度": st.column_config.NumberColumn(
+                "AI相关度",
+                format="%.2f",
+                **build_width_kwargs("AI相关度", widths),
+            ),
+            "关键词相关度": st.column_config.NumberColumn(
+                "关键词相关度",
+                format="%.2f",
+                **build_width_kwargs("关键词相关度", widths),
+            ),
+            "推荐评分": st.column_config.ProgressColumn(
+                "推荐评分",
+                format="%d",
+                min_value=min_possible_score,
+                max_value=max_possible_score,
+                **build_width_kwargs("推荐评分", widths),
+            ),
+            "ID": st.column_config.TextColumn(
+                "ID",
+                help="唯一标识符",
+                **build_width_kwargs("ID", widths),
+            ),
+            "上传日期": st.column_config.TextColumn(
+                "上传日期",
+                help="该漫画的上传时间",
+                **build_width_kwargs("上传日期", widths),
+            ),
+            "本地目录": st.column_config.TextColumn(
+                "本地目录",
+                help="匹配到的本地漫画目录",
+                **build_width_kwargs("本地目录", widths),
+            ),
+        }
+    )
+    return column_config
+
+
+def render_library_column_width_controls(display_columns):
+    current_widths = load_library_column_widths()
+    with st.expander("列宽配置", expanded=False):
+        with st.form("library-column-widths"):
+            edited_widths = {}
+            control_columns = st.columns(4)
+            for index, column_name in enumerate(display_columns):
+                with control_columns[index % len(control_columns)]:
+                    edited_widths[column_name] = st.number_input(
+                        column_name,
+                        min_value=40,
+                        max_value=1200,
+                        value=int(current_widths.get(column_name, DEFAULT_LIBRARY_COLUMN_WIDTHS.get(column_name, 160))),
+                        step=10,
+                        key=f"library-column-width-{column_name}",
+                    )
+
+            save_col, reset_col = st.columns(2)
+            save_clicked = save_col.form_submit_button("保存列宽", width="stretch")
+            reset_clicked = reset_col.form_submit_button("恢复默认列宽", width="stretch")
+
+        if save_clicked:
+            save_library_column_widths(edited_widths)
+            st.toast(f"列宽已保存到 {COLUMN_WIDTH_CONFIG_FILE}", icon="✅")
+            st.rerun()
+        if reset_clicked:
+            save_library_column_widths(
+                {
+                    column_name: DEFAULT_LIBRARY_COLUMN_WIDTHS.get(column_name, 160)
+                    for column_name in display_columns
+                }
+            )
+            st.toast("已恢复默认列宽", icon="✅")
+            st.rerun()
 
 
 def make_selectable_table(table_df):
@@ -445,6 +615,7 @@ def render_manga_detail(manga):
             "AI相关度",
             "ID",
             "标题",
+            "标题译文",
             "作者",
             "团队",
             "上传日期",
@@ -489,7 +660,7 @@ if df_base is None:
     st.error("未找到数据文件！")
     st.stop()
 
-search_kw = st.sidebar.text_input("实时关键词搜索 (标题/标签/作者)：", placeholder="例如: elf...")
+search_kw = st.sidebar.text_input("实时关键词搜索 (标题/标题译文/标签/作者)：", placeholder="例如: elf...")
 keyword_relevance_enabled = st.sidebar.toggle(
     "启用关键词相关度",
     value=False,
@@ -823,7 +994,7 @@ with tab_library:
     copy_button_slot = copy_col.empty()
 
     if not filtered_df.empty:
-        sort_columns = ['推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录']
+        sort_columns = ['推荐评分', 'ID', '上传日期', '标题译文', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录']
         if '关键词相关度' in filtered_df.columns:
             sort_columns.insert(0, '关键词相关度')
         if '封面相关度' in filtered_df.columns:
@@ -899,7 +1070,7 @@ with tab_library:
 
         preferred_columns = [
             '封面', '选中', '封面相关度', 'AI相关度', '关键词相关度', '推荐评分', 'ID', '上传日期',
-            '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接'
+            '标题译文', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接'
         ]
         table_df = make_selectable_table(table_df)
         display_columns = [col for col in preferred_columns if col in table_df.columns]
@@ -908,25 +1079,15 @@ with tab_library:
         with copy_button_slot.container():
             render_copy_page_button(build_current_page_copy_text(table_df), len(table_df))
 
+        library_column_widths = load_library_column_widths()
         edited_table = st.data_editor(
             table_df,
-            column_config={
-                "封面": st.column_config.ImageColumn("封面", help="本地文件夹或线上缓存中的封面图"),
-                "选中": st.column_config.CheckboxColumn("选中", width="small"),
-                "链接": st.column_config.LinkColumn("图库链接", display_text="网络来源"),
-                "封面相关度": st.column_config.NumberColumn("封面相关度", format="%.2f"),
-                "AI相关度": st.column_config.NumberColumn("AI相关度", format="%.2f"),
-                "关键词相关度": st.column_config.NumberColumn("关键词相关度", format="%.2f"),
-                "推荐评分": st.column_config.ProgressColumn(
-                    "推荐评分",
-                    format="%d",
-                    min_value=min_possible_score,
-                    max_value=max_possible_score
-                ),
-                "ID": st.column_config.TextColumn("ID", help="唯一标识符"),
-                "上传日期": st.column_config.TextColumn("上传日期", help="该漫画的上传时间"),
-                "本地目录": st.column_config.TextColumn("本地目录", help="匹配到的本地漫画目录")
-            },
+            column_config=build_library_column_config(
+                display_columns,
+                min_possible_score,
+                max_possible_score,
+                library_column_widths,
+            ),
             column_order=display_columns,
             disabled=[col for col in table_df.columns if col != "选中"],
             hide_index=True,
@@ -935,6 +1096,7 @@ with tab_library:
             key=f"library-select-{current_selected_manga_id()}-{selected_page_index}-{global_sort_by}-{global_sort_order}",
         )
         apply_table_selection(edited_table, display_df)
+        render_library_column_width_controls(display_columns)
 
         del table_df
         del display_df

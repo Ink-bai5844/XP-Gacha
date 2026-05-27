@@ -19,7 +19,20 @@ SECRETS_FILE = PROJECT_ROOT / ".streamlit" / "secrets.toml"
 CSV_DIR = "data/gallery_info"
 ID_COLUMN = "ID"
 LINK_COLUMN = "链接"
-DB_COLUMNS = [ID_COLUMN, LINK_COLUMN, "文件名", "标题", "标签", "作者", "团队", "语言", "页数", "上传日期"]
+TITLE_TRANSLATION_COLUMN = "标题译文"
+DB_COLUMNS = [
+    ID_COLUMN,
+    LINK_COLUMN,
+    "文件名",
+    "标题",
+    TITLE_TRANSLATION_COLUMN,
+    "标签",
+    "作者",
+    "团队",
+    "语言",
+    "页数",
+    "上传日期",
+]
 
 
 def load_db_uri():
@@ -116,6 +129,14 @@ def ensure_gallery_table_schema(conn):
         )
 
     conn.execute(text("ALTER TABLE gallery_info MODIFY COLUMN ID VARCHAR(64);"))
+    if TITLE_TRANSLATION_COLUMN not in columns:
+        if "标题" in columns:
+            conn.execute(text("ALTER TABLE gallery_info ADD COLUMN `标题译文` VARCHAR(1024) AFTER `标题`;"))
+        else:
+            conn.execute(text("ALTER TABLE gallery_info ADD COLUMN `标题译文` VARCHAR(1024);"))
+        columns.add(TITLE_TRANSLATION_COLUMN)
+
+    conn.execute(text("ALTER TABLE gallery_info MODIFY COLUMN `标题译文` VARCHAR(1024) AFTER `标题`;"))
     if LINK_COLUMN in columns:
         conn.execute(text("ALTER TABLE gallery_info MODIFY COLUMN 链接 VARCHAR(255);"))
 
@@ -166,11 +187,22 @@ def sync_csv_to_db():
             conn.execute(text("ALTER TABLE gallery_info MODIFY COLUMN 链接 VARCHAR(255);"))
             conn.execute(text("ALTER TABLE gallery_info ADD UNIQUE INDEX idx_id (ID);"))
 
-        # 有相同的'链接'就先删后插，没有就直接插入
+        # 有相同的 ID 则更新，CSV 未提供译文时保留数据库中已有的标题译文。
         merge_sql = """
-            REPLACE INTO gallery_info (`ID`, `链接`, `文件名`, `标题`, `标签`, `作者`, `团队`, `语言`, `页数`, `上传日期`)
-            SELECT `ID`, `链接`, `文件名`, `标题`, `标签`, `作者`, `团队`, `语言`, `页数`, `上传日期`
-            FROM temp_gallery_info;
+            INSERT INTO gallery_info (`ID`, `链接`, `文件名`, `标题`, `标题译文`, `标签`, `作者`, `团队`, `语言`, `页数`, `上传日期`)
+            SELECT `ID`, `链接`, `文件名`, `标题`, `标题译文`, `标签`, `作者`, `团队`, `语言`, `页数`, `上传日期`
+            FROM temp_gallery_info
+            ON DUPLICATE KEY UPDATE
+                `链接` = VALUES(`链接`),
+                `文件名` = VALUES(`文件名`),
+                `标题` = VALUES(`标题`),
+                `标题译文` = COALESCE(NULLIF(VALUES(`标题译文`), ''), `标题译文`),
+                `标签` = VALUES(`标签`),
+                `作者` = VALUES(`作者`),
+                `团队` = VALUES(`团队`),
+                `语言` = VALUES(`语言`),
+                `页数` = VALUES(`页数`),
+                `上传日期` = VALUES(`上传日期`);
         """
         conn.execute(text(merge_sql))
         

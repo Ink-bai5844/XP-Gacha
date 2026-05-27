@@ -12,6 +12,8 @@ except ModuleNotFoundError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SECRETS_FILE = PROJECT_ROOT / ".streamlit" / "secrets.toml"
 FULLTEXT_INDEX_NAME = "ft_gallery_search"
+TITLE_TRANSLATION_COLUMN = "标题译文"
+FULLTEXT_COLUMNS = ["标题", "标题译文", "标签", "作者", "团队"]
 
 
 def load_db_uri():
@@ -58,6 +60,7 @@ def load_column_meta(conn):
         text(
             """
             SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE
+                 , ORDINAL_POSITION
             FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA = DATABASE()
               AND TABLE_NAME = 'gallery_info'
@@ -78,31 +81,71 @@ def ensure_column_type(conn, column_meta, column_name, expected_type, sql):
     execute_step(conn, sql, f"正在优化 {column_name} 类型：{current_type} -> {expected_type}")
 
 
+def ensure_title_translation_column(conn, column_meta):
+    title_translation_meta = column_meta.get(TITLE_TRANSLATION_COLUMN)
+    title_meta = column_meta.get("标题")
+    if not title_translation_meta:
+        if title_meta:
+            execute_step(
+                conn,
+                "ALTER TABLE gallery_info ADD COLUMN `标题译文` VARCHAR(1024) AFTER `标题`;",
+                "正在补充标题译文列",
+            )
+        else:
+            execute_step(
+                conn,
+                "ALTER TABLE gallery_info ADD COLUMN `标题译文` VARCHAR(1024);",
+                "正在补充标题译文列",
+            )
+        return
+
+    current_type = str(title_translation_meta["COLUMN_TYPE"]).lower()
+    title_position = int(title_meta["ORDINAL_POSITION"]) if title_meta else 0
+    translation_position = int(title_translation_meta["ORDINAL_POSITION"])
+    if current_type == "varchar(1024)" and translation_position == title_position + 1:
+        print("标题译文 类型与列顺序已正确")
+        return
+
+    execute_step(
+        conn,
+        "ALTER TABLE gallery_info MODIFY COLUMN `标题译文` VARCHAR(1024) AFTER `标题`;",
+        "正在优化标题译文类型与列顺序",
+    )
+
+
 def ensure_fulltext_index(conn):
-    index_exists = conn.execute(
+    rows = conn.execute(
         text(
             """
-            SELECT COUNT(*)
+            SELECT COLUMN_NAME
             FROM information_schema.STATISTICS
             WHERE TABLE_SCHEMA = DATABASE()
               AND TABLE_NAME = 'gallery_info'
               AND INDEX_NAME = :index_name
+            ORDER BY SEQ_IN_INDEX
             """
         ),
         {"index_name": FULLTEXT_INDEX_NAME},
-    ).scalar()
-    if index_exists:
+    ).mappings().all()
+    index_columns = [row["COLUMN_NAME"] for row in rows]
+    if index_columns == FULLTEXT_COLUMNS:
         print(f"全文索引已存在：{FULLTEXT_INDEX_NAME}")
         return
+    if index_columns:
+        execute_step(
+            conn,
+            f"DROP INDEX {FULLTEXT_INDEX_NAME} ON gallery_info;",
+            f"正在重建全文索引字段：{index_columns} -> {FULLTEXT_COLUMNS}",
+        )
 
     try:
         execute_step(
             conn,
             """
             ALTER TABLE gallery_info
-            ADD FULLTEXT INDEX ft_gallery_search (`标题`, `标签`, `作者`, `团队`) WITH PARSER ngram;
+            ADD FULLTEXT INDEX ft_gallery_search (`标题`, `标题译文`, `标签`, `作者`, `团队`) WITH PARSER ngram;
             """,
-            "正在创建 ngram FULLTEXT 索引：标题/标签/作者/团队",
+            "正在创建 ngram FULLTEXT 索引：标题/标题译文/标签/作者/团队",
         )
     except Exception as exc:
         print(f"ngram FULLTEXT 创建失败，尝试普通 FULLTEXT：{exc}")
@@ -110,9 +153,9 @@ def ensure_fulltext_index(conn):
             conn,
             """
             ALTER TABLE gallery_info
-            ADD FULLTEXT INDEX ft_gallery_search (`标题`, `标签`, `作者`, `团队`);
+            ADD FULLTEXT INDEX ft_gallery_search (`标题`, `标题译文`, `标签`, `作者`, `团队`);
             """,
-            "正在创建普通 FULLTEXT 索引：标题/标签/作者/团队",
+            "正在创建普通 FULLTEXT 索引：标题/标题译文/标签/作者/团队",
         )
 
 
@@ -166,10 +209,14 @@ def optimize_gallery_schema(engine=None):
             execute_step(conn, "DROP INDEX idx_id ON gallery_info;", "正在移除重复唯一索引 idx_id")
 
         column_meta = load_column_meta(conn)
+        ensure_title_translation_column(conn, column_meta)
+
+        column_meta = load_column_meta(conn)
         type_steps = [
             ("链接", "varchar(64)", "ALTER TABLE gallery_info MODIFY COLUMN `链接` VARCHAR(64);"),
             ("文件名", "varchar(256)", "ALTER TABLE gallery_info MODIFY COLUMN `文件名` VARCHAR(256);"),
             ("标题", "varchar(512)", "ALTER TABLE gallery_info MODIFY COLUMN `标题` VARCHAR(512);"),
+            ("标题译文", "varchar(1024)", "ALTER TABLE gallery_info MODIFY COLUMN `标题译文` VARCHAR(1024) AFTER `标题`;"),
             ("作者", "varchar(768)", "ALTER TABLE gallery_info MODIFY COLUMN `作者` VARCHAR(768);"),
             ("团队", "varchar(128)", "ALTER TABLE gallery_info MODIFY COLUMN `团队` VARCHAR(128);"),
             ("语言", "varchar(64)", "ALTER TABLE gallery_info MODIFY COLUMN `语言` VARCHAR(64);"),

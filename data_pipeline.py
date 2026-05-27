@@ -15,7 +15,8 @@ from utils_core import get_local_folders, match_local_folder
 from utils_charts import build_preference_chart_cache
 from utils_nlp import extract_and_map_title_words
 
-SEARCH_COLUMNS = ["标题", "标签", "作者", "团队"]
+SEARCH_COLUMNS = ["标题", "标题译文", "标签", "作者", "团队"]
+FULLTEXT_COLUMNS = ["标题", "标题译文", "标签", "作者", "团队"]
 FULLTEXT_INDEX_NAME = "ft_gallery_search"
 
 @st.cache_resource
@@ -38,7 +39,7 @@ engine = init_db_engine()
 
 
 def build_search_text_series(df):
-    search_columns = ['ID', '标题', '标签', '作者', '团队']
+    search_columns = ["ID", *SEARCH_COLUMNS]
     combined_series = pd.Series('', index=df.index, dtype='object')
 
     for column_name in search_columns:
@@ -104,22 +105,43 @@ def build_boolean_fulltext_query(keyword):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
+def get_gallery_table_columns():
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'gallery_info'
+                    """
+                )
+            ).mappings().all()
+        return {row["COLUMN_NAME"] for row in rows}
+    except Exception as exc:
+        print(f"数据表字段检查失败: {exc}")
+        return set()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def has_gallery_fulltext_index():
     try:
         with engine.connect() as conn:
-            result = conn.execute(
+            rows = conn.execute(
                 text(
                     """
-                    SELECT COUNT(*)
+                    SELECT COLUMN_NAME
                     FROM information_schema.STATISTICS
                     WHERE TABLE_SCHEMA = DATABASE()
                       AND TABLE_NAME = 'gallery_info'
                       AND INDEX_NAME = :index_name
+                    ORDER BY SEQ_IN_INDEX
                     """
                 ),
                 {"index_name": FULLTEXT_INDEX_NAME},
-            ).scalar()
-        return bool(result)
+            ).mappings().all()
+        return [row["COLUMN_NAME"] for row in rows] == FULLTEXT_COLUMNS
     except Exception as exc:
         print(f"全文索引状态检查失败: {exc}")
         return False
@@ -131,7 +153,12 @@ def search_gallery_ids_with_like(keywords):
 
     where_parts = []
     params = {}
-    search_columns = ["ID", *SEARCH_COLUMNS]
+    available_columns = get_gallery_table_columns()
+    search_columns = [
+        column
+        for column in ["ID", *SEARCH_COLUMNS]
+        if not available_columns or column in available_columns
+    ]
     for idx, keyword in enumerate(keywords):
         part_conditions = []
         params[f"kw{idx}"] = f"%{escape_like_keyword(keyword.lower())}%"
@@ -156,7 +183,7 @@ def search_gallery_ids_with_fulltext(keywords, include_relevance=True):
     if not keywords:
         return [], {}
 
-    match_expr = "MATCH(`标题`, `标签`, `作者`, `团队`)"
+    match_expr = "MATCH(`标题`, `标题译文`, `标签`, `作者`, `团队`)"
     where_parts = []
     score_parts = []
     params = {}
@@ -397,10 +424,21 @@ def get_data_hash():
             
     try:
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT COUNT(*), MAX(ID) FROM gallery_info")).fetchone()
+            if "标题译文" in get_gallery_table_columns():
+                result = conn.execute(
+                    text(
+                        """
+                        SELECT COUNT(*), MAX(ID), COALESCE(SUM(CRC32(COALESCE(`标题译文`, ''))), 0)
+                        FROM gallery_info
+                        """
+                    )
+                ).fetchone()
+            else:
+                result = conn.execute(text("SELECT COUNT(*), MAX(ID), 0 FROM gallery_info")).fetchone()
             if result:
                 hasher.update(str(result[0]).encode()) 
                 hasher.update(str(result[1]).encode()) 
+                hasher.update(str(result[2]).encode())
     except Exception as e:
         print(f"数据库状态获取失败: {e}")
             
@@ -730,7 +768,7 @@ def apply_dynamic_scores(
     scored_df = source_df.copy()
     scored_df['推荐评分'] = total_scores.astype(np.int32)
     
-    columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接', '文件名', '解析后标签', '标题特征词', '搜索文本']
+    columns_order = ['封面', '推荐评分', 'ID', '上传日期', '标题译文', '标题', '作者', '团队', '标签', '语言', '页数', '本地目录', '链接', '文件名', '解析后标签', '标题特征词', '搜索文本']
     if '上传日期' not in scored_df.columns:
         scored_df['上传日期'] = ''
         

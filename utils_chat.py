@@ -30,7 +30,15 @@ def get_ai_response_stream(user_query, context_df, api_mode="本地 (LM Studio)"
         for _, row in context_df.iterrows():
             item_id = row.get('ID', '无ID')
             link = row.get('链接', '无链接')
-            context_text += f"- ID: {item_id} | 标题: {row['标题']} | 作者: {row['作者']} | 标签: {row['标签']} | 评分: {row['推荐评分']} | 链接: {link}\n"
+            title = row.get('标题', '')
+            translated_title = row.get('标题译文', '')
+            author = row.get('作者', '')
+            tags = row.get('标签', '')
+            score = row.get('推荐评分', '')
+            context_text += (
+                f"- ID: {item_id} | 标题: {title} | 标题译文: {translated_title} | "
+                f"作者: {author} | 标签: {tags} | 评分: {score} | 链接: {link}\n"
+            )
 
     payload = {
         "model": model_name,
@@ -58,8 +66,9 @@ def get_ai_response_stream(user_query, context_df, api_mode="本地 (LM Studio)"
                         data_json = json.loads(data_str)
                         if "choices" in data_json and len(data_json["choices"]) > 0:
                             delta = data_json["choices"][0].get("delta", {})
-                            if "content" in delta:
-                                yield delta["content"]
+                            content = delta.get("content")
+                            if isinstance(content, str) and content:
+                                yield content
                     except json.JSONDecodeError:
                         continue
     except Exception as e:
@@ -163,6 +172,8 @@ def render_chat_interface(chat_context_df):
             has_cleaned_prefix = False
             
             for chunk in stream_generator:
+                if not isinstance(chunk, str) or not chunk:
+                    continue
                 full_response += chunk
                 normalized_response = full_response.replace("Thinking Process:", "<think>")
                 
