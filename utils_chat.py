@@ -80,7 +80,7 @@ def render_chat_interface(chat_context_df):
     col_mode, col_n, col_temp, col_tok = st.columns([1.5, 1.2, 1, 1])
     
     with col_mode:
-        api_mode = st.radio("API 来源：", options=["本地 (LM Studio)", "线上 (Bltcy AI)"], horizontal=True)
+        api_mode = st.radio("API 来源：", options=["本地 (LM Studio)", "线上API"], horizontal=True)
     
     n_context = 0
     if chat_context_df is not None and not chat_context_df.empty:

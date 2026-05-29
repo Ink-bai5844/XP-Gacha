@@ -37,13 +37,14 @@ LM_STUDIO_API_BASE = "http://localhost:1234/v1"
 LM_STUDIO_MODEL = "local-model"
 
 # 线上 AI 配置
-ONLINE_API_BASE = "http://api.bltcy.ai/v1" 
-ONLINE_API_KEY = "your_api_key_here"
+ONLINE_API_BASE = "your_api_base" 
+ONLINE_API_KEY = "your_api_key"
 ONLINE_MODEL = "grok-4-fast-non-reasoning"
 SYSTEM_PROMPT = (
     "你是‘地下金库’的智能助手。你的性格冷静、专业。 "
     "‘地下金库’是一个储存大量漫画的数据库。我会为你提供一部分当前的库存数据作为参考。 "
     "请结合这些数据回答问题。如果数据中没有相关内容，请基于你的通用知识库回答。"
+    "如要推荐条目，要附上可点击的完整跳转链接。"
 )
 
 # 预设Tag权重配置
