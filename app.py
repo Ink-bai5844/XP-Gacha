@@ -670,7 +670,7 @@ vector_search_kw = st.sidebar.text_input("AI 语义检索 (自然语言)：", pl
 with st.sidebar.expander("封面相似检索 (CLIP)", expanded=False):
     cover_query_id = st.text_input(
         "输入库内条目 ID：",
-        placeholder="例如: JM1426534 / NH123456",
+        placeholder="例如: JM114514 / NH123456",
     )
     cover_query_file = st.file_uploader(
         "或上传一张图片：",
