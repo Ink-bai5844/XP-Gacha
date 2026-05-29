@@ -654,7 +654,7 @@ python data_processing/build_vector_db.py
 常用参数示例：
 
 ```powershell
-python data_processing/build_vector_db.py --model-path "models/Qwen3-Embedding-0.6B" --vector-file "manga_vectors/manga_vectors.pkl" --batch-size 16 --max-text-length 800
+python data_processing/build_vector_db.py --model-path "models/Qwen3-Embedding-0.6B" --vector-file "manga_vectors/manga_vectors_Qwen3.pkl" --batch-size 16 --max-text-length 800
 ```
 
 ### 构建封面图片向量索引
