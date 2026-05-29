@@ -38,9 +38,13 @@
 - 支持 nhentai源(以下简称`NH`) / 禁漫天堂源(以下简称`JM`) 双源抓取、修复抓取和本地链接补抓
 - 数据处理页支持数据抓取、全量导库、增量导库、MySQL 表结构与全文索引优化、标题 AI 翻译、向量库重建、封面 Base64 预编码、缓存维护、脚本实时输出等功能
 
-### 检索排序
+### 全文索引&语义向量混合检索排序
 
-![检索排序](UI-imgs/Functions-1.png)
+![全文索引&语义向量混合检索排序](UI-imgs/Functions-1.png)
+
+### 封面相似度检索排序
+
+![封面相似度检索排序](UI-imgs/Functions-8.png)
 
 ### 全局权重分配
 
@@ -54,9 +58,13 @@
 
 ![RAG-LLM检索对话](UI-imgs/Functions-4.png)
 
-### 本地路径打开
+### 漫画详情与本地路径打开
 
-![本地路径打开](UI-imgs/Functions-5.png)
+![漫画详情与本地路径打开](UI-imgs/Functions-5.png)
+
+### 表格列宽配置
+
+![表格列宽配置](UI-imgs/Functions-9.png)
 
 ## 🧮 推荐评分算法
 
@@ -102,6 +110,8 @@
 AI 语义检索和封面相似检索仍然是当前结果集上的二次过滤。文本语义向量构建时会把 `标题译文` 拼入语料，因此翻译更新后建议重建一次文本向量库。它们会缓存最近一次“查询词/图片 + 候选 ID 集合”的结果；如果调权重导致候选 ID 集合变化，可能会重新计算相似度。
 
 ### 历史偏好加权
+
+![历史偏好加权](UI-imgs/Functions-6.png)
 
 应用会把最近 `HISTORY_RECOMMENDATION_CACHE_SIZE` 次通过页面打开的条目记录到 `datacache/recommendation_history.json`：
 
@@ -447,6 +457,8 @@ streamlit run app.py
   影响范围：
   标题特征词统计、标题权重配置、标题分推荐分。
 
+*注：若想跳过字典编写阶段直接获得字典，请移步tools/datasets.txt*
+
 ### 字典实际生效顺序
 
 标签链路：
@@ -480,6 +492,8 @@ streamlit run app.py
 - 改数据库内容或想让语义检索语料同步：需要重跑 `data_processing/build_vector_db.py`
 
 ## 🛠️ 数据准备与维护
+
+![数据准备与维护](UI-imgs/Functions-7.png)
 
 推荐优先使用应用内的 `数据处理` 页面操作。该页面已经把常用流程做成可视化表单，并提供脚本实时输出：
 
