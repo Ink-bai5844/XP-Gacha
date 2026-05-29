@@ -46,13 +46,9 @@
 
 ![封面相似度检索排序](UI-imgs/Functions-8.png)
 
-### 全局权重分配
+### 全局权重分配/标签屏蔽/权重调节/评分下限屏蔽
 
-![全局权重分配](UI-imgs/Functions-2.png)
-
-### 标签屏蔽/权重调节/评分下限屏蔽
-
-![标签屏蔽/权重调节/评分下限屏蔽](UI-imgs/Functions-3.png)
+![全局权重分配/标签屏蔽/权重调节/评分下限屏蔽](UI-imgs/Functions-2.png)
 
 ### RAG-LLM检索对话
 
