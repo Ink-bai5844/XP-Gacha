@@ -7,9 +7,11 @@ pymysql
 pillow
 janome
 sentence-transformers
+transformers
 torch
 requests
 curl-cffi
 beautifulsoup4
+cloudscraper
 cryptography
 tomli; python_version < "3.11"

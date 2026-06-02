@@ -1,0 +1,27 @@
+.git
+.vscode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Keep local secrets and machine-specific config out of the image.
+config.py
+.streamlit/secrets.toml
+.streamlit/library_column_widths.json
+
+# Large mutable runtime assets should be mounted by docker compose.
+b64_cache/
+b64_tmp/
+data/
+datacache/
+localimgtmp/
+logs/
+manga_vectors/
+models/
+onlineimgtmp/
+output1/
+
+# Generated script output.
+data_processing/title_translation_results.jsonl

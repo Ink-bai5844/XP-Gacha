@@ -62,6 +62,31 @@
 
 ![表格列宽配置](UI-imgs/Functions-9.png)
 
+## 🧭 页面与交互
+
+页面当前支持：
+
+- `库存列表`：推荐评分排序、ID / 标题 / 标题译文 / 标签 / 作者 / 团队关键词检索、关键词相关度开关、选中漫画、来源链接、本地目录列、封面缩略图显示、列宽配置保存，并支持一键复制当前页列表信息
+- `漫画详情`：展示当前选中漫画的完整信息，左侧显示封面与本地目录打开入口
+- `LLM 助手`：将当前结果集注入 LLM-RAG 问答，参考库存数据中包含 `标题译文`
+- `历史记录`：刷新历史记录、清空历史记录、查看和删除历史条目
+- `数据处理`：CSV 整理、数据库同步、标题AI翻译、缓存与向量、维护工具、采集入口，以及每个脚本的实时输出
+- 侧边栏：标签屏蔽，标签/作者/标题权重调节，历史偏好总分倍率调节
+- AI 语义检索
+- 封面相似检索（支持上传图片，或输入库内已有条目的 `ID` 直接使用其封面做相似检索）
+- 点击库存列表中的来源链接，并记录历史偏好
+- 在漫画详情页一键打开本地漫画目录，并记录历史偏好
+- 全局偏好统计图表
+- 用户历史偏好统计图表
+
+库存列表底部有 `列宽配置` 折叠面板，可以手动设置各列像素宽度并保存到：
+
+```text
+.streamlit/library_column_widths.json
+```
+
+之后重新打开应用会自动加载这些列宽。Streamlit 当前不会把前端拖拽列宽回传给 Python，因此这里采用的是“表单保存列宽”的持久化方式。
+
 ## 🧮 推荐评分算法
 
 推荐分当前由四部分组成：
@@ -243,24 +268,7 @@ XP-Gacha/
 - 本地 embedding 模型
 - 本地 CLIP 模型
 - 如需本地LLM聊天：已启动的 `LM Studio` 兼容接口
-
-安装依赖：
-
-```bash
-pip install -r requirements.txt
-```
-
-如果你手动装包，至少需要：
-
-```bash
-pip install streamlit pandas numpy scipy sqlalchemy pymysql pillow janome sentence-transformers torch requests curl-cffi beautifulsoup4 cloudscraper tomli
-```
-
-如果你要使用 `data_processing/img_to_vector.py` 或主界面的封面相似检索，还需要：
-
-```bash
-pip install transformers
-```
+- 可选：Docker Desktop + WSL2，用于容器化启动
 
 ## ⚙️ 如何开始
 
@@ -299,6 +307,19 @@ host = "127.0.0.1"
 port = 3306
 database = "gallery_info"
 ```
+
+Docker模式下，如果 MySQL 仍运行在 Windows 宿主机上，地址要写成：
+
+```toml
+[mysql]
+user = "your_database_name"
+password = "your_database_password"
+host = "host.docker.internal"
+port = 3306
+database = "gallery_info"
+```
+
+如果 MySQL 也放进同一个 `docker-compose.yml`，则 `host` 应改成 MySQL 服务名。
 
 ### 3. 自定义主题色
 
@@ -365,34 +386,106 @@ models/
 
 ## 🚀 启动应用
 
-本地版：
+### 本机 Python 运行
+
+适合在 Windows 本机直接运行，支持 `os.startfile` 打开本地漫画目录。
+
+安装依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+如果你手动装包，至少需要：
+
+```bash
+pip install streamlit pandas numpy scipy sqlalchemy pymysql pillow janome sentence-transformers torch requests curl-cffi beautifulsoup4 cloudscraper tomli
+```
+
+如果你要使用 `data_processing/img_to_vector.py` 或主界面的封面相似检索，还需要：
+
+```bash
+pip install transformers
+```
+
+启动应用：
 
 ```powershell
 streamlit run app.py
 ```
 
-页面当前支持：
-
-- `库存列表`：推荐评分排序、ID / 标题 / 标题译文 / 标签 / 作者 / 团队关键词检索、关键词相关度开关、选中漫画、来源链接、本地目录列、封面缩略图显示、列宽配置保存，并支持一键复制当前页列表信息
-- `漫画详情`：展示当前选中漫画的完整信息，左侧显示封面与本地目录打开入口
-- `LLM 助手`：将当前结果集注入 LLM-RAG 问答，参考库存数据中包含 `标题译文`
-- `历史记录`：刷新历史记录、清空历史记录、查看和删除历史条目
-- `数据处理`：CSV 整理、数据库同步、标题AI翻译、缓存与向量、维护工具、采集入口，以及每个脚本的实时输出
-- 侧边栏：标签屏蔽，标签/作者/标题权重调节，历史偏好总分倍率调节
-- AI 语义检索
-- 封面相似检索（支持上传图片，或输入库内已有条目的 `ID` 直接使用其封面做相似检索）
-- 点击库存列表中的来源链接，并记录历史偏好
-- 在漫画详情页一键打开本地漫画目录，并记录历史偏好
-- 全局偏好统计图表
-- 用户历史偏好统计图表
-
-库存列表底部有 `列宽配置` 折叠面板，可以手动设置各列像素宽度并保存到：
+启动后访问：
 
 ```text
-.streamlit/library_column_widths.json
+http://localhost:8501
 ```
 
-之后重新打开应用会自动加载这些列宽。Streamlit 当前不会把前端拖拽列宽回传给 Python，因此这里采用的是“表单保存列宽”的持久化方式。
+### Docker 运行
+
+适合在 Docker Desktop 的 Linux containers / WSL2 模式下运行。项目已提供 `Dockerfile`、`docker-compose.yml` 和 `config_docker.py`，镜像中只包含代码与运行环境，模型、向量、缓存、CSV、封面图和数据库密钥通过宿主机目录挂载。
+
+首次启动或依赖变更后启动：
+
+```powershell
+docker compose up -d --build
+```
+
+日常后台启动：
+
+```powershell
+docker compose up -d
+```
+
+停止：
+
+```powershell
+docker compose down
+```
+
+查看日志：
+
+```powershell
+docker compose logs -f
+```
+
+启动后访问：
+
+```text
+http://localhost:8501
+```
+
+容器默认把以下目录挂载到 `/app` 下，相关文件仍保留在宿主机项目目录中，不会被打进镜像：
+
+```text
+.streamlit/
+b64_cache/
+b64_tmp/
+data/
+datacache/
+dictionaries/
+localimgtmp/
+logs/
+manga_vectors/
+models/
+onlineimgtmp/
+```
+
+Docker 版默认使用 `config_docker.py` 生成容器内的 `config.py`，常用配置可以通过 `docker-compose.yml` 的 `environment` 覆盖：
+
+```yaml
+environment:
+  XP_GACHA_BASE_DIR: /library
+  LM_STUDIO_API_BASE: http://host.docker.internal:5555/v1
+```
+
+如需让容器读取真实本地漫画目录，在 `docker-compose.yml` 中取消并修改示例挂载：
+
+```yaml
+volumes:
+  - H:/动漫资源/漫画集/HMAN:/library:ro
+```
+
+注意：Docker Linux 容器不能直接调用 Windows 的资源管理器。漫画详情页点击“打开本地目录”时会记录历史并显示路径，但在容器环境中需要手动复制路径打开。
 
 ## 📖 字典与 XP 语义聚合说明
 

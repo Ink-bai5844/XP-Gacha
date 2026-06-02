@@ -39,7 +39,7 @@ LM_STUDIO_MODEL = "local-model"
 # 线上 AI 配置
 ONLINE_API_BASE = "your_api_base" 
 ONLINE_API_KEY = "your_api_key"
-ONLINE_MODEL = "grok-4-fast-non-reasoning"
+ONLINE_MODEL = "deepseek-v4-flash"
 SYSTEM_PROMPT = (
     "你是‘地下金库’的智能助手。你的性格冷静、专业。 "
     "‘地下金库’是一个储存大量漫画的数据库。我会为你提供一部分当前的库存数据作为参考。 "

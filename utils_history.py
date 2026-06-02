@@ -15,6 +15,11 @@ from config import (
     HISTORY_RECOMMENDATION_CACHE_SIZE,
 )
 
+try:
+    from config import HISTORY_LINK_TRACKING_PUBLIC_HOST
+except ImportError:
+    HISTORY_LINK_TRACKING_PUBLIC_HOST = HISTORY_LINK_TRACKING_HOST
+
 _TRACKED_LINK_ITEMS = {}
 _TRACKED_LINK_LOCK = threading.Lock()
 _TRACKING_SERVER = None
@@ -158,7 +163,7 @@ def build_tracked_link(row_data):
 
     token = register_tracked_link_item(row_data)
     return (
-        f"http://{HISTORY_LINK_TRACKING_HOST}:{HISTORY_LINK_TRACKING_PORT}/open"
+        f"http://{HISTORY_LINK_TRACKING_PUBLIC_HOST}:{HISTORY_LINK_TRACKING_PORT}/open"
         f"?token={quote(token)}&target={quote(target_link, safe='')}"
     )
 

@@ -546,8 +546,14 @@ def open_local_history_item(item_payload):
     selected_path = str(item_payload.get("本地目录", "")).strip()
     if selected_path != "本地目录不存在" and os.path.exists(selected_path):
         record_recommendation_history(item_payload, "local_folder")
-        os.startfile(selected_path)
-        st.session_state["open_item_notice"] = f"已记录并打开本地目录：{_get_item_label(item_payload)}"
+        if hasattr(os, "startfile"):
+            os.startfile(selected_path)
+            st.session_state["open_item_notice"] = f"已记录并打开本地目录：{_get_item_label(item_payload)}"
+        else:
+            st.session_state["open_item_notice"] = (
+                f"已记录本地目录：{_get_item_label(item_payload)}。"
+                "当前环境不能直接打开宿主机文件夹，请复制下方路径手动打开。"
+            )
     else:
         st.session_state["open_item_error"] = f"路径失效：{selected_path}"
 
