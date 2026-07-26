@@ -70,6 +70,11 @@ INITIAL_TAG_WEIGHTS = {
     "NTR(netorare)": env_float("INITIAL_TAG_WEIGHT_NTR", -2.0),
 }
 
+# 线上封面实时抓取。容器内如需走宿主机代理可设 ONLINE_COVER_PROXY=http://host.docker.internal:7890
+ONLINE_COVER_FETCH_ENABLED = os.getenv("ONLINE_COVER_FETCH_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+ONLINE_COVER_PROXY = os.getenv("ONLINE_COVER_PROXY", "")
+ONLINE_COVER_FETCH_CONCURRENCY = env_int("ONLINE_COVER_FETCH_CONCURRENCY", 6)
+
 # 检索结果上限
 SEMANTIC_SEARCH_TOP_K = env_int("SEMANTIC_SEARCH_TOP_K", 5000)
 COVER_SEARCH_TOP_K = env_int("COVER_SEARCH_TOP_K", 5000)

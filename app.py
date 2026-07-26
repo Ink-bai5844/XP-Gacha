@@ -24,7 +24,12 @@ from data_pipeline import (
     search_gallery_candidate_ids,
 )
 from utils_charts import render_global_preference_charts, render_history_preference_charts
-from utils_core import get_cover_base64
+from utils_core import get_cover_base64, resolve_gallery_id
+from utils_online_cover import (
+    has_cached_cover,
+    is_online_cover_pending,
+    submit_online_cover_fetches,
+)
 from utils_cv import search_similar_cover_items
 from utils_history import (
     build_history_preference_maps,
@@ -563,11 +568,12 @@ def render_manga_detail(manga):
     manga_payload = manga.to_dict() if hasattr(manga, "to_dict") else dict(manga)
 
     with left:
-        cover_data = get_cover_base64(
-            manga_payload.get("本地目录", ""),
-            manga_payload.get("ID", ""),
-            manga_payload.get("链接", ""),
-        )
+        with st.spinner("正在加载封面..."):
+            cover_data = get_cover_base64(
+                manga_payload.get("本地目录", ""),
+                manga_payload.get("ID", ""),
+                manga_payload.get("链接", ""),
+            )
         if cover_data:
             st.image(cover_data, width="stretch")
         else:
@@ -994,9 +1000,15 @@ tab_library, tab_llm, tab_detail, tab_history, tab_data_processing = st.tabs(
 )
 
 with tab_library:
-    title_col, copy_col = st.columns([4, 1.6])
+    title_col, refresh_col, copy_col = st.columns([1, 4, 1.6])
     with title_col:
         st.subheader("库存列表")
+    with refresh_col:
+        st.button(
+            "刷新封面",
+            key="refresh-page-covers",
+            help="重新加载当前页封面（后台抓取完成后点击显示）",
+        )
     copy_button_slot = copy_col.empty()
 
     if not filtered_df.empty:
@@ -1063,9 +1075,30 @@ with tab_library:
 
         with st.spinner(f'正在加载 {selected_page_label} 范围的缩略图...'):
             display_df['封面'] = display_df.apply(
-                lambda row: get_cover_base64(row['本地目录'], row.get('ID', ''), row.get('链接', '')),
+                lambda row: get_cover_base64(
+                    row['本地目录'], row.get('ID', ''), row.get('链接', ''), allow_online=False
+                ),
                 axis=1
             )
+
+        # 本地取不到封面的条目提交后台并发抓取，表格先渲染，封面由下方轮询逐步补上
+        online_cover_candidates = []
+        for _, row in display_df[display_df['封面'].isnull()].iterrows():
+            resolved_cover_id = resolve_gallery_id(row.get('ID', ''), row.get('链接', ''))
+            if resolved_cover_id:
+                online_cover_candidates.append(resolved_cover_id)
+        if online_cover_candidates:
+            submit_online_cover_fetches(online_cover_candidates)
+        pending_cover_set = set()
+        missed_cover_refresh = False
+        for cover_id in online_cover_candidates:
+            if is_online_cover_pending(cover_id):
+                pending_cover_set.add(cover_id)
+            elif has_cached_cover(cover_id):
+                # 抓取在本次渲染扫描后才落盘，立即重跑一次补上，避免封面悬空
+                missed_cover_refresh = True
+        if missed_cover_refresh:
+            st.rerun()
 
         table_df = display_df.drop(
             columns=['文件名', '解析后标签', '标题特征词', '搜索文本'],
@@ -1103,6 +1136,9 @@ with tab_library:
         )
         apply_table_selection(edited_table, display_df)
         render_library_column_width_controls(display_columns)
+
+        if pending_cover_set:
+            st.caption(f"⏳ 有 {len(pending_cover_set)} 个封面正在后台抓取，稍后点击「刷新封面」按钮查看…")
 
         del table_df
         del display_df

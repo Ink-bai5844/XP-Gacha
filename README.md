@@ -867,9 +867,29 @@ python tools/clear_title_translation_by_error_ids.py --input "tools/error.json" 
 2. 如果没有，则读取 `onlineimgtmp/ID.*`
 3. 如果还没有，则回退到本地目录里的 `1.*`
 4. 本地目录回退时会生成 `localimgtmp/ID.jpg`
-5. 最终结果会回写到 `b64_cache/ID.txt`
+5. 如果本地全部落空，则从图源站点实时抓取封面（见下）
+6. 最终结果会回写到 `b64_cache/ID.txt`
 
-即，Base64 缓存是第一优先级，在线图是第二优先级，本地图是最后回退。
+即，Base64 缓存是第一优先级，在线图是第二优先级，本地图是第三优先级，线上实时抓取是最后回退。
+
+### 线上封面实时抓取
+
+当 `b64_cache`、`onlineimgtmp`、本地目录都取不到某条目的封面（或 `b64_cache` 目录不存在）时，应用会直接从图源站点实时抓取：
+
+- NH 源：先通过 `https://nhentai.net/api/v2/galleries/<画廊ID>` 把画廊 ID 换成缩略图 URL 实际使用的 `media_id`（两者不是同一个数字，旧版 `/api/gallery/` 接口作为回退），API 同时给出缩略图真实扩展名，再依次尝试 `https://t1~t5.nhentai.net/galleries/<media_id>/thumb.<ext>`
+- JM 源：专辑 ID 即 JM ID 本身，依次尝试 `https://cdn-msp.18comic.vip` 与 `cdn-msp1~5` 镜像下的 `/media/albums/<专辑ID>.jpg/.webp/.png`
+
+找到第一个可访问的组合即停止，抓到的图片会原子写入 `onlineimgtmp/ID.<ext>` 并回写 `b64_cache/ID.txt`，下次直接命中缓存。失败分两类：确定性失败（如 404，条目已被源站删除）的 ID 本次会话内不再重试；网络性失败（超时/连接失败）不拉黑 ID，短暂冷却后可重试。
+
+加载方式是异步的：库存列表只用本地缓存快速渲染表格（不等网络），缺失封面的条目提交到后台线程池并发抓取，表格下方会提示后台抓取数量；抓取完成后点击「库存列表」标题右侧的「刷新封面」按钮手动刷新显示（不做自动轮询刷新，避免整页刷新重挂载表格打断正在进行的勾选操作）；漫画详情页则单条即时抓取，若同一封面正被后台抓取会等待其完成。
+
+相关配置（`config.py`）：
+
+- `ONLINE_COVER_FETCH_ENABLED`：是否启用实时抓取，默认 `True`
+- `ONLINE_COVER_FETCH_CONCURRENCY`：后台并发抓取的线程数，默认 `6`（修改后需重启应用生效）
+- `ONLINE_COVER_PROXY`：抓取走的代理，默认与爬虫一致的 `http://127.0.0.1:7890`，设为 `""` 表示直连；每次请求内代理与直连互为回退，成功的一侧成为下次首选。NH / JM 两个图源各自独立熔断：连续多次网络性失败后暂停该源约 10 分钟再自动恢复，互不影响
+
+Docker 部署时两者均可用同名环境变量覆盖（`ONLINE_COVER_PROXY` 默认为空即直连，容器内走宿主机代理可设为 `http://host.docker.internal:7890`）。
 
 ## 缓存说明
 

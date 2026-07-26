@@ -3,10 +3,41 @@ import re
 import glob
 import base64
 import difflib
+import threading
+import time
 import pandas as pd
 from PIL import Image
 import streamlit as st
 from config import BASE_DIR, B64_CACHE_DIR, ONLINE_IMG_DIR, IMG_CACHE_DIR
+from utils_online_cover import fetch_and_cache_online_cover
+
+# onlineimgtmp 可达数十万文件，逐行 glob 等于每行全目录扫描（实测 0.19s/次）；
+# 改为一次扫描建索引并短 TTL 复用。新抓的封面同时落 b64_cache（优先级更高），
+# 因此索引短暂过期不影响显示。
+_ONLINE_IMG_INDEX_TTL = 30.0
+_online_img_index = None
+_online_img_index_built_at = 0.0
+_online_img_index_lock = threading.Lock()
+
+
+def _get_online_img_index():
+    global _online_img_index, _online_img_index_built_at
+    now = time.monotonic()
+    with _online_img_index_lock:
+        if _online_img_index is not None and now - _online_img_index_built_at < _ONLINE_IMG_INDEX_TTL:
+            return _online_img_index
+    index = {}
+    try:
+        for entry in os.scandir(ONLINE_IMG_DIR):
+            if entry.is_file():
+                stem = os.path.splitext(entry.name)[0]
+                index.setdefault(stem.upper(), entry.path)
+    except OSError:
+        pass
+    with _online_img_index_lock:
+        _online_img_index = index
+        _online_img_index_built_at = now
+    return index
 
 def sanitize_folder_name(name):
     if not isinstance(name, str):
@@ -55,7 +86,40 @@ def resolve_gallery_id(gallery_id="", url=""):
     return None
 
 
-def get_cover_base64(local_path, gallery_id="", url=""):
+def _local_folder_cover_b64(local_path, gallery_id):
+    cache_file = os.path.join(IMG_CACHE_DIR, f"{gallery_id}.jpg")
+
+    if not os.path.exists(cache_file):
+        if local_path == "本地目录不存在" or not isinstance(local_path, str) or not os.path.exists(local_path):
+            return None
+
+        escaped_path = glob.escape(local_path)
+        search_pattern = os.path.join(escaped_path, "1.*")
+        matched_files = glob.glob(search_pattern)
+
+        valid_files = [f for f in matched_files if os.path.isfile(f)]
+        if not valid_files:
+            return None
+
+        target_file = valid_files[0]
+        try:
+            with Image.open(target_file) as img:
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                img.thumbnail((150, 200))
+                img.save(cache_file, format="JPEG", quality=85)
+        except Exception:
+            return None
+
+    try:
+        with open(cache_file, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception:
+        return None
+
+
+def get_cover_base64(local_path, gallery_id="", url="", allow_online=True):
     gallery_id = resolve_gallery_id(gallery_id, url)
             
     if not gallery_id:
@@ -70,12 +134,10 @@ def get_cover_base64(local_path, gallery_id="", url=""):
             pass
 
     full_b64_string = None
-    online_img_pattern = os.path.join(ONLINE_IMG_DIR, f"{gallery_id}.*")
-    matched_online_imgs = glob.glob(online_img_pattern)
-    
-    if matched_online_imgs:
+    target_img = _get_online_img_index().get(str(gallery_id).upper())
+
+    if target_img:
         try:
-            target_img = matched_online_imgs[0]
             with open(target_img, "rb") as f:
                 encoded = base64.b64encode(f.read()).decode("utf-8")
             ext = target_img.split('.')[-1].lower()
@@ -85,36 +147,12 @@ def get_cover_base64(local_path, gallery_id="", url=""):
             pass
 
     if not full_b64_string:
-        if local_path == "本地目录不存在" or not isinstance(local_path, str) or not os.path.exists(local_path):
-            return None
-            
-        cache_file = os.path.join(IMG_CACHE_DIR, f"{gallery_id}.jpg")
-        
-        if not os.path.exists(cache_file):
-            escaped_path = glob.escape(local_path)
-            search_pattern = os.path.join(escaped_path, "1.*")
-            matched_files = glob.glob(search_pattern)
-            
-            valid_files = [f for f in matched_files if os.path.isfile(f)]
-            if not valid_files:
-                return None
-                
-            target_file = valid_files[0]
-            try:
-                with Image.open(target_file) as img:
-                    if img.mode in ("RGBA", "P"):
-                        img = img.convert("RGB")
-                    img.thumbnail((150, 200)) 
-                    img.save(cache_file, format="JPEG", quality=85)
-            except Exception:
-                return None 
-                
-        try:
-            with open(cache_file, "rb") as f:
-                encoded = base64.b64encode(f.read()).decode("utf-8")
-            full_b64_string = f"data:image/jpeg;base64,{encoded}"
-        except Exception:
-            return None
+        full_b64_string = _local_folder_cover_b64(local_path, gallery_id)
+
+    if not full_b64_string:
+        if allow_online:
+            return fetch_and_cache_online_cover(gallery_id, wait_if_in_flight=True)
+        return None
 
     if full_b64_string:
         try:

@@ -52,6 +52,14 @@ INITIAL_TAG_WEIGHTS = {
     'NTR(netorare)': -2.0
 }
 
+# 线上封面实时抓取
+# 当 b64_cache、onlineimgtmp、本地目录都取不到封面时，直接从图源站点实时抓取并回写缓存
+ONLINE_COVER_FETCH_ENABLED = True
+# 实时抓取使用的代理（与爬虫一致）；设为 "" 表示直连
+ONLINE_COVER_PROXY = "http://127.0.0.1:7890"
+# 后台并发抓取的线程数（修改后需重启应用生效）
+ONLINE_COVER_FETCH_CONCURRENCY = 6
+
 # 检索结果上限
 # 语义检索会在当前候选集中保留前 N 个文本最相似条目
 SEMANTIC_SEARCH_TOP_K = 5000
