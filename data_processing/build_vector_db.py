@@ -6,13 +6,6 @@ from pathlib import Path
 
 import pandas as pd
 from sentence_transformers import SentenceTransformer
-from sqlalchemy import create_engine
-from sqlalchemy.engine import URL
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
 
 # 允许直接运行 data_processing 下的脚本时，也能导入项目根目录模块。
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config import LOCAL_MODEL_PATH as CONFIG_LOCAL_MODEL_PATH
 from config import VECTOR_FILE as CONFIG_VECTOR_FILE
+from server.database import get_database_url, get_engine
 
 # 默认优先读取 config.py；环境变量只用于临时覆盖。
 LOCAL_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", CONFIG_LOCAL_MODEL_PATH)
@@ -34,25 +28,7 @@ def get_model_display_name(model_path=None):
 
 
 def load_db_uri():
-    if not SECRETS_FILE.exists():
-        raise FileNotFoundError(f"未找到数据库配置文件：{SECRETS_FILE}")
-
-    with SECRETS_FILE.open("rb") as f:
-        secrets = tomllib.load(f)
-
-    try:
-        mysql_cfg = secrets["mysql"]
-        return URL.create(
-            "mysql+pymysql",
-            username=str(mysql_cfg["user"]),
-            password=str(mysql_cfg["password"]),
-            host=str(mysql_cfg.get("host", "localhost")),
-            port=int(mysql_cfg.get("port", 3306)),
-            database=str(mysql_cfg["database"]),
-            query={"charset": "utf8mb4"},
-        )
-    except KeyError as e:
-        raise KeyError(f"{SECRETS_FILE} 缺少 mysql.{e.args[0]} 配置") from e
+    return get_database_url()
 
 
 def build_vectors(
@@ -67,7 +43,7 @@ def build_vectors(
     batch_size = int(batch_size)
     max_text_length = int(max_text_length)
 
-    engine = create_engine(load_db_uri())
+    engine = get_engine()
     print("正在从 MySQL 读取数据...")
     df = pd.read_sql(sql_query, con=engine)
     df = df.fillna("")

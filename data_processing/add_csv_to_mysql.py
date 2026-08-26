@@ -4,15 +4,10 @@ import re
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import URL
+from sqlalchemy import inspect, text
+from server.database import get_database_url, get_engine
 
 from data_processing.optimize_mysql_schema import optimize_gallery_schema
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SECRETS_FILE = PROJECT_ROOT / ".streamlit" / "secrets.toml"
@@ -36,28 +31,10 @@ DB_COLUMNS = [
 
 
 def load_db_uri():
-    if not SECRETS_FILE.exists():
-        raise FileNotFoundError(f"未找到数据库配置文件：{SECRETS_FILE}")
-
-    with SECRETS_FILE.open("rb") as f:
-        secrets = tomllib.load(f)
-
-    try:
-        mysql_cfg = secrets["mysql"]
-        return URL.create(
-            "mysql+pymysql",
-            username=str(mysql_cfg["user"]),
-            password=str(mysql_cfg["password"]),
-            host=str(mysql_cfg.get("host", "localhost")),
-            port=int(mysql_cfg.get("port", 3306)),
-            database=str(mysql_cfg["database"]),
-            query={"charset": "utf8mb4"},
-        )
-    except KeyError as e:
-        raise KeyError(f"{SECRETS_FILE} 缺少 mysql.{e.args[0]} 配置") from e
+    return get_database_url()
 
 
-engine = create_engine(load_db_uri())
+engine = get_engine()
 
 
 def extract_gallery_id(url):

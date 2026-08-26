@@ -12,7 +12,8 @@ import altair as alt
 from collections import Counter
 from janome.tokenizer import Tokenizer
 from scipy.sparse import csr_matrix
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from server.database import get_engine
 
 st.set_page_config(page_title="地下金库(Online)", layout="wide")
 
@@ -37,30 +38,7 @@ st.markdown(
 # 数据库连接
 @st.cache_resource
 def init_db_engine():
-    # 使用 cache_resource 确保引擎只创建一次
-    try:
-        # 从 st.secrets 读取配置
-        db_user = st.secrets["mysql"]["user"]
-        db_pwd = st.secrets["mysql"]["password"]
-        db_host = st.secrets["mysql"]["host"]
-        db_port = st.secrets["mysql"]["port"]
-        db_name = st.secrets["mysql"]["database"]
-        
-        # 构建连接字符串
-        DB_URI = f"mysql+pymysql://{db_user}:{db_pwd}@{db_host}:{db_port}/{db_name}?charset=utf8mb4"
-        
-        # 创建引擎，并设置连接池参数
-        # pool_size: 保持的连接数, max_overflow: 允许溢出的最大连接数
-        engine = create_engine(
-            DB_URI, 
-            pool_size=5, 
-            max_overflow=10, 
-            pool_recycle=3600
-        )
-        return engine
-    except KeyError as e:
-        st.error(f"密钥配置缺失！请检查配置文件是否包含 {e}")
-        st.stop()
+    return get_engine()
 
 engine = init_db_engine()
 

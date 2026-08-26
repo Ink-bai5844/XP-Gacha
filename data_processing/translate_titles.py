@@ -11,18 +11,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import URL
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+from sqlalchemy import inspect, text
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+from server.database import get_database_url, get_engine
 
 try:
     with contextlib.redirect_stdout(io.StringIO()):
@@ -91,25 +86,7 @@ def is_content_rejection_text(text_value: object) -> bool:
 
 
 def load_db_uri():
-    if not SECRETS_FILE.exists():
-        raise FileNotFoundError(f"未找到数据库配置文件：{SECRETS_FILE}")
-
-    with SECRETS_FILE.open("rb") as f:
-        secrets = tomllib.load(f)
-
-    try:
-        mysql_cfg = secrets["mysql"]
-        return URL.create(
-            "mysql+pymysql",
-            username=str(mysql_cfg["user"]),
-            password=str(mysql_cfg["password"]),
-            host=str(mysql_cfg.get("host", "localhost")),
-            port=int(mysql_cfg.get("port", 3306)),
-            database=str(mysql_cfg["database"]),
-            query={"charset": "utf8mb4"},
-        )
-    except KeyError as exc:
-        raise KeyError(f"{SECRETS_FILE} 缺少 mysql.{exc.args[0]} 配置") from exc
+    return get_database_url()
 
 
 def normalize_api_url(api_url: str) -> str:
@@ -380,7 +357,7 @@ def translate_titles(args: argparse.Namespace) -> None:
     jsonl_output = resolve_output_path(args.jsonl_output)
     failed_jsonl_output = resolve_output_path(args.failed_jsonl_output)
     db_write_enabled = not args.jsonl_only
-    engine = create_engine(load_db_uri())
+    engine = get_engine()
 
     rows, skipped_translated = load_title_rows(engine, args.start_index, args.end_index)
     batches = chunk_rows(rows, args.batch_size)

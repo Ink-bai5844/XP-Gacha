@@ -1,12 +1,7 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import URL
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+from sqlalchemy import inspect, text
+from server.database import get_engine as runtime_engine
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,30 +11,8 @@ TITLE_TRANSLATION_COLUMN = "标题译文"
 FULLTEXT_COLUMNS = ["标题", "标题译文", "标签", "作者", "团队"]
 
 
-def load_db_uri():
-    if not SECRETS_FILE.exists():
-        raise FileNotFoundError(f"未找到数据库配置文件：{SECRETS_FILE}")
-
-    with SECRETS_FILE.open("rb") as f:
-        secrets = tomllib.load(f)
-
-    try:
-        mysql_cfg = secrets["mysql"]
-        return URL.create(
-            "mysql+pymysql",
-            username=str(mysql_cfg["user"]),
-            password=str(mysql_cfg["password"]),
-            host=str(mysql_cfg.get("host", "localhost")),
-            port=int(mysql_cfg.get("port", 3306)),
-            database=str(mysql_cfg["database"]),
-            query={"charset": "utf8mb4"},
-        )
-    except KeyError as exc:
-        raise KeyError(f"{SECRETS_FILE} 缺少 mysql.{exc.args[0]} 配置") from exc
-
-
 def get_engine():
-    return create_engine(load_db_uri())
+    return runtime_engine()
 
 
 def get_index_names(inspector):

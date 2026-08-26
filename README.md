@@ -1,5 +1,30 @@
 # XP-Gacha / 地下金库
 
+## 新版一体化启动（React + FastAPI + MySQL）
+
+新版保留原 Streamlit 的检索、动态评分、语义/封面相似搜索、详情、历史偏好、图表、LLM 问答和全部数据处理入口，界面使用 `web`。FastAPI 同时提供 API 与静态前端，因此部署后只有一个 Web 入口。
+
+Windows 推荐直接运行：
+
+```powershell
+./scripts/start.ps1
+```
+
+或手动执行 `Copy-Item .env.example .env` 后运行 `docker compose up --build -d`。打开 `http://127.0.0.1:8000`，首次启动后进入“附录”，上传包含 CSV 与标准词典的 ZIP、上传单个 CSV，或点击“导入项目 data/gallery_info”。默认增量写入；覆盖重建需要再次确认。
+
+MySQL 8.4 已包含在 Compose 中，数据保存在命名卷 `xp-gacha_mysql-data`；宿主机默认只在 `127.0.0.1:3307` 暴露数据库端口。漫画目录、数据库密码、LM Studio 和线上兼容 API 均在 `.env` 中配置。
+
+不使用 Docker 时：
+
+```powershell
+pnpm --dir web install
+pnpm --dir web build
+python -m pip install -r requirements.txt
+python launcher.py
+```
+
+API 文档位于 `http://127.0.0.1:8000/api/docs`。旧 `streamlit run app.py` 入口仍保留，便于过渡和功能对照。
+
 争做最强大的本子推荐系统（误
 
 一个基于 `Streamlit` 的本地（正经？）漫画库存管理、检索与推荐系统。

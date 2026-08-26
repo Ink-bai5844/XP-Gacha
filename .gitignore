@@ -2,7 +2,8 @@
 /.vscode
 /b64_cache
 /b64_tmp
-/config.py
+/.env
+/.env.local
 /data
 /datacache
 /dictionaries
@@ -10,12 +11,16 @@
 /manga_vectors
 /models
 /onlineimgtmp
-/__pycache__
+# Python bytecode and caches at any directory depth
+**/__pycache__/
+*.py[cod]
+*$py.class
 /logs
-/Integration/__pycache__
-/tools/__pycache__
-/data_get/__pycache__
-/data_get/local/__pycache__
-/data_processing/__pycache__
 /output1
 /data_processing/title_translation_results.jsonl
+/web/node_modules
+/web/dist
+/.pnpm-store
+/.portable-cache
+/datacache/imports
+/PROMPT

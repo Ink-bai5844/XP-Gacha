@@ -1,17 +1,56 @@
+name: xp-gacha
+
 services:
-  xp-gacha:
-    build: .
-    container_name: xp-gacha
-    ports:
-      - "8501:8501"
-      - "8765:8765"
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --ngram-token-size=2
     environment:
-      XP_GACHA_BASE_DIR: /library
-      LM_STUDIO_API_BASE: http://host.docker.internal:5555/v1
-      HISTORY_LINK_TRACKING_HOST: 0.0.0.0
-      HISTORY_LINK_TRACKING_PUBLIC_HOST: 127.0.0.1
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-xp_gacha_root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-xp_gacha}
+      MYSQL_USER: ${MYSQL_USER:-xp_gacha}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-xp_gacha}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:${MYSQL_EXPOSE_PORT:-3307}:3306"
     volumes:
-      - ./.streamlit:/app/.streamlit
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${XP_GACHA_PORT:-8000}:8000"
+    environment:
+      XP_GACHA_ENV: production
+      XP_GACHA_DATA_ROOT: /app
+      XP_GACHA_BASE_DIR: /library
+      XP_GACHA_ALLOW_OPEN_LOCAL: "0"
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-xp_gacha}
+      MYSQL_USER: ${MYSQL_USER:-xp_gacha}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-xp_gacha}
+      LM_STUDIO_API_BASE: ${LM_STUDIO_API_BASE:-http://host.docker.internal:1234/v1}
+      LM_STUDIO_MODEL: ${LM_STUDIO_MODEL:-local-model}
+      ONLINE_API_BASE: ${ONLINE_API_BASE:-}
+      ONLINE_API_KEY: ${ONLINE_API_KEY:-}
+      ONLINE_MODEL: ${ONLINE_MODEL:-deepseek-v4-flash}
+      ONLINE_COVER_PROXY: ${ONLINE_COVER_PROXY:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
       - ./b64_cache:/app/b64_cache
       - ./b64_tmp:/app/b64_tmp
       - ./data:/app/data
@@ -22,8 +61,19 @@ services:
       - ./manga_vectors:/app/manga_vectors
       - ./models:/app/models
       - ./onlineimgtmp:/app/onlineimgtmp
-      # Optional: mount the real manga library here, then set XP_GACHA_BASE_DIR=/library.
-      # - H:/动漫资源/漫画集/HMAN:/library:ro
+      - "${XP_GACHA_LIBRARY_PATH:-./library}:/library:ro"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  adminer:
+    image: adminer:5
+    profiles: ["tools"]
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:${ADMINER_PORT:-8081}:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql-data:

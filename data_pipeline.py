@@ -4,13 +4,16 @@ import hashlib
 import pickle
 import gc
 import re
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 from collections import Counter
 from scipy.sparse import csr_matrix
-from sqlalchemy import bindparam, create_engine, text
-from config import CACHE_DIR, STOP_TAGS, SEMANTIC_MAP
+from sqlalchemy import bindparam, inspect, text
+from config import CACHE_DIR, DICTIONARY_DIR, STOP_TAGS, SEMANTIC_MAP
+from server.database import get_engine
 from utils_core import get_local_folders, match_local_folder
 from utils_charts import build_preference_chart_cache
 from utils_nlp import extract_and_map_title_words
@@ -21,19 +24,7 @@ FULLTEXT_INDEX_NAME = "ft_gallery_search"
 
 @st.cache_resource
 def init_db_engine():
-    try:
-        db_user = st.secrets["mysql"]["user"]
-        db_pwd = st.secrets["mysql"]["password"]
-        db_host = st.secrets["mysql"]["host"]
-        db_port = st.secrets["mysql"]["port"]
-        db_name = st.secrets["mysql"]["database"]
-        
-        DB_URI = f"mysql+pymysql://{db_user}:{db_pwd}@{db_host}:{db_port}/{db_name}?charset=utf8mb4"
-        engine = create_engine(DB_URI, pool_size=5, max_overflow=10, pool_recycle=3600)
-        return engine
-    except KeyError as e:
-        st.error(f"密钥配置缺失！请检查配置文件是否包含 {e}")
-        st.stop()
+    return get_engine()
 
 engine = init_db_engine()
 
@@ -107,6 +98,11 @@ def build_boolean_fulltext_query(keyword):
 @st.cache_data(ttl=600, show_spinner=False)
 def get_gallery_table_columns():
     try:
+        if engine.url.get_backend_name() != "mysql":
+            inspector = inspect(engine)
+            if not inspector.has_table("gallery_info"):
+                return set()
+            return {column["name"] for column in inspector.get_columns("gallery_info")}
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
@@ -126,6 +122,8 @@ def get_gallery_table_columns():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def has_gallery_fulltext_index():
+    if engine.url.get_backend_name() != "mysql":
+        return False
     try:
         with engine.connect() as conn:
             rows = conn.execute(
@@ -159,11 +157,12 @@ def search_gallery_ids_with_like(keywords):
         for column in ["ID", *SEARCH_COLUMNS]
         if not available_columns or column in available_columns
     ]
+    escape_clause = " ESCAPE '\\\\'" if engine.url.get_backend_name() == "mysql" else ""
     for idx, keyword in enumerate(keywords):
         part_conditions = []
         params[f"kw{idx}"] = f"%{escape_like_keyword(keyword.lower())}%"
         for column in search_columns:
-            part_conditions.append(f"LOWER(`{column}`) LIKE :kw{idx} ESCAPE '\\\\'")
+            part_conditions.append(f"LOWER(`{column}`) LIKE :kw{idx}{escape_clause}")
         where_parts.append("(" + " OR ".join(part_conditions) + ")")
 
     sql = f"""
@@ -413,10 +412,10 @@ def ensure_search_text_column(df):
 def get_data_hash():
     hasher = hashlib.md5()
     config_files = [
-        'dictionaries/STOP_TAGS.txt',
-        'dictionaries/SEMANTIC_MAP.json',
-        'dictionaries/TITLE_STOP_WORDS.txt',
-        'dictionaries/TITLE_SEMANTIC_MAP.json',
+        Path(DICTIONARY_DIR) / 'STOP_TAGS.txt',
+        Path(DICTIONARY_DIR) / 'SEMANTIC_MAP.json',
+        Path(DICTIONARY_DIR) / 'TITLE_STOP_WORDS.txt',
+        Path(DICTIONARY_DIR) / 'TITLE_SEMANTIC_MAP.json',
     ]
     for file in config_files:
         if os.path.exists(file):
@@ -424,7 +423,9 @@ def get_data_hash():
             
     try:
         with engine.connect() as conn:
-            if "标题译文" in get_gallery_table_columns():
+            if engine.url.get_backend_name() != "mysql":
+                result = conn.execute(text("SELECT COUNT(*), MAX(ID), 0 FROM gallery_info")).fetchone()
+            elif "标题译文" in get_gallery_table_columns():
                 result = conn.execute(
                     text(
                         """
