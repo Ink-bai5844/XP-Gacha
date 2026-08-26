@@ -1,986 +1,823 @@
 # XP-Gacha / 地下金库
 
-## 新版一体化启动（React + FastAPI + MySQL）
+XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据维护工具。当前主程序已经从 Streamlit 重构为 React 单页应用 + FastAPI API + MySQL；旧 Streamlit 入口仍保留用于兼容和对照，但不再是推荐入口。
 
-新版保留原 Streamlit 的检索、动态评分、语义/封面相似搜索、详情、历史偏好、图表、LLM 问答和全部数据处理入口，界面使用 `web`。FastAPI 同时提供 API 与静态前端，因此部署后只有一个 Web 入口。
+**当前版本：`v0.2.1`**
 
-Windows 推荐直接运行：
+| 项目 | 当前实现 |
+| --- | --- |
+| Web 前端 | React 18、TypeScript、Vite |
+| 应用服务 | FastAPI、Uvicorn |
+| 数据库 | MySQL 8.4、`utf8mb4`；全文索引优先使用 `ngram`，失败时回退普通 `FULLTEXT` |
+| 推荐计算 | Pandas、NumPy、SciPy 稀疏矩阵 |
+| AI 能力 | Qwen3 Embedding、CLIP、LM Studio / OpenAI 兼容 API |
+| 部署方式 | Windows 便携包、Docker Compose、源码运行 |
+| 默认主访问地址 | `http://127.0.0.1:8000` |
+| 默认 API 文档 | `http://127.0.0.1:8000/api/docs` |
+
+> [!IMPORTANT]
+> 这是没有登录鉴权的私人本地工具。不要把 Web/API 直接暴露到公网；如需远程访问，请在前面增加访问控制、HTTPS 和可信反向代理。
+
+## 选择运行方式
+
+| 使用场景 | 推荐方式 | 需要预装 |
+| --- | --- | --- |
+| Windows 用户直接使用 | Windows 11 x64 便携版 | 无 |
+| 本机或服务器统一部署 | Docker Compose | Docker Desktop / Docker Engine |
+| 修改前后端和调试 | 源码开发 | Python、Node.js、pnpm、MySQL |
+| 对照旧界面 | Legacy Streamlit | 源码开发环境 |
+
+## Windows 一键便携版
+
+便携版是普通用户的首选。它内置 CPython 3.13.15、MySQL 8.4.11 noinstall、CPU 版 PyTorch、Python 依赖、React 构建产物和 app-local VC++ 运行库，不要求安装 Python、Node.js、MySQL 或 Docker，也不会注册 Windows 服务或修改全局 `PATH`。
+
+当前构建与启动验证以 Windows 11 x64 为正式支持目标；Windows 10 未纳入本项目的正式验证范围。
+
+### 第一次启动
+
+1. 完整解压 `XP-Gacha-v0.2.1-portable-win64.zip`，不要在压缩软件预览窗口中直接运行。
+2. 把目录放到普通本地可写位置。不要放进 `Program Files`、只读目录、网络盘或同步盘。
+3. 双击 `Start XP-Gacha.cmd`。
+4. 首次启动会创建 `userdata`、初始化包内 MySQL、随机生成数据库凭据、启动应用并在健康检查通过后打开浏览器。
+5. 进入“附录 → 一键导入词典 / 数据”，上传 CSV 或 ZIP。
+
+启动窗口需要保持开启。正常停止请在窗口中按 `Ctrl+C`，或双击 `Stop XP-Gacha.cmd`。不要在 MySQL 写入期间直接结束进程或复制数据库目录。
+
+网页 `8000` 和 MySQL `3307` 都只是首选端口；若被占用，启动器会自动寻找可用端口。请以启动窗口打印的实际网址为准。
+
+### 便携包内常用入口
+
+| 文件 | 用途 |
+| --- | --- |
+| `Start XP-Gacha.cmd` | 启动当前这一份包内 MySQL、API 和 Web |
+| `Stop XP-Gacha.cmd` | 安全停止当前包实例 |
+| `Check XP-Gacha.cmd` | 检查必需文件和 Python 模块能否加载 |
+| `Open User Data.cmd` | 打开 `userdata` |
+| `portable-settings.env` | 可选端口、漫画目录、LLM/API 和在线封面设置 |
+| `BUILD-INFO.json` | 版本、源码状态、运行时版本和构建验证结果 |
+| `requirements-lock.txt` | 实际打入发行版的 Python 包版本 |
+| `SHA256SUMS.txt` | 发行目录内逐文件 SHA-256 |
+
+`Check XP-Gacha.cmd` 不会启动 MySQL，也不验证网络或文件哈希；它通过不代表完整启动一定成功。ZIP 同目录的 `.sha256` 用于核对下载包整体，包内 `SHA256SUMS.txt` 用于核对逐文件完整性。
+
+### 便携版设置
+
+`portable-settings.env` 只读取下列白名单键，未知键会被忽略：
+
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `XP_GACHA_PORT` | `8000` | 首选网页端口 |
+| `MYSQL_PORT` | `3307` | 首选包内 MySQL 端口 |
+| `XP_GACHA_LIBRARY_PATH` | `userdata/library` | 漫画目录；相对路径以发行包根目录为基准，也可用绝对路径 |
+| `XP_GACHA_IMPORT_MAX_MB` | `1024` | ZIP/CSV 上传上限，单位 MB |
+| `MAX_DISPLAY` | `500` | 每页最多显示的库存条数 |
+| `LM_STUDIO_API_BASE` | `http://127.0.0.1:1234/v1` | 本地 OpenAI 兼容接口 |
+| `LM_STUDIO_MODEL` | `local-model` | 本地模型名 |
+| `ONLINE_API_BASE` | 空 | 在线 OpenAI 兼容 API 地址 |
+| `ONLINE_API_KEY` | 空 | 在线 API 密钥 |
+| `ONLINE_MODEL` | `deepseek-v4-flash` | 在线模型名 |
+| `ONLINE_COVER_PROXY` | 空 | 在线封面代理；空值表示直连 |
+| `ONLINE_COVER_FETCH_ENABLED` | `1` | 是否允许在线补抓封面 |
+
+`portable-settings.env` 可能包含 API 密钥，不要公开。它位于 `userdata` 外，升级时需要单独逐项合并。
+
+`userdata/config/portable.json` 保存随机生成的 MySQL 账户和密码。它必须与 `userdata/mysql` 成套备份和迁移；不要单独删除、重建或分享该文件。
+
+## Docker Compose
+
+Docker 方式会启动 MySQL 8.4 与应用容器，并把项目的数据、字典、缓存、模型和漫画目录挂载进去。前端在 Node 22 构建阶段编译，运行镜像使用 Python 3.11 和 CPU 版 PyTorch。
+
+### 启动与停止
+
+Windows PowerShell：
 
 ```powershell
-./scripts/start.ps1
+.\scripts\start.ps1
 ```
 
-或手动执行 `Copy-Item .env.example .env` 后运行 `docker compose up --build -d`。打开 `http://127.0.0.1:8000`，首次启动后进入“附录”，上传包含 CSV 与标准词典的 ZIP、上传单个 CSV，或点击“导入项目 data/gallery_info”。默认增量写入；覆盖重建需要再次确认。
+Linux / macOS shell：
 
-MySQL 8.4 已包含在 Compose 中，数据保存在命名卷 `xp-gacha_mysql-data`；宿主机默认只在 `127.0.0.1:3307` 暴露数据库端口。漫画目录、数据库密码、LM Studio 和线上兼容 API 均在 `.env` 中配置。
+```bash
+sh ./scripts/start.sh
+```
 
-不使用 Docker 时：
+首次启动脚本会从 `.env.example` 复制出 `.env`。默认访问地址为：
+
+- Web：`http://127.0.0.1:8000`
+- 健康检查：`http://127.0.0.1:8000/api/health`
+- API 文档：`http://127.0.0.1:8000/api/docs`
+
+如果修改了 `.env` 中的 `XP_GACHA_PORT`，请把上述网址的 `8000` 替换为实际端口。
+
+停止服务：
 
 ```powershell
-pnpm --dir web install
-pnpm --dir web build
+.\scripts\stop.ps1
+```
+
+或：
+
+```bash
+docker compose down
+```
+
+普通 `docker compose down` 不删除 MySQL 命名卷。不要使用 `docker compose down -v`，除非确实要永久删除数据库。
+
+### Docker 环境配置
+
+编辑项目根目录 `.env`：
+
+| 变量 | 示例 / 默认值 | 作用 |
+| --- | --- | --- |
+| `XP_GACHA_PORT` | `8000` | Web 宿主机端口 |
+| `MYSQL_EXPOSE_PORT` | `3307` | MySQL 宿主机端口，仅绑定 `127.0.0.1` |
+| `MYSQL_DATABASE` | `xp_gacha` | 数据库名 |
+| `MYSQL_USER` | `xp_gacha` | 应用账户 |
+| `MYSQL_PASSWORD` | `xp_gacha` | 应用账户密码 |
+| `MYSQL_ROOT_PASSWORD` | `xp_gacha_root` | MySQL root 密码 |
+| `XP_GACHA_LIBRARY_PATH` | `./library` | 宿主机漫画目录，只读挂载到 `/library` |
+| `LM_STUDIO_API_BASE` | `http://host.docker.internal:1234/v1` | 容器访问宿主机 LM Studio |
+| `LM_STUDIO_MODEL` | `local-model` | 本地模型名 |
+| `ONLINE_API_BASE` | 空 | 在线兼容 API 地址 |
+| `ONLINE_API_KEY` | 空 | 在线 API 密钥 |
+| `ONLINE_MODEL` | `deepseek-v4-flash` | 在线模型名 |
+| `ONLINE_COVER_PROXY` | 空 | 在线封面代理 |
+| `ADMINER_PORT` | `8081` | 可选 Adminer 端口 |
+
+如果数据库卷已经初始化，修改 `.env` 中的 MySQL 密码不会自动修改现有账户。请在第一次建库前设好密码；已有库应通过数据库命令迁移凭据。
+
+可选启动 Adminer：
+
+```bash
+docker compose --profile tools up -d adminer
+```
+
+打开 `http://127.0.0.1:8081`，服务器填写 `mysql`，再使用 `.env` 中的数据库名和应用账户。
+
+> [!WARNING]
+> Compose 中 MySQL 和 Adminer 的宿主端口只绑定本机，但 Web 端口当前使用 `${XP_GACHA_PORT}:8000`，会监听宿主机所有接口。局域网或服务器部署前必须设置强密码，并自行增加防火墙、反向代理、HTTPS 和鉴权。
+
+## 从源码运行
+
+### 前置条件
+
+- Python 3.11 或更高版本；
+- Node.js 22 与 pnpm 11；
+- MySQL 8.x；完整全文检索和导入行为以 MySQL 8.4 为准；
+- Windows、Linux 或 macOS 的普通开发环境。
+
+项目已经包含无密钥的 `config.py`，不需要再从 `config_empty.py` 复制。机器相关配置统一使用环境变量。
+
+### 安装、构建和启动
+
+PowerShell 示例：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+
+corepack enable
+pnpm --dir web install --frozen-lockfile
+pnpm --dir web build
+
+$env:XP_GACHA_HOST = "127.0.0.1"
+$env:DATABASE_URL = "mysql+pymysql://xp_gacha:your_password@127.0.0.1:3306/xp_gacha?charset=utf8mb4"
 python launcher.py
 ```
 
-API 文档位于 `http://127.0.0.1:8000/api/docs`。旧 `streamlit run app.py` 入口仍保留，便于过渡和功能对照。
+`launcher.py` 会用 FastAPI 同时提供 `/api/*` 和 `web/dist`，并默认打开浏览器。
 
-争做最强大的本子推荐系统（误
+开发时可以分两个终端运行：
 
-一个基于 `Streamlit` 的本地（正经？）漫画库存管理、检索与推荐系统。
-
-将「在线抓取 / 本地链接整理 / CSV 清洗 / MySQL 入库 / 标题分词 / 标签语义聚合 / 向量语义检索 / LLM 问答」串成了一条完整流程，搭建个人专属本子资料库、个人 XP 标签筛选器和线上&本地图库浏览器。
-
-当前实现明显偏向 Windows 本地环境使用：
-
-- 支持直接打开本地文件夹（`os.startfile`）
-- 默认配置里使用了 Windows 绝对路径
-- 本地模型与图库目录默认按本地磁盘组织
-
-## 界面预览
-
-![主界面1](UI-imgs/main-ui-1.png)
-![主界面2](UI-imgs/main-ui-2.png)
-
-## ✨ 功能概览
-
-- 基于 MySQL 数据库读取漫画元数据，并缓存预处理结果与评分矩阵
-- 按标签、作者、标题关键词和历史打开偏好进行动态推荐评分
-- 标签/标题评分基于语义聚合后的标签/关键词词频
-- 支持记录最近 N 次点击来源链接/打开本地目录，并基于历史偏好自动加权推荐
-- 支持屏蔽标签、权重调节、分数阈值筛选
-- 支持 MySQL 关键词候选召回，优先使用 `FULLTEXT` 全文索引，支持检索 `ID`, `标题`, `标题译文`, `标签`, `作者`, `团队`
-- 关键词搜索结果支持可选的 `关键词相关度` 列；关闭时不会让数据库额外计算全文相关度
-- 支持本地向量模型的自然语言语义检索，向量文本会纳入 `标题译文`
-- 支持上传图片或输入库内 `ID` 的封面相似检索（CLIP）
-- 支持展示封面缩略图、来源链接和本地目录，并可一键复制库存列表当前页内容
-- 库存列表支持手动保存列宽配置到 `.streamlit/library_column_widths.json`，下次启动自动加载
-- 主界面支持勾选漫画；选中只用于详情查看，不会写入历史记录
-- 漫画详情页集中展示主列表未展开的完整信息，并提供本地目录打开入口
-- LLM 助手、漫画详情、历史记录、数据处理均已拆成独立页面
-- 支持全局偏好图表和历史偏好图表，均提供 Top 15 图表与 Top 150 展开表
-- 支持将当前筛选结果注入给 LLM 做RAG增强检索问答，注入字段包含 `标题译文`，并兼容部分接口流式返回空片段
-- 支持 nhentai源(以下简称`NH`) / 禁漫天堂源(以下简称`JM`) 双源抓取、修复抓取和本地链接补抓
-- 数据处理页支持数据抓取、全量导库、增量导库、MySQL 表结构与全文索引优化、标题 AI 翻译、向量库重建、封面 Base64 预编码、缓存维护、脚本实时输出等功能
-
-### 全文索引&语义向量混合检索排序
-
-![全文索引&语义向量混合检索排序](UI-imgs/Functions-1.png)
-
-### 封面相似度检索排序
-
-![封面相似度检索排序](UI-imgs/Functions-8.png)
-
-### 全局权重分配/标签屏蔽/权重调节/评分下限屏蔽
-
-![全局权重分配/标签屏蔽/权重调节/评分下限屏蔽](UI-imgs/Functions-2.png)
-
-### RAG-LLM检索对话
-
-![RAG-LLM检索对话](UI-imgs/Functions-4.png)
-
-### 漫画详情与本地路径打开
-
-![漫画详情与本地路径打开](UI-imgs/Functions-5.png)
-
-### 表格列宽配置
-
-![表格列宽配置](UI-imgs/Functions-9.png)
-
-## 🧭 页面与交互
-
-页面当前支持：
-
-- `库存列表`：推荐评分排序、ID / 标题 / 标题译文 / 标签 / 作者 / 团队关键词检索、关键词相关度开关、选中漫画、来源链接、本地目录列、封面缩略图显示、列宽配置保存，并支持一键复制当前页列表信息
-- `漫画详情`：展示当前选中漫画的完整信息，左侧显示封面与本地目录打开入口
-- `LLM 助手`：将当前结果集注入 LLM-RAG 问答，参考库存数据中包含 `标题译文`
-- `历史记录`：刷新历史记录、清空历史记录、查看和删除历史条目
-- `数据处理`：CSV 整理、数据库同步、标题AI翻译、缓存与向量、维护工具、采集入口，以及每个脚本的实时输出
-- 侧边栏：标签屏蔽，标签/作者/标题权重调节，历史偏好总分倍率调节
-- AI 语义检索
-- 封面相似检索（支持上传图片，或输入库内已有条目的 `ID` 直接使用其封面做相似检索）
-- 点击库存列表中的来源链接，并记录历史偏好
-- 在漫画详情页一键打开本地漫画目录，并记录历史偏好
-- 全局偏好统计图表
-- 用户历史偏好统计图表
-
-库存列表底部有 `列宽配置` 折叠面板，可以手动设置各列像素宽度并保存到：
-
-```text
-.streamlit/library_column_widths.json
+```powershell
+# 终端 1：API，端口 8000
+$env:XP_GACHA_HOST = "127.0.0.1"
+$env:DATABASE_URL = "mysql+pymysql://xp_gacha:your_password@127.0.0.1:3306/xp_gacha?charset=utf8mb4"
+uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-之后重新打开应用会自动加载这些列宽。Streamlit 当前不会把前端拖拽列宽回传给 Python，因此这里采用的是“表单保存列宽”的持久化方式。
-
-## 🧮 推荐评分算法
-
-推荐分当前由四部分组成：
-
-- 标签分：基于语义聚合后的标签词频、标签权重和全局倍率
-- 作者分：基于作者出现频次和作者偏好倍率
-- 标题分：基于标题分词后的高频词和词权重
-- 历史偏好分：基于最近 N 次点击来源链接或打开本地目录的条目，额外奖励这些条目里相对小众的标签、标题词和作者
-
-当前实现为了减少大数据量下的权重拖动延迟，已经将评分链路改为“预处理阶段编码，交互阶段批量计算”：
-
-- 预处理缓存中会额外保存标签稀疏矩阵、标题词稀疏矩阵、作者索引编码、每行标签数/标题词数等评分缓存
-- 预处理缓存中还会保存 `ID -> 行号` 映射，用于把数据库召回的候选 ID 快速切成候选行
-- 运行时会把用户侧边栏输入的动态权重字典转成权重向量
-- 标签分与标题分通过稀疏矩阵乘法批量计算
-- 作者分通过作者索引数组直接查表计算
-- 历史偏好分也复用同一套标签/标题词稀疏矩阵和作者索引编码，不逐行扫描全表
-- 有关键词候选集时，推荐评分只对候选行切片计算，而不是强制对全库打分
-- 最终仍保持和原先逐行评分一致的公式口径与整数结果
-
-也就是说，当前 `apply_dynamic_scores()` 已不再逐行 `DataFrame.apply(axis=1)` 评分，而是基于 `numpy + scipy.sparse.csr_matrix` 批量完成整列推荐分计算。
-
-## 🔎 检索与性能机制
-
-当前主界面的检索链路不是单纯的 Pandas 全表字符串扫描：
-
-1. 启动时从 MySQL 读取 `gallery_info`，生成预处理 DataFrame、词频统计、图表缓存和评分矩阵缓存。
-2. 用户输入普通关键词时，先由 MySQL 召回候选 `ID`。
-   - 如果存在 `ft_gallery_search`，优先走 `FULLTEXT`。
-   - 全文索引字段为 `标题`、`标题译文`、`标签`、`作者`、`团队`。
-   - 如果全文索引不存在或没有命中，会回退到 `LIKE`。
-   - `LIKE` 回退也会在当前数据库实际存在的 `标题译文` 列中搜索。
-3. 应用把候选 `ID` 映射到预处理 DataFrame 行号，只对候选集进行推荐评分。
-4. 页面展示时仅对当前分页的 `ID` 批量读取一次 MySQL 原始行，再加载当前页封面。
-5. 关键词召回结果会按“搜索词 + 是否启用关键词相关度”缓存在当前 Streamlit 会话中；调权重时不会重复查 MySQL。
-
-侧边栏中的 `启用关键词相关度` 控制数据库是否计算全文相关度：
-
-- 关闭：只召回候选 `ID`，不计算 `MATCH ... AGAINST` 分数，也不会显示 `关键词相关度` 列。
-- 开启：会额外计算全文相关度，显示 `关键词相关度` 列，并允许按该列排序。
-
-AI 语义检索和封面相似检索仍然是当前结果集上的二次过滤。文本语义向量构建时会把 `标题译文` 拼入语料，因此翻译更新后建议重建一次文本向量库。它们会缓存最近一次“查询词/图片 + 候选 ID 集合”的结果；如果调权重导致候选 ID 集合变化，可能会重新计算相似度。
-
-### 历史偏好加权
-
-![历史偏好加权](UI-imgs/Functions-6.png)
-
-应用会把最近 `HISTORY_RECOMMENDATION_CACHE_SIZE` 次通过页面打开的条目记录到 `datacache/recommendation_history.json`：
-
-- 点击库存列表中的 `图库链接 -> 网络来源`
-- 在漫画详情页点击 `打开本地目录`
-
-库存列表里的 `选中` 只用于切换当前漫画详情，不会写入历史记录，也不会影响历史偏好统计。
-
-每条历史记录会保存：
-
-- `ID`
-- `标题`
-- `作者`
-- `链接`
-- `本地目录`
-- 过滤并语义聚合后的 `tags`
-- 过滤并语义聚合后的 `title_words`
-
-历史分先对历史记录中的每个特征计算 `feature_bonus`：
-
-```text
-feature_bonus =
-历史出现次数
-* log(1 + (该类别总数据库出现次数 + 1) / (该特征数据库出现次数 + 1))
-* 对应类别全局倍率
+```powershell
+# 终端 2：Vite；/api 自动代理到 127.0.0.1:8000
+pnpm --dir web dev
 ```
 
-其中：
+`.env` 文件由 Docker Compose 读取，Python 源码模式不会自动加载它。源码运行时请在 shell 中设置环境变量，或由进程管理器注入。
 
-- 标签历史倍率 = 侧边栏 `标签总分倍率`
-- 作者历史倍率 = 侧边栏 `作者总分倍率`
-- 标题词历史倍率 = 侧边栏 `标题总分倍率`
+数据库连接优先级为：
 
-也就是说，同样被打开过的特征，在总数据库里越少见，历史加成越高；越常见，历史加成越低。最终每个条目的历史分会再乘以侧边栏的 `历史偏好总分倍率`，设为 `0` 即完全关闭历史偏好加权。
+1. `DATABASE_URL`；
+2. `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_DATABASE`、`MYSQL_USER`、`MYSQL_PASSWORD`；
+3. 旧版 `.streamlit/secrets.toml`，仅兼容兜底；
+4. 本机默认 `xp_gacha@127.0.0.1:3306/xp_gacha`。
 
-库存列表中的网络来源点击通过本地追踪重定向记录历史，默认监听：
+## 当前页面与功能
+
+| 路由 | 页面 | 主要功能 |
+| --- | --- | --- |
+| `/` | 库存 | 搜索、评分、筛选、排序、分页、封面、行内详情、复制当前页、全局图表 |
+| `/detail/:id` | 漫画详情 | 完整元数据、原始与解析标签、打开本地目录、来源跳转 |
+| `/chat` | LLM 助手 | 本地/在线兼容 API、SSE 流式回答、库存上下文与引用 |
+| `/history` | 历史记录 | 刷新、逐条/批量删除、确认清空、重新打开、历史偏好图表 |
+| `/charts` | 偏好图表 | 全局/历史切换，标签、作者、标题词 Top 15 与 Top 150 |
+| `/admin` | 附录 | 一键导入、系统状态、26 个白名单数据任务、输出与中止 |
+| `/api/docs` | API 文档 | FastAPI 交互式 OpenAPI 文档 |
+
+前端连接不到 API 时会显示 10 条内置虚构样本，用于检查界面布局；这些样本不是实际库存，也不会写入数据库。
+
+### 库存检索
+
+- 关键词覆盖 ID、标题、标题译文、标签、作者和团队。
+- MySQL 有全文索引时优先使用 `FULLTEXT`；无索引、无命中或全文查询异常时自动回退 `LIKE`。
+- 可选择是否把关键词相关度加入结果列和排序。
+- 文本语义检索使用本地 embedding 模型和向量索引。
+- 封面相似检索可输入库存 ID，或上传 JPG、JPEG、PNG、WebP、BMP；上传上限 20 MB。
+- 标签、作者和标题词选择器无需先搜索即可每批浏览 80 项，也支持关键词搜索、上一批/下一批、已选项移除和清空。
+- 每页数量由后端 `config.py` 的 `MAX_DISPLAY` 决定，当前默认 500，不再写死为 5 条。
+
+### 评分与筛选
+
+推荐分由标签、作者、标题词和历史偏好四部分组成：
 
 ```text
-127.0.0.1:8765
+推荐分 = 标签贡献 + 作者贡献 + 标题词贡献 + 历史偏好贡献
 ```
 
-如果该端口被占用，来源链接仍会直接打开，但网络链接点击不会写入历史记录；漫画详情页里的本地目录打开记录不受影响。
+标签、作者和标题词的基础分使用全库频次计算：
 
-默认展示排序为：
+```text
+基础特征分 = 10 × ln(1 + 全库出现次数)
+```
 
-- `推荐评分` 降序
-- 次级 `上传日期` 降序
+多值特征按条目内特征数量的平方根归一化，随后应用单项权重和全局倍率。当前实现还包含两个基线常量：标签贡献额外乘 `0.5`；作者权重向量的默认值是 `5.0`，所以即使作者自定义映射为空，所有已识别作者也会以单项权重 `5.0` 参与计算。历史偏好会按最近打开记录中的标签、标题词和作者计数，并结合该特征在全库中的稀有程度生成附加分。
 
-## 🗂️ 项目结构
+界面提供：
+
+- 标签、作者、标题、历史偏好四个全局倍率，范围 `0–5`；
+- 屏蔽标签；
+- 标签、作者、标题词的单项权重，范围 `0–20`；
+- 最低推荐评分阈值，范围 `0–1600`。
+
+当前 React Web 启动时四个全局倍率均为 `1`，屏蔽列表和三组自定义映射均为空；这里的“作者映射为空”不改变后端作者权重基线 `5.0`。新选标签/标题词的初始值为 `1`，新选作者的初始值为 `5`，选择作者后才能在界面中改写该作者的数值。`config.py` 中的 `INITIAL_TAG_WEIGHT_NTR` 目前只供旧 Streamlit 使用，不会自动注入 React Web；“纯爱、百合、兽耳”等也没有硬编码默认项，需要在“标签权重配置”中搜索或分批浏览后自行选择。
+
+为避免大库频繁重算：
+
+- 普通筛选请求有约 220 ms 防抖；
+- 滑块拖动时只更新预览，松开后提交最终值；
+- 数字权重输入约 180 ms 合并更新；
+- 后端缓存最近 8 组查询，并把历史文件状态纳入缓存键；
+- 评分使用 NumPy/SciPy 向量和稀疏矩阵计算。
+
+### 固定布局与行内详情
+
+- 表格采用固定比例列宽，总宽度适配当前容器，不依赖横向滚动查看右侧字段。
+- 大页使用虚拟滚动，只渲染视口附近的行。
+- 相关度列只在对应检索启用时显示。
+- 支持全局升序/降序和按推荐分、相关度、ID、日期、标题、作者、团队、标签、语言、页数、本地路径排序。
+- 可一键复制当前页为制表符分隔文本，也可批量提交当前页封面刷新。
+- 点击首列一次即可选择；选中后在当前行下直接展开完整信息，再次点击取消。
+- 展开内容包括封面、摘要、作者、团队、语言、页数、日期、基础/推荐分、三种相关度、标题词、原始标签、文件名、本地路径、来源链接和搜索文本。
+
+选择条目本身不会写入历史；只有打开本地目录或网络来源时才记录。
+
+### 漫画详情、本地目录与封面
+
+详情页同时显示：
+
+- 数据库中的原始未解析标签；
+- 经过 `STOP_TAGS.txt` 过滤和 `SEMANTIC_MAP.json` 映射后的解析标签；
+- 标题特征词、评分、相关度、文件名、路径和来源。
+
+网络来源统一经过 `/api/track/{id}` 记录历史后重定向。Windows 本地运行或便携版可以调用文件管理器打开漫画目录；Docker 默认关闭该能力，因为容器不能替用户打开宿主机目录。
+
+封面读取优先级为：
+
+1. `b64_cache/<ID>.txt`；
+2. `onlineimgtmp` 中的同 ID 图片；
+3. 本地漫画目录中的 `1.*`，生成到 `localimgtmp/<ID>.jpg`；
+4. 允许联网时尝试在线补抓，并写入 `onlineimgtmp` 与 `b64_cache`。
+
+### 历史与图表
+
+- 默认保留最近 50 次“打开本地目录”或“打开网络来源”记录。
+- 源码/Docker 默认写入 `datacache/recommendation_history.json`；便携版写入 `userdata/datacache/recommendation_history.json`。
+- 支持刷新、单条删除、复选批量删除和二次确认清空。
+- 历史中的标签、作者和标题词会参与后续评分。
+- 全局和历史图表均提供标签、作者、标题词 Top 15 条形图和可展开 Top 150 数据表。
+- 库存页底部的全局图表进入视口后才加载。
+
+### LLM 助手
+
+- 支持本地 LM Studio 和线上 OpenAI 兼容 API。
+- 可调 Temperature、最大 Tokens 和上下文条目数量。
+- 后端通过 Server-Sent Events 流式转发回答。
+- 可识别 `<think>...</think>` 与 `Thinking Process:`，思考过程折叠显示。
+- 旧对话折叠，最近一次问答保持展开。
+- 上下文条目以封面、ID、标题和作者链接回详情页。
+
+当前上下文从当前分页和当前排序结果的前 N 条取得，不是对全部筛选结果随机抽样。聊天和任务输出只保存在当前进程/浏览器状态中，重启后不会恢复。
+
+## 一键导入词典与数据
+
+入口：`/admin` → “一键导入词典 / 数据”。
+
+### 支持的文件
+
+- 单个 `.csv`；
+- 一个 `.zip`，可在任意层级包含多个 CSV 和标准词典；
+- 默认上传上限 `1024 MB`；
+- CSV 编码支持 UTF-8 与 UTF-8 BOM；
+- ZIP 解压会检查绝对路径、`..` 和目录越界。
+
+标准词典文件名必须完全匹配：
+
+| 文件 | 用途 |
+| --- | --- |
+| `STOP_TAGS.txt` | 从评分/展示用解析标签中排除噪声标签 |
+| `SEMANTIC_MAP.json` | 把多个原始标签聚合到统一语义标签 |
+| `TITLE_STOP_WORDS.txt` | 标题分词停用词 |
+| `TITLE_SEMANTIC_MAP.json` | 标题词同义映射 |
+
+TXT 既支持单引号包围、逗号分隔的旧格式，也支持每行一个值；空行和以 `#` 开头的行会忽略。JSON 必须是有效的对象映射。
+
+替换词典时使用原子写入，旧文件备份到：
+
+```text
+<XP_GACHA_DATA_ROOT>/datacache/imports/backups/<时间戳>/
+```
+
+### CSV 列
+
+`链接` 是唯一必需列。标准列如下：
+
+| 列名 | 必需 | 处理规则 |
+| --- | --- | --- |
+| `ID` | 否 | 空值时尝试从 NH `/g/<id>` 或 JM `/album/<id>` 链接推导 |
+| `链接` | 是 | 用于 ID 推导、来源跳转与历史记录 |
+| `文件名` | 否 | 可用于匹配本地目录；标题为空时作为标题回退 |
+| `标题` | 否 | 空值时使用文件名 |
+| `标题译文` | 否 | 增量模式下空值不会覆盖已有译文 |
+| `标签` | 否 | 保存数据库原始标签 |
+| `作者` | 否 | 用于筛选、评分和图表 |
+| `团队` | 否 | 用于搜索和详情 |
+| `语言` | 否 | 用于展示和排序 |
+| `页数` | 否 | 无法解析时记为 `0` |
+| `上传日期` | 否 | 建议先在附录中统一格式 |
+
+无法得到 ID 的行会丢弃；相同 ID 保留最后一条。
+
+### 导入模式
+
+| 模式 | 行为 |
+| --- | --- |
+| 增量写入 / 更新 | 按 ID 插入或更新；空的标题译文保留数据库已有值 |
+| 覆盖重建 | 重建 `gallery_info` 表；界面会再次确认 |
+
+CSV 导入完成后会优化 MySQL 表与全文索引；所有成功导入都会删除 `preprocessed_df.pkl` 与 `data.hash` 并刷新库存，词典导入还会立即重载词典。
+
+“导入项目 `data/gallery_info`”读取的是：
+
+```text
+<XP_GACHA_DATA_ROOT>/data/gallery_info/*.csv
+```
+
+源码/Docker 默认对应项目的 `data/gallery_info`；便携版对应 `userdata/data/gallery_info`。上传导入使用临时文件，结束后会删除临时副本，请自行保留原始 CSV/ZIP。
+
+## 附录：数据处理与采集
+
+后端只允许执行 26 个白名单任务，同一时间最多运行一个任务。界面会轮询合并输出，支持手动中止；危险操作要求显式勾选确认。
+
+| 分区 | 任务 |
+| --- | --- |
+| A.1 CSV 整理 | 补全文件名列、NH 链接补 ID、迁移语言标签、清洗上传日期、标题词频统计、聚合未映射标签、语义映射补原名 |
+| A.2 数据库同步 | 增量同步 CSV、覆盖重建 MySQL 表、优化表结构与全文索引 |
+| A.3 标题 AI 翻译 | LM Studio / 在线兼容 API、批次、并发、范围、重试、JSONL 审查 |
+| A.4 缓存与向量 | Base64 预编码、文本语义向量、CLIP 封面向量构建/统计、缓存清理 |
+| A.5 维护工具 | 图片/缓存 ID 前缀修正、合并 Base64 增量缓存、清理翻译 JSONL failed 条目、按 ID 删除数据库行、按 `error.json` 清空标题译文 |
+| A.6 采集入口 | NH/JM 在线采集、NH/JM 失败页重试、NH 本地链接抓信息、NH 本地链接抓图片 |
+
+系统状态区显示 CSV、线上封面、本地缩略图、Base64、数据库行数，以及四项缓存/向量文件是否存在；模型状态由 `/api/system/status` 返回，但当前附录页面尚未单独展示。
+
+> [!NOTE]
+> 表单中的“超时秒数”目前主要作为任务参数保留，通用任务管理器尚未按该值自动结束子进程；需要时请使用“中止任务”。标题翻译自己的单次请求超时仍会生效。
+
+在线采集依赖第三方站点的可访问性和页面结构。请遵守目标站点条款、当地法律和合理请求频率。
+
+## 模型与向量
+
+发行版不会携带模型和向量。默认路径：
+
+| 能力 | 模型 | 索引 |
+| --- | --- | --- |
+| 文本语义检索 | `models/Qwen3-Embedding-0.6B` | `manga_vectors/manga_vectors_Qwen3.pkl` |
+| 封面相似检索 | `models/clip-vit-base-patch32` | `manga_vectors/clip_image_index.pkl` |
+
+可在“附录 → 缓存与向量”中构建索引，也可通过环境变量覆盖路径。模型或索引缺失时，普通关键词、评分、历史和数据库功能仍可使用；对应 AI 检索会给出警告。
+
+## 架构
+
+```mermaid
+flowchart LR
+    Browser[浏览器 / React SPA] -->|HTTP + SSE| API[FastAPI / server.main]
+    API --> Library[LibraryModule<br/>召回・评分・分页]
+    API --> History[History / Charts]
+    API --> Import[CSV / ZIP Import]
+    API --> Jobs[JobsModule<br/>白名单子进程]
+    API --> Chat[LM Studio / 在线兼容 API]
+    Library --> MySQL[(MySQL gallery_info)]
+    Library --> Runtime[词典・缓存・模型・向量・封面]
+    Import --> MySQL
+    Import --> Runtime
+    Jobs --> Legacy[既有 data_get / data_processing / tools]
+```
+
+FastAPI 在同一个 `8000` 端口提供 API 和编译后的 `web/dist`。后端模块继续复用经过验证的 `data_pipeline.py` 与 `utils_*.py`，数据任务则通过 `python -m server.job_tasks` 在独立子进程中运行。
+
+### 项目结构
 
 ```text
 XP-Gacha/
-├─ app.py                                  # 本地主界面
-├─ ui_data_processing.py                   # 数据处理可视化页面与脚本输出
-├─ config_empty.py                         # 配置模板
-├─ config.py                               # 本地实际配置
-├─ data_pipeline.py                        # 数据读取、缓存、标签/标题处理、动态评分
-├─ utils_charts.py                         # 全局/历史偏好图表统计与渲染
-├─ utils_core.py                           # 本地目录匹配、封面缩略图与 Base64 缓存
-├─ utils_history.py                        # 历史打开记录、来源链接追踪与历史偏好加权
-├─ utils_nlp.py                            # 标题分词、语义检索模型加载
-├─ utils_cv.py                             # CLIP 封面向量读取、上传图/ID 相似检索
-├─ utils_chat.py                           # LLM 对话与流式输出
-├─ data_processing/
-│  ├─ img_to_vector.py                     # 构建/查询 CLIP 封面向量索引
-│  ├─ add_csv_to_mysql.py                  # 增量导库
-│  ├─ addname.py                           # 从本地链接列表补文件名
-│  ├─ all_csv_to_mysql.py                  # 全量导库
-│  ├─ b64_pre_encode.py                    # 预编码 Base64 缓存
-│  ├─ build_vector_db.py                   # 重建向量库
-│  ├─ optimize_mysql_schema.py             # 优化 gallery_info 字段类型、主键与 FULLTEXT 索引
-│  ├─ translate_titles.py                  # 批量调用 OpenAI 兼容接口生成标题译文
-│  ├─ map_add_name.py
-│  ├─ tag_set.py
-│  └─ title_cut_set.py
-├─ .streamlit/
-│  ├─ config.toml                          # Streamlit 主题配置
-│  ├─ library_column_widths.json            # 库存列表列宽配置，应用内保存后生成
-│  └─ secrets.toml                         # MySQL 密钥配置
-├─ dictionaries/                           # 停用词、语义映射等字典资源
-├─ data/
-│  ├─ gallery_info/                        # 标准化 CSV
-│  ├─ gallery_info_no_name/                # 原始抓取 CSV
-│  └─ local_data/                          # 本地链接列表输入
-├─ data_get/
-│  ├─ NH_get_info_online.py                # NH 在线抓取
-│  ├─ NH_get_info_online_fix.py            # NH 失败页重试
-│  ├─ JM_get_info_online.py                # JM 在线抓取
-│  ├─ JM_get_info_online_fix.py            # JM 失败页重试
-│  └─ local/
-│     ├─ NH_get_info_local.py              # NH 本地链接抓信息
-│     └─ NH_get_images_local.py            # NH 本地链接抓完整漫画
-├─ tools/                                  # 工具脚本
-│  ├─ clean_failed_title_translation_jsonl.py
-│  ├─ clear_title_translation_by_error_ids.py
-│  └─ delete_gallery_rows_by_id.py
-├─ Integration/
-│  ├─ ScoringFormula_local.py              # 本地整合版(old)
-│  └─ ScoringFormula_online.py             # 线上整合版
-├─ manga_vectors/                          # 文本语义向量与图片向量索引
-├─ models/                                 # 本地模型统一存放目录
-│  ├─ Qwen3-Embedding-0.6B/                # embedding 预训练模型
-│  └─ clip-vit-base-patch32/               # CLIP 预训练模型
-├─ onlineimgtmp/                           # 在线封面缩略图缓存
-├─ localimgtmp/                            # 本地封面缩略图缓存
-├─ b64_cache/                              # Base64 封面缓存
-├─ b64_tmp/                                # Base64 增量临时目录
-└─ datacache/                              # DataFrame 预处理缓存
+├─ web/                         React + TypeScript 前端
+│  ├─ src/
+│  └─ dist/                    构建产物
+├─ server/                      FastAPI 与服务模块
+│  ├─ main.py
+│  ├─ job_tasks.py
+│  └─ modules/
+├─ portable/                    Windows 便携启动器与模板
+├─ scripts/
+│  ├─ start.ps1 / start.sh
+│  ├─ stop.ps1
+│  └─ build_portable_release.ps1
+├─ tests/                       API、便携启动器与 PowerShell 检查
+├─ data_get/                    NH/JM 采集器
+├─ data_processing/             CSV、翻译、缓存和向量脚本
+├─ tools/                       维护脚本
+├─ dictionaries/                四个标准词典
+├─ data/gallery_info/           项目 CSV
+├─ datacache/                   预处理、历史、导入备份
+├─ onlineimgtmp/                线上封面
+├─ localimgtmp/                 本地缩略图
+├─ b64_cache/ / b64_tmp/        Base64 主缓存与增量缓存
+├─ manga_vectors/               文本与封面向量索引
+├─ models/                      本地模型
+├─ library/                     默认漫画目录
+├─ config.py                    无密钥、环境变量驱动的运行配置
+├─ launcher.py                  源码单进程入口
+├─ app.py                       Legacy Streamlit 入口
+├─ Dockerfile
+└─ docker-compose.yml
 ```
 
-### 数据流
+## 运行时配置
 
-1. 通过 `NH` / `JM` 抓取脚本或本地链接脚本生成 CSV。
-2. CSV 统一规范到 `ID` 首列。
-3. 将 `data/gallery_info/*.csv` 导入 MySQL 表 `gallery_info`。
-4. 数据库表以 `ID` 为主键或唯一索引，并在 `标题` 后保留 `标题译文` 列。
-5. 可用标题 AI 翻译脚本批量生成 `标题译文`，成功与失败批次分别写入 JSONL，便于审查和重试。
-6. 建立包含 `标题译文` 的 `ft_gallery_search` 全文索引。
-7. 用数据库数据构建向量库，向量 `ids` 也使用 `ID`，向量文本包含 `标题译文`。
-8. 启动 `app.py` 后，从数据库读取数据并做预处理缓存。
-9. 普通关键词先由 MySQL 召回候选 `ID`，再对候选集进行推荐评分。
-10. 页面中按照推荐评分、关键词、语义检索、封面相似检索结果进行筛选和展示。
-11. 当前分页会按 `ID` 批量读取 MySQL 原始行，缩略图显示优先命中 Base64 缓存，其次在线图，最后本地图回退。
-12. 点击来源链接或在漫画详情页打开本地目录时，会把条目的聚合标签、标题词、作者等写入 `datacache/recommendation_history.json`，供历史偏好加权和历史偏好图表使用；仅勾选漫画不会写入历史。
+### 服务与数据库
 
-## 💻 运行环境
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `XP_GACHA_ENV` | `development` | `development` 时启用开发 CORS |
+| `XP_GACHA_HOST` | `0.0.0.0` | Uvicorn 监听地址；本机使用建议设为 `127.0.0.1` |
+| `XP_GACHA_PORT` | `8000` | Web/API 端口 |
+| `XP_GACHA_FRONTEND_DIST` | `web/dist` | React 构建产物 |
+| `XP_GACHA_ALLOW_OPEN_LOCAL` | `true` | 是否允许 Windows 服务端打开本地目录；Docker 强制为 `false` |
+| `XP_GACHA_IMPORT_MAX_MB` | `1024` | 导入上传上限 |
+| `DATABASE_URL` | 空 | 完整 SQLAlchemy URL，优先级最高 |
+| `MYSQL_HOST` | `127.0.0.1` | 数据库主机 |
+| `MYSQL_PORT` | `3306` | 数据库端口 |
+| `MYSQL_DATABASE` | `xp_gacha` | 数据库名 |
+| `MYSQL_USER` | `xp_gacha` | 数据库用户 |
+| `MYSQL_PASSWORD` | `xp_gacha` | 数据库密码 |
 
-建议环境：
+### 数据、检索与模型
 
-- Python `3.10+`
-- Windows
-- 可用的 MySQL 实例
-- 本地 embedding 模型
-- 本地 CLIP 模型
-- 如需本地LLM聊天：已启动的 `LM Studio` 兼容接口
-- 可选：Docker Desktop + WSL2，用于容器化启动
+下表中由 `runtime_path` 管理的缓存、词典、模型和向量相对路径都以 `XP_GACHA_DATA_ROOT` 为基准。`XP_GACHA_BASE_DIR` 是例外：显式传入相对路径时会按当前工作目录解析；Docker 给它传入 `/library`，便携启动器也会预先转换为绝对路径。
 
-## ⚙️ 如何开始
+| 环境变量 | 默认值 |
+| --- | --- |
+| `XP_GACHA_DATA_ROOT` | 源码项目根目录；Docker `/app`；便携版 `userdata` |
+| `XP_GACHA_BASE_DIR` | `<DATA_ROOT>/library` |
+| `ONLINE_IMG_DIR` | `onlineimgtmp` |
+| `IMG_CACHE_DIR` | `localimgtmp` |
+| `CACHE_DIR` | `datacache` |
+| `B64_CACHE_DIR` | `b64_cache` |
+| `MODEL_DIR` | `models` |
+| `DICTIONARY_DIR` | `dictionaries` |
+| `VECTOR_FILE` | `manga_vectors/manga_vectors_Qwen3.pkl` |
+| `IMG_VECTOR_FILE` | `manga_vectors/clip_image_index.pkl` |
+| `LOCAL_MODEL_PATH` | `models/Qwen3-Embedding-0.6B` |
+| `CLIP_MODEL_PATH` | `models/clip-vit-base-patch32` |
+| `MAX_DISPLAY` | `500` |
+| `SEMANTIC_SEARCH_TOP_K` | `5000` |
+| `COVER_SEARCH_TOP_K` | `5000` |
+| `HISTORY_RECOMMENDATION_CACHE_SIZE` | `50` |
+| `HISTORY_CACHE_FILE` | `datacache/recommendation_history.json` |
 
-### 1. 创建 `config.py`
+### LLM 与在线封面
 
-```powershell
-copy config_empty.py config.py
-```
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `LM_STUDIO_API_BASE` | `http://127.0.0.1:1234/v1` | 本地兼容接口 |
+| `LM_STUDIO_MODEL` | `local-model` | 本地模型 |
+| `ONLINE_API_BASE` | 空 | 在线兼容接口 |
+| `ONLINE_API_KEY` | 空 | 在线 API 密钥 |
+| `ONLINE_MODEL` | `deepseek-v4-flash` | 在线模型 |
+| `SYSTEM_PROMPT` | 内置中文提示 | 助手系统提示 |
+| `ONLINE_COVER_FETCH_ENABLED` | `true` | 是否允许在线补抓 |
+| `ONLINE_COVER_PROXY` | 空 | 代理地址，空值直连 |
+| `ONLINE_COVER_FETCH_CONCURRENCY` | `6` | 后台封面并发数 |
 
-然后按本机环境修改：
+不要把含密钥的 `.env`、`portable-settings.env` 或 `userdata/config/portable.json` 提交到版本库或发给他人。
 
-- `BASE_DIR`：本地漫画根目录
-- `LOCAL_MODEL_PATH`：本地 embedding 模型目录，默认 `models/Qwen3-Embedding-0.6B`
-- `VECTOR_FILE`：文本语义向量文件输出位置
-- `IMG_VECTOR_FILE`：封面向量索引文件位置
-- `CLIP_MODEL_PATH`：本地 CLIP 模型目录，默认 `models/clip-vit-base-patch32`
-- `SEMANTIC_SEARCH_TOP_K`：语义检索最多保留的候选数
-- `COVER_SEARCH_TOP_K`：封面相似检索最多保留的候选数
-- `LM_STUDIO_API_BASE` / `LM_STUDIO_MODEL`：本地 LLM 助手和标题翻译 `--lm-studio` 模式使用
-- `ONLINE_API_BASE` / `ONLINE_API_KEY` / `ONLINE_MODEL`：线上 LLM 助手默认配置
-- `INITIAL_TAG_WEIGHTS`
-- `MAX_DISPLAY`
-- `HISTORY_RECOMMENDATION_CACHE_SIZE`：参与历史偏好加权的最近打开记录数上限
-- `HISTORY_CACHE_FILE`：历史打开记录文件，默认 `datacache/recommendation_history.json`
-- `HISTORY_LINK_TRACKING_HOST` / `HISTORY_LINK_TRACKING_PORT`：来源链接点击追踪的本地监听地址
+## 数据目录、备份与便携版边界
 
-### 2. 配置数据库密钥
+源码和 Docker 的主要数据目录包括：
 
-`.streamlit/secrets.toml`：
+| 目录 | 内容 |
+| --- | --- |
+| `data/gallery_info` | 可重复导入的原始 CSV |
+| `datacache` | 预处理缓存、历史记录、导入临时目录和词典备份 |
+| `dictionaries` | 标签与标题词典 |
+| `onlineimgtmp` | 在线封面 |
+| `localimgtmp` | 本地目录生成的缩略图 |
+| `b64_cache` / `b64_tmp` | Base64 缓存 |
+| `manga_vectors` | 文本、封面向量索引 |
+| `models` | 本地模型与模型缓存 |
+| `library` | 漫画目录 |
+| `logs` | 采集和运行日志 |
 
-```toml
-[mysql]
-user = "your_database_name"
-password = "your_database_password"
-host = "127.0.0.1"
-port = 3306
-database = "gallery_info"
-```
+Docker 的 MySQL 数据位于命名卷 `xp-gacha_mysql-data`，不在项目目录 bind mount 中。备份 Docker 环境时要同时备份数据库卷和项目数据目录。
 
-Docker模式下，如果 MySQL 仍运行在 Windows 宿主机上，地址要写成：
-
-```toml
-[mysql]
-user = "your_database_name"
-password = "your_database_password"
-host = "host.docker.internal"
-port = 3306
-database = "gallery_info"
-```
-
-如果 MySQL 也放进同一个 `docker-compose.yml`，则 `host` 应改成 MySQL 服务名。
-
-### 3. 自定义主题色
-
-项目使用 `Streamlit` 的项目级主题配置文件：
-
-- `.streamlit/config.toml`
-
-当前仓库已经内置了一套浅色和深色主题，你可以直接修改里面的颜色值：
-
-```toml
-[theme]
-primaryColor = "#755bbb"
-
-[theme.light]
-backgroundColor = "#FFFDF8"
-secondaryBackgroundColor = "#F3EEE7"
-textColor = "#1F1F1F"
-borderColor = "#D9D1C7"
-
-[theme.dark]
-backgroundColor = "#121714"
-secondaryBackgroundColor = "#1D2520"
-textColor = "#EAF2EC"
-borderColor = "#334039"
-```
-
-各字段含义：
-
-- `primaryColor`：主强调色，影响按钮、链接、高亮控件等
-- `backgroundColor`：页面主背景色
-- `secondaryBackgroundColor`：侧边栏、输入框、面板等区域背景色
-- `textColor`：主要文字颜色
-- `borderColor`：边框颜色
-
-使用方式：
-
-1. 打开 `.streamlit/config.toml`
-2. 修改浅色或深色主题下对应的颜色值
-3. 保存文件
-4. 刷新页面；如果没有立即生效，重启 `streamlit run app.py`
-
-深浅色模式切换：
-
-- 应用右上角 `⋮` -> `Settings`
-- 在 `Theme` 中切换 `Light` / `Dark`
-
-### 4. 准备字典与模型资源
-
-默认会读取：
-
-- `dictionaries/STOP_TAGS.txt`
-- `dictionaries/SEMANTIC_MAP.json`
-- `dictionaries/TITLE_STOP_WORDS.txt`
-- `dictionaries/TITLE_SEMANTIC_MAP.json`
-- `config.py` 中指定的本地 embedding 模型目录与本地 CLIP 模型目录
-
-本地下载的模型统一放在项目根目录的 `models/` 下。默认使用下面两个目录，其他本地模型也建议继续放在 `models/` 内：
+便携版通常把同类目录放到 `userdata`，另有：
 
 ```text
-models/
-├─ Qwen3-Embedding-0.6B/
-└─ clip-vit-base-patch32/
+userdata/
+├─ config/portable.json
+├─ mysql/data/
+├─ data/
+├─ datacache/
+├─ dictionaries/
+├─ onlineimgtmp/
+├─ localimgtmp/
+├─ b64_cache/ / b64_tmp/
+├─ manga_vectors/
+├─ models/
+├─ library/
+├─ logs/
+├─ run/
+└─ tmp/
 ```
 
-## 🚀 启动应用
+> [!CAUTION]
+> 当前附录任务把表单中的相对路径解析到源码/发行包根目录，而不是 `XP_GACHA_DATA_ROOT`。便携版执行附录任务时，请把路径显式写成 `userdata/data/...`、`userdata/models/...`、`userdata/manga_vectors/...`、`userdata/b64_cache/...` 等。否则任务可能在包根创建 `data`、`models`、`manga_vectors`、`b64_cache`、`logs` 或 `data_processing` 输出。升级前必须检查这些额外目录；仅备份 `userdata` 可能漏数据。自定义到包外的绝对漫画目录也需单独备份。
 
-### 本机 Python 运行
+## 更新 Windows 便携包
 
-适合在 Windows 本机直接运行，支持 `os.startfile` 打开本地漫画目录。
+当前没有联网自动更新器、自动数据库迁移器或失败自动回滚。采用“新目录解压 + 数据迁移 + 保留旧版回滚”的手动升级流程：
 
-安装依赖：
+1. 在旧版运行 `Stop XP-Gacha.cmd`，确认程序和 MySQL 已停止。
+2. 备份旧版整个 `userdata`，不要只复制 `userdata/mysql/data`。
+3. 备份或记录旧版 `portable-settings.env` 的自定义项。
+4. 检查旧包根目录是否有附录任务生成的额外数据。
+5. 把新版 ZIP 解压到新的版本目录，不要直接覆盖旧版目录。
+6. 比较新旧 `BUILD-INFO.json` 中的 `runtime.mysql.version`。
+7. 若内置 MySQL 版本一致，删除新版尚未使用的空 `userdata`，再把旧版整个 `userdata` 复制到新版；不要合并两个数据目录。
+8. 逐项把旧设置合并进新版 `portable-settings.env`，不要盲目覆盖新版模板。
+9. 把第 4 步发现的包根用户输出迁移到新版对应位置；`data_processing`、`tools` 等同时包含程序代码的目录只能复制用户生成文件，不能用旧目录整体覆盖新版代码。优先迁移到 `userdata/...` 并同步修改任务路径。
+10. 启动新版，核对库存、历史、词典、封面、模型和漫画目录。
+11. 保留旧版目录作为回滚，确认稳定后再删除。
 
-```bash
-pip install -r requirements.txt
+MySQL 正在运行时，绝不能复制其原始数据目录。若新旧包内 MySQL 版本不同，不保证 `mysql/data` 可直接迁移；应等待该版本的迁移说明，或先使用逻辑导出/导入。
+
+默认词典只会在 `userdata/dictionaries` 中对应文件不存在时播种；迁移旧 `userdata` 后，新包不会覆盖用户自定义词典。
+
+## 构建 Windows 便携发行版
+
+版本号从 `server/__init__.py` 读取，`web/package.json` 的版本只是前端包内部版本，不决定发行包名称。
+
+构建机需要：
+
+- Windows x64 PowerShell；
+- CPython 3.13 x64 且有 pip；
+- Node.js 与 pnpm；
+- Git；
+- Windows 自带的 `curl.exe`、`tar.exe`、`robocopy.exe`、`expand.exe`；
+- 网络连接和数 GB 可用空间。
+
+执行：
+
+```powershell
+.\scripts\build_portable_release.ps1
 ```
 
-如果你手动装包，至少需要：
+默认输出目录相对于项目根目录解析：
 
-```bash
-pip install streamlit pandas numpy scipy sqlalchemy pymysql pillow janome sentence-transformers torch requests curl-cffi beautifulsoup4 cloudscraper tomli
+```text
+..\XP-Gacha-Releases
 ```
 
-如果你要使用 `data_processing/img_to_vector.py` 或主界面的封面相似检索，还需要：
+它不是写死的盘符路径。默认产物：
 
-```bash
-pip install transformers
+```text
+..\XP-Gacha-Releases/
+├─ XP-Gacha-v<version>-portable-win64/
+├─ XP-Gacha-v<version>-portable-win64.zip
+└─ XP-Gacha-v<version>-portable-win64.zip.sha256
 ```
 
-启动应用：
+构建流程会：
+
+1. 构建 React 前端；
+2. 按白名单复制程序，排除业务数据和开发缓存；
+3. 下载并校验固定版本的 Python、MySQL、WiX，以及微软签名有效的当前 VC++ 运行库；
+4. 将 CPU PyTorch 与全部 Python 依赖安装到嵌入式 Python；
+5. 执行依赖自检；
+6. 对空 MySQL 数据库执行首次启动 smoke test；
+7. 使用已生成的数据库凭据执行第二次重启 smoke test；
+8. 清空验证产生的 `userdata`；
+9. 审计发行包不含业务数据；
+10. 生成 `BUILD-INFO.json`、`requirements-lock.txt`、逐文件 SHA-256、ZIP 和 ZIP 校验值。
+
+常用参数：
+
+```powershell
+# 指定相对于项目根目录的输出目录
+.\scripts\build_portable_release.ps1 -OutputRoot ".\releases"
+
+# 指定 CPython 3.13 x64
+.\scripts\build_portable_release.ps1 -BuildPython "C:\path\to\python.exe"
+
+# 复用已经确认最新的 web/dist
+.\scripts\build_portable_release.ps1 -SkipFrontendBuild
+```
+
+正式发布不要使用 `-SkipVerification`；否则 `BUILD-INFO.json` 会记录首次启动未验证。下载和 pip 缓存位于项目的 `.portable-cache`，不会进入发行包。
+
+`-Force` 会递归删除输出目录中精确同版本的发行目录、ZIP 和校验文件。不要对已经放入真实 `userdata` 的活动发行目录使用它。推荐先更新 `server/__init__.py` 的版本号，再构建一个新的版本目录。
+
+推荐发布顺序：
+
+1. 完成功能和文档；
+2. 更新 `server/__init__.py`；
+3. 运行前端构建和测试；
+4. 保持 Git 工作区干净并提交；
+5. 运行默认的完整便携包构建；
+6. 核对 `BUILD-INFO.json`、ZIP `.sha256` 和 `sourceDirty`；
+7. 发布 ZIP 与对应校验文件。
+
+## API 概览
+
+完整请求模型和在线调试请查看 `/api/docs`。
+
+| 分类 | 方法与路径 |
+| --- | --- |
+| 健康/系统 | `GET /api/health`、`GET /api/system/status` |
+| 库存选项 | `GET /api/meta/options`、`GET /api/meta/options/search` |
+| 库存/详情 | `POST /api/library/query`、`GET /api/gallery/{id}` |
+| 封面 | `GET /api/covers/{id}`、`GET /api/covers/status`、`POST /api/covers/refresh`、`POST /api/search/cover` |
+| 历史 | `GET/POST/DELETE /api/history`、`DELETE /api/history/all` |
+| 打开/跳转 | `POST /api/gallery/{id}/open-local`、`GET /api/track/{id}` |
+| 图表 | `GET /api/charts/global`、`GET /api/charts/history` |
+| LLM | `POST /api/chat/stream` |
+| 任务 | `GET /api/scripts`、`POST /api/jobs`、`GET /api/jobs/{id}`、`POST /api/jobs/{id}/cancel` |
+| 导入 | `POST /api/import/bundle`、`POST /api/import/project` |
+| 偏好 | `GET/PUT /api/preferences` |
+
+`/api/preferences` 当前只提供列宽 JSON 的后端读写兼容接口，React 表格没有接入可视化列宽编辑，实际使用固定比例列宽。
+
+## 测试与校验
+
+后端/API 与便携启动器：
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+前端类型检查和生产构建：
+
+```powershell
+pnpm --dir web typecheck
+pnpm --dir web build
+```
+
+Windows PowerShell 脚本检查：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\check_windows_powershell_scripts.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\check_start_script_failure.ps1
+```
+
+常用运行检查：
+
+```powershell
+docker compose ps
+docker compose logs --tail 200 app mysql
+```
+
+## 故障排查
+
+### `Docker was not found`
+
+确认 Docker Desktop / Docker Engine 已安装且正在运行：
+
+```powershell
+docker version
+docker compose version
+```
+
+Windows 使用 WSL 2 后端时，还需要系统虚拟化、WSL 和 Linux 发行版处于可用状态。完成这些系统变更后通常需要重启。
+
+### Docker 启动后网页打不开
+
+```powershell
+docker compose ps
+docker compose logs --tail 200 app mysql
+```
+
+确认 `.env` 中的 Web/MySQL 端口没有被占用，并检查 `http://127.0.0.1:<XP_GACHA_PORT>/api/health`；未改配置时端口为 `8000`。第一次镜像构建会下载 CPU AI 依赖，耗时和磁盘占用都明显高于普通 Web 项目。
+
+### 库存为空
+
+这是无数据发行版的正常状态。进入 `/admin` 上传 CSV/ZIP，或把 CSV 放入 `<XP_GACHA_DATA_ROOT>/data/gallery_info` 后点击“导入项目 data/gallery_info”。
+
+### 关键词搜索只有 `LIKE`
+
+先在附录运行“优化 MySQL 表结构与全文索引”。SQLite 等替代数据库不提供与 MySQL `ngram`、表优化和 upsert 完全相同的体验。
+
+### 语义或封面相似检索不可用
+
+检查模型和索引是否存在：
+
+```text
+models/Qwen3-Embedding-0.6B
+manga_vectors/manga_vectors_Qwen3.pkl
+models/clip-vit-base-patch32
+manga_vectors/clip_image_index.pkl
+```
+
+需要时在“附录 → 缓存与向量”构建。便携版路径应显式填写 `userdata/models/...` 和 `userdata/manga_vectors/...`。
+
+### 便携版浏览器没有自动打开
+
+查看启动窗口打印的实际 URL。端口冲突时启动器会自动更换端口，也可以手动编辑 `portable-settings.env` 的首选端口。
+
+### 便携版 MySQL 或应用启动失败
+
+依次查看：
+
+```text
+userdata/logs/mysql-initialize.log
+userdata/logs/mysql-error.log
+userdata/logs/mysql-console.log
+userdata/logs/app.log
+```
+
+如果提示“MySQL 数据目录不完整且非空”，先停止程序并备份整个 `userdata`，不要直接删除。只有确认从未导入数据且允许完全重建时，才考虑清理旧数据。
+
+### `ERROR 1045 ... using password: NO`
+
+先查看 `BUILD-INFO.json`，确认使用的是 `v0.2.1`，不是旧的 `v0.2.0` 启动器。`v0.2.1` 已加入 MySQL 8.4 公钥认证参数。
+
+同时确认：
+
+- `userdata/mysql` 与 `userdata/config/portable.json` 来自同一份完整备份；
+- 没有单独删除或重建 `portable.json`；
+- 旧版程序已经完全停止。
+
+### 安全软件提示便携包
+
+先核对 ZIP 同目录 `.sha256` 和包内 `SHA256SUMS.txt`，再重新解压。不要通过永久关闭系统安全功能解决。分享日志前请移除私人路径，绝不能分享 `portable.json` 或带密钥的 `portable-settings.env`。
+
+## 当前限制
+
+- 不附带漫画目录、CSV、业务数据库、历史、封面、模型或向量；便携包只携带程序默认词典。
+- 没有登录鉴权，不适合直接公网部署。
+- 本地目录打开仅适用于 Windows 桌面运行；Docker 中默认关闭。
+- LLM 助手依赖 LM Studio 或用户自己的兼容 API。
+- 语义/封面检索依赖用户提供模型和索引。
+- 在线封面和采集依赖网络及第三方站点状态。
+- 同时只能运行一个附录任务。
+- 任务状态、终端输出和聊天记录不持久化，服务重启后丢失。
+- 通用任务“超时秒数”尚未由任务管理器强制执行。
+- 便携版当前没有自动更新器，升级采用手动迁移。
+- 便携版附录任务的相对路径仍以发行包根目录解析，使用时应显式加 `userdata/`。
+
+## Legacy Streamlit
+
+`app.py` 保留旧 Streamlit 界面以兼容已有工作流：
 
 ```powershell
 streamlit run app.py
 ```
 
-启动后访问：
+它不是当前主入口，不包含 React 表格虚拟化、固定比例布局、同端口 `/api/track` 等新版交互。旧版还可能读取 `.streamlit/secrets.toml` 和使用独立 `8765` 链接追踪服务；这些都不应作为新部署方案。
 
-```text
-http://localhost:8501
-```
+仓库 `UI-imgs` 中现有图片属于旧 Streamlit 界面，因此本 README 不再把它们作为当前 Web 截图。
 
-### Docker 运行
+## 数据与使用责任
 
-适合在 Docker Desktop 的 Linux containers / WSL2 模式下运行。项目已提供 `Dockerfile`、`docker-compose.yml` 和 `config_docker.py`，镜像中只包含代码与运行环境，模型、向量、缓存、CSV、封面图和数据库密钥通过宿主机目录挂载。
+请只导入、整理和访问你有权处理的内容。在线采集功能应遵守目标站点条款、robots 策略、版权要求和所在地法律；项目不会替用户提供、分发或授权漫画数据。
 
-首次启动或依赖变更后启动：
+## License
 
-```powershell
-docker compose up -d --build
-```
-
-日常后台启动：
-
-```powershell
-docker compose up -d
-```
-
-停止：
-
-```powershell
-docker compose down
-```
-
-查看日志：
-
-```powershell
-docker compose logs -f
-```
-
-启动后访问：
-
-```text
-http://localhost:8501
-```
-
-容器默认把以下目录挂载到 `/app` 下，相关文件仍保留在宿主机项目目录中，不会被打进镜像：
-
-```text
-.streamlit/
-b64_cache/
-b64_tmp/
-data/
-datacache/
-dictionaries/
-localimgtmp/
-logs/
-manga_vectors/
-models/
-onlineimgtmp/
-```
-
-Docker 版默认使用 `config_docker.py` 生成容器内的 `config.py`，常用配置可以通过 `docker-compose.yml` 的 `environment` 覆盖：
-
-```yaml
-environment:
-  XP_GACHA_BASE_DIR: /library
-  LM_STUDIO_API_BASE: http://host.docker.internal:5555/v1
-```
-
-如需让容器读取真实本地漫画目录，在 `docker-compose.yml` 中取消并修改示例挂载：
-
-```yaml
-volumes:
-  - H:/动漫资源/漫画集/HMAN:/library:ro
-```
-
-注意：Docker Linux 容器不能直接调用 Windows 的资源管理器。漫画详情页点击“打开本地目录”时会记录历史并显示路径，但在容器环境中需要手动复制路径打开。
-
-## 📖 字典与 XP 语义聚合说明
-
-`dictionaries/` 里当前主要有 4 个文件：
-
-- `STOP_TAGS.txt`
-  标签停用词表。
-  主要用于在标签评分前剔除“噪声标签”或“非偏好标签”，例如语言标记、翻译标记、作品形态、活动编号、吐槽性标签等。
-  文件格式是一个 Python 风格的字符串列表片段，项目会用正则提取其中的单引号内容。
-  简单示例：
-  ```text
-  'english', 'translated', 'full color', 'anthology', 'c105'
-  ```
-  表示这些标签在后续标签统计和评分前会先被过滤掉。
-  影响范围：
-  `data_pipeline.py`、`Integration/ScoringFormula_online.py` 等标签预处理流程。
-
-- `SEMANTIC_MAP.json`
-  标签语义聚合词典。
-  用来把不同写法、近义词、上下位词、英日中混写标签映射到统一标签。
-  简单示例：
-  ```json
-  {
-    "school uniform": "制服",
-    "uniform": "制服",
-    "glasses": "眼镜"
-  }
-  ```
-  表示原始标签里的 `school uniform` 和 `uniform` 最终都会按 `制服` 这个统一标签统计。
-  这份词典直接影响“标签词频统计”和“推荐评分”。
-  影响范围：
-  标签聚合、侧边栏标签选项、标签权重配置、屏蔽标签、推荐评分。
-
-- `TITLE_STOP_WORDS.txt`
-  标题分词停用词表。
-  用来过滤标题中的高频虚词、语气词、标点、编号、翻译标记、无实际偏好意义的常见碎词，降低标题词频噪声。
-  文件格式和 `STOP_TAGS.txt` 一样，也是通过正则抽取单引号内容。
-  简单示例：
-  ```text
-  'dl版', '翻译', '第1话', 'vol', 'the', 'and'
-  ```
-  表示这些词即使在标题里出现，也不会进入标题特征词统计。
-  影响范围：
-  标题特征词抽取、标题词频统计、标题加权评分。
-
-- `TITLE_SEMANTIC_MAP.json`
-  标题语义聚合词典。
-  用来把标题分词结果中的近义词或不同写法统一到同一个关键词上。
-  简单示例：
-  ```json
-  {
-    "変化": "变身",
-    "变身": "变身",
-    "眼鏡": "眼镜"
-  }
-  ```
-  表示标题分词时，如果抽到 `変化` 或 `变身`，最后都会统一按 `变身` 统计。
-  影响范围：
-  标题特征词统计、标题权重配置、标题分推荐分。
-
-*注：若想跳过字典编写阶段直接获得字典，请移步tools/datasets.txt*
-
-### 字典实际生效顺序
-
-标签链路：
-
-1. 读取原始 `标签`
-2. 用 `STOP_TAGS.txt` 过滤噪声标签
-3. 用 `SEMANTIC_MAP.json` 做语义映射
-4. 统计聚合后的标签词频
-5. 用聚合后的标签参与推荐评分
-
-标题链路：
-
-1. 对 `标题` 分词
-2. 用 `TITLE_STOP_WORDS.txt` 过滤噪声词
-3. 用 `TITLE_SEMANTIC_MAP.json` 做语义映射
-4. 统计聚合后的标题词频
-5. 用聚合后的标题词参与推荐评分
-
-### ⚠️ 修改词典后的影响
-
-如果你改了 `dictionaries/` 下的词典：
-
-- `app.py` / `data_pipeline.py` 的预处理缓存会因为哈希变化自动失效并重建
-- 标签和标题的推荐评分结果会变化
-- 侧边栏里可选的标签、标题词也可能变化
-- 已构建的向量库不会因为这些词典自动重建
-
-也就是说：
-
-- 改标签/标题评分逻辑：通常不需要重建向量库
-- 改数据库内容或想让语义检索语料同步：需要重跑 `data_processing/build_vector_db.py`
-
-## 🛠️ 数据准备与维护
-
-![数据准备与维护](UI-imgs/Functions-7.png)
-
-推荐优先使用应用内的 `数据处理` 页面操作。该页面已经把常用流程做成可视化表单，并提供脚本实时输出：
-
-- CSV 整理：补文件名、标签/标题词整理、Base64 预编码等
-- 数据库同步：全量导入 MySQL、增量同步 MySQL、优化 MySQL 表结构与全文索引
-- 标题AI翻译：按序号范围批量调用 OpenAI 兼容接口，将标题中文译文写入 MySQL，并同步保存成功/失败 JSONL
-- 缓存与向量：重建文本向量库、构建/查看封面图片向量索引
-- 维护工具：刷新缓存统计、清理缓存、合并 Base64 增量缓存、清理标题翻译 JSONL、按 ID 删除数据库条目、按 `error.json` 清空标题译文
-- 采集入口：NH/JM 在线抓信息、失败页重试、NH 本地链接抓信息、NH 本地链接抓完整漫画
-
-采集入口里的链接、起始网址、保存 CSV 路径、抓取页数、线程数、错误日志、失败报告等参数都可以直接在页面里填写。脚本内也保留了同名全局变量，方便直接运行脚本或临时覆写。
-
-### NH 在线抓取
-
-循环抓取指定页数范围，自动写入 `ID`、下载缩略图，并按 `ID` 查重：
-
-```powershell
-python data_get/NH_get_info_online.py --max-page 100 --start-url "https://nhentai.net/language/chinese/?sort=date" --output-csv "gallery_info_chinese.csv" --image-dir "onlineimgtmp" --error-log "logs/NH_error_log_online.txt" --max-workers 10 --once
-```
-
-### NH 失败页重试
-
-按错误页重试，并继续按 `ID` 查重：
-
-```powershell
-python data_get/NH_get_info_online_fix.py
-```
-
-可在脚本顶部全局变量或 `数据处理` 页面里调整读取的错误日志、重试错误日志、输出 CSV、缩略图目录、起始网址等参数。
-
-### JM 在线抓取
-
-抓取JM数据，自动写 `JM...` 的 `ID`，自动清洗语言标签和上传日期：
-
-```powershell
-python data_get/JM_get_info_online.py
-```
-
-可在脚本顶部全局变量或 `数据处理` 页面里调整 `BASE_URL`、`START_URL`、`MAX_PAGES`、`CSV_PATH`、`OUTPUT_DIR`、`MAX_WORKERS` 等参数。
-
-### JM 失败页重试
-
-从指定错误日志里提取失败页码，按首次出现顺序去重后，只重爬这些页：
-
-```powershell
-python data_get/JM_get_info_online_fix.py
-```
-
-可在脚本顶部全局变量或 `数据处理` 页面里调整读取的错误日志、重试日志、失败页报告 CSV、输出 CSV、起始网址等参数。
-
-### NH 本地链接抓信息
-
-如果你已经有本地链接列表：
-
-```powershell
-python data_get/local/NH_get_info_local.py
-```
-
-可在脚本顶部全局变量或 `数据处理` 页面里调整输入链接文件、输出 CSV、错误日志、请求间隔等参数。
-
-### NH 本地链接抓完整漫画
-
-```powershell
-python data_get/local/NH_get_images_local.py
-```
-
-可在脚本顶部全局变量或 `数据处理` 页面里调整输入链接文件、本地漫画根目录、错误日志、最大页数、请求间隔与重试次数等参数。
-
-### 给 CSV 补文件名
-
-用于把本地链接列表中的文件夹名补回 CSV，生成 `*_full.csv`：
-
-```powershell
-python data_processing/addname.py
-```
-
-### 全量导入 MySQL
-
-会读取 `data/gallery_info/*.csv`，规范列后覆盖写入 `gallery_info`：
-
-```powershell
-python data_processing/all_csv_to_mysql.py
-```
-
-当前会：
-
-- 自动补缺失 `ID`
-- 在 `标题` 后保留 `标题译文` 列
-- 按 `ID` 去重
-- 优化 `gallery_info` 字段类型
-- 将 `ID` 优化为主键或唯一索引
-- 建立 `ft_gallery_search` 全文索引，用于关键词候选召回
-
-### 增量同步到 MySQL
-
-```powershell
-python data_processing/add_csv_to_mysql.py
-```
-
-当前会：
-
-- 自动补缺失 `ID`
-- 按 `ID` 去重
-- 按 `ID` 的主键 / 唯一索引做增量插入与更新
-- CSV 未提供 `标题译文` 时保留数据库里已有的标题译文
-- 同步完成后自动执行表结构与全文索引优化
-
-### 标题 AI 翻译
-
-读取 `gallery_info` 中的 `标题`，按 ID 排序后的序号范围筛选，将多个标题拼成一组请求 OpenAI 兼容的 Chat Completions 接口，并把返回的 JSON 拆分写入 `标题译文`。已有 `标题译文` 的条目会自动跳过。
-
-当前行为：
-
-- 多个标题组成一批请求，`--batch-size` 控制每批数量
-- 线上接口可用 `--concurrency` 并发多个批次
-- `--start-index` / `--end-index` 控制按 ID 排序后的翻译序号范围
-- 每个成功批次会追加到成功 JSONL，默认 `data_processing/title_translation_results.jsonl`
-- 失败批次会单独追加到 `data_processing/title_translation_failed_results.jsonl`
-- `429 Too many requests` 会用短错误输出，便于看日志
-- 内容安全拒绝、HTTP 错误、格式错误等不会写入数据库，只会进入失败 JSONL
-- 返回字段兼容 `title_zh`，也兼容部分模型误返回的 `title`
-- 如果只想先审查 JSONL，不写数据库，可追加 `--jsonl-only` 或 `--no-db-write`
-
-```powershell
-python data_processing/translate_titles.py --api-url "https://api.openai.com/v1/chat/completions" --api-key "sk-..." --model "gpt-4o-mini" --batch-size 20 --concurrency 3 --start-index 1 --end-index 200 --jsonl-output "data_processing/title_translation_results.jsonl" --failed-jsonl-output "data_processing/title_translation_failed_results.jsonl"
-```
-
-`--api-url` 可填完整 `/chat/completions` 地址，也可填 OpenAI 兼容 Base URL。`--api-key` 为空时会读取 `OPENAI_API_KEY`。
-
-本地 LM Studio 单线程模式示例：
-
-```powershell
-python data_processing/translate_titles.py --lm-studio --batch-size 5 --start-index 1 --end-index 50 --jsonl-only
-```
-
-启用 `--lm-studio` 时默认读取 `config.py` 里的 `LM_STUDIO_API_BASE` / `LM_STUDIO_MODEL`，API Key 可为空，并强制单线程请求；如果命令行显式传入 `--api-url` 或 `--model`，则以命令行参数为准。
-
-应用内 `数据处理 -> 标题AI翻译` 选项卡也提供同样参数。勾选 `LM Studio 本地单线程模式` 后，URL 和模型名直接读取 `config.py`，并强制单线程，适合本地 LM Studio 兼容接口。
-
-### 优化 MySQL 表结构与全文索引
-
-如果数据库是旧版本表结构，或你想单独补建全文索引，可以执行：
-
-```powershell
-python data_processing/optimize_mysql_schema.py
-```
-
-当前会尝试：
-
-- 清理并优化 `ID` 字段，优先将 `ID` 设置为主键
-- 补齐 `标题译文` 列，并缩短明显不需要 `TEXT` 的字段类型，例如 `链接`、`标题`、`标题译文`、`语言`、`上传日期`
-- 将 `页数` 优化为整数类型
-- 创建 `ft_gallery_search` 全文索引：
-
-```sql
-FULLTEXT INDEX ft_gallery_search (`标题`, `标题译文`, `标签`, `作者`, `团队`) WITH PARSER ngram
-```
-
-如果当前 MySQL 环境不支持 `ngram` parser，脚本会回退为普通 `FULLTEXT` 索引。首次建索引会对整张 `gallery_info` 扫描，数据量大时需要等待一段时间。
-
-### 重建向量库
-
-读取 MySQL 中 `gallery_info`，并以 `ID` 作为向量主键：
-
-```powershell
-python data_processing/build_vector_db.py
-```
-
-当你改了数据库主键逻辑、更新了大量数据、或者刚跑完全量导库后，建议重建一次。
-如果批量更新了 `标题译文`，也建议重建一次，因为文本语义向量会纳入 `标题译文`。
-
-常用参数示例：
-
-```powershell
-python data_processing/build_vector_db.py --model-path "models/Qwen3-Embedding-0.6B" --vector-file "manga_vectors/manga_vectors_Qwen3.pkl" --batch-size 16 --max-text-length 800
-```
-
-### 构建封面图片向量索引
-
-读取 `onlineimgtmp/` 和 `localimgtmp/` 中的图片，并生成 CLIP 封面向量索引：
-
-```powershell
-python data_processing/img_to_vector.py build --device cuda --index-path manga_vectors/clip_image_index.pkl
-```
-
-补充说明：
-
-- 首次全量构建会比较久，尤其当 `onlineimgtmp/` 图片很多时
-- 支持 `Ctrl + C` 中断，已完成批次会保存在 `*.progress` 目录，下次继续跑会自动续建
-- `--batch-size` 可调，例如 `--batch-size 128`
-- 如果中途中断，可以直接再次执行同一条 `build` 命令继续；脚本会自动从进度目录续跑。也可以先看索引状态：
-
-```powershell
-python data_processing/img_to_vector.py stats --index-path manga_vectors/clip_image_index.pkl
-```
-
-终端查询单张图片时：
-
-```powershell
-python data_processing/img_to_vector.py search --query 你的查询图.jpg --top-k 20 --index-path manga_vectors/clip_image_index.pkl
-```
-
-### 预编码封面 Base64
-
-```powershell
-python data_processing/b64_pre_encode.py
-```
-
-会扫描：
-
-- `onlineimgtmp`
-- `localimgtmp`
-
-并为 `ID.*` 图片生成对应的增量 Base64 文本缓存到 `b64_tmp` 文件夹下，检查无误后需手动拷贝至 `b64_cache` 文件夹下。
-
-### 标题翻译维护工具
-
-这些工具也已接入应用内 `数据处理 -> 维护工具` 选项卡。
-
-清理标题翻译成功 JSONL 里混入的 `status == "failed"` 行，默认会生成 `.bak`：
-
-```powershell
-python tools/clean_failed_title_translation_jsonl.py --jsonl-path "data_processing/title_translation_results.jsonl"
-```
-
-按输入 ID 删除数据库中的整条 `gallery_info` 记录。默认只预览，确认删除必须追加 `--confirm`：
-
-```powershell
-python tools/delete_gallery_rows_by_id.py NH123456 NH234567 --confirm
-```
-
-也可以从文本文件读取 ID：
-
-```powershell
-python tools/delete_gallery_rows_by_id.py --id-file "tools/delete_ids.txt" --confirm
-```
-
-从 `tools/error.json` 中识别所有 `"id": "NH..."` 文本段，并清空这些 ID 的 `标题译文`。默认只预览，确认清空必须追加 `--confirm`：
-
-```powershell
-python tools/clear_title_translation_by_error_ids.py --input "tools/error.json" --confirm
-```
-
-默认清空为 `NULL`；如果想清空为空字符串，可追加 `--empty-string`。
-
-*注：若想跳过数据爬取阶段直接获得数据，请移步tools/datasets.txt(无封面)*
-
-## 🔑 核心约定
-
-### `ID` 唯一标识
-
-当前项目已统一以 `ID` 作为唯一标识：
-
-- NH源：`NH123456`
-- JM源：`JM123456`
-
-应用者：
-
-- CSV 首列
-- MySQL 表 `gallery_info`
-- 数据库主键 / 唯一索引
-- MySQL `FULLTEXT` 关键词召回
-- 向量库 `ids`
-- 语义检索命中
-- 缩略图文件名
-- Base64 缓存文件名
-- Streamlit 页面显示与本地打开逻辑
-
-### 缩略图命名规则
-
-- 在线缩略图：`onlineimgtmp/NH123456.jpg` 或 `onlineimgtmp/JM123456.png`
-- 本地缩略图：`localimgtmp/NH123456.jpg`
-- Base64 缓存：`b64_cache/NH123456.txt` 或 `b64_cache/JM123456.txt`
-
-## 🖼️ 缩略图显示机制
-
-`app.py` 当前只对当前分页的数据懒加载封面。
-
-显示顺序是：
-
-1. 读取 `b64_cache/ID.txt`
-2. 如果没有，则读取 `onlineimgtmp/ID.*`
-3. 如果还没有，则回退到本地目录里的 `1.*`
-4. 本地目录回退时会生成 `localimgtmp/ID.jpg`
-5. 如果本地全部落空，则从图源站点实时抓取封面（见下）
-6. 最终结果会回写到 `b64_cache/ID.txt`
-
-即，Base64 缓存是第一优先级，在线图是第二优先级，本地图是第三优先级，线上实时抓取是最后回退。
-
-### 线上封面实时抓取
-
-当 `b64_cache`、`onlineimgtmp`、本地目录都取不到某条目的封面（或 `b64_cache` 目录不存在）时，应用会直接从图源站点实时抓取：
-
-- NH 源：先通过 `https://nhentai.net/api/v2/galleries/<画廊ID>` 把画廊 ID 换成缩略图 URL 实际使用的 `media_id`（两者不是同一个数字，旧版 `/api/gallery/` 接口作为回退），API 同时给出缩略图真实扩展名，再依次尝试 `https://t1~t5.nhentai.net/galleries/<media_id>/thumb.<ext>`
-- JM 源：专辑 ID 即 JM ID 本身，依次尝试 `https://cdn-msp.18comic.vip` 与 `cdn-msp1~5` 镜像下的 `/media/albums/<专辑ID>.jpg/.webp/.png`
-
-找到第一个可访问的组合即停止，抓到的图片会原子写入 `onlineimgtmp/ID.<ext>` 并回写 `b64_cache/ID.txt`，下次直接命中缓存。失败分两类：确定性失败（如 404，条目已被源站删除）的 ID 本次会话内不再重试；网络性失败（超时/连接失败）不拉黑 ID，短暂冷却后可重试。
-
-加载方式是异步的：库存列表只用本地缓存快速渲染表格（不等网络），缺失封面的条目提交到后台线程池并发抓取，表格下方会提示后台抓取数量；抓取完成后点击「库存列表」标题右侧的「刷新封面」按钮手动刷新显示（不做自动轮询刷新，避免整页刷新重挂载表格打断正在进行的勾选操作）；漫画详情页则单条即时抓取，若同一封面正被后台抓取会等待其完成。
-
-相关配置（`config.py`）：
-
-- `ONLINE_COVER_FETCH_ENABLED`：是否启用实时抓取，默认 `True`
-- `ONLINE_COVER_FETCH_CONCURRENCY`：后台并发抓取的线程数，默认 `6`（修改后需重启应用生效）
-- `ONLINE_COVER_PROXY`：抓取走的代理，默认与爬虫一致的 `http://127.0.0.1:7890`，设为 `""` 表示直连；每次请求内代理与直连互为回退，成功的一侧成为下次首选。NH / JM 两个图源各自独立熔断：连续多次网络性失败后暂停该源约 10 分钟再自动恢复，互不影响
-
-Docker 部署时两者均可用同名环境变量覆盖（`ONLINE_COVER_PROXY` 默认为空即直连，容器内走宿主机代理可设为 `http://host.docker.internal:7890`）。
-
-## 缓存说明
-
-项目当前主要有这几类缓存：
-
-- `datacache/`
-  预处理后的主缓存和用户历史记录目录。
-  当前默认会把以下内容一起写入 `preprocessed_df.pkl`：
-  - 预处理后的主 DataFrame
-  - 标签 / 作者 / 标题词频次统计
-  - 全局偏好排序图表所需的 Top 15 / Top 150 统计缓存
-  - 动态评分所需的预编码评分缓存
-  评分缓存当前包括：
-  - 标签稀疏矩阵
-  - 标题词稀疏矩阵
-  - 作者索引编码
-  - 每行标签数 / 标题词数对应的归一化因子
-  - `ID -> 行号` 映射
-  另外，`recommendation_history.json` 会单独保存最近打开记录，用于历史偏好加权和用户历史偏好图表；它不会写入 `preprocessed_df.pkl`，历史偏好图表在页面渲染时即时统计。
-- `onlineimgtmp/`
-  在线抓取到的缩略图
-- `localimgtmp/`
-  本地封面缩略图缓存
-- `b64_cache/`
-  最终供前端显示的 Base64 文本缓存
-- `b64_tmp/`
-  Base64 增量预编码临时目录
-- `manga_vectors/*.pkl`
-  语义向量缓存
-- `manga_vectors/clip_image_index.pkl`
-  封面图片向量索引缓存
-- `data_processing/title_translation_results.jsonl`
-  标题 AI 翻译成功批次记录，包含输入标题、原始返回 JSON、规范化译文字段和数据库写入数量
-- `data_processing/title_translation_failed_results.jsonl`
-  标题 AI 翻译失败批次记录，包含输入标题和错误原因，便于后续重试或清理
-- `.streamlit/library_column_widths.json`
-  库存列表列宽配置，使用列表下方的 `列宽配置` 面板保存后生成
-- `*.pkl.progress/`
-  `data_processing/img_to_vector.py` 构建封面向量时的断点续跑进度目录
-- Streamlit 会话缓存
-  主界面会缓存最近一次关键词数据库召回结果、动态评分结果、语义检索结果和封面相似检索结果。权重变化时，如果关键词和候选集签名没有变化，会尽量复用这些结果，减少重复数据库查询或向量计算。
-
-数据库内容或字典文件变化后，应用会自动根据哈希重新生成预处理缓存。
-如果只是代码升级导致缓存结构扩展，而底层数据未变化，应用会优先尝试基于旧缓存自动补齐新版缓存结构，而不一定重新全量读取数据库。
-
-## ⚠️ 注意事项
-
-- 当前实现对 Windows 更友好，尤其是“打开本地文件夹”功能。
-- `BASE_DIR`、模型路径等默认值是本机路径，换机器必须修改。
-- `app.py` 启动时会连接数据库；如果密钥或表不存在，页面会直接报错停止。
-- 关键词检索建议执行一次 `data_processing/optimize_mysql_schema.py`，确保存在 `ft_gallery_search` 全文索引；没有全文索引时会自动回退到 `LIKE`，但宽泛关键词可能较慢。
-- `启用关键词相关度` 会让 MySQL 额外计算并排序全文相关度。宽泛关键词命中很多时，开启它可能比只召回候选 `ID` 更慢。
-- `标题译文` 更新后，关键词搜索会随数据库即时生效；AI 语义检索需要重建文本向量库才会纳入新译文。
-- 语义检索依赖本地 embedding 模型和提前构建好的文本向量文件。
-- 封面相似检索依赖本地 CLIP 模型与 `IMG_VECTOR_FILE` 指向的图片向量索引。
-- 库存列表的来源链接点击追踪依赖本地 `HISTORY_LINK_TRACKING_HOST:HISTORY_LINK_TRACKING_PORT` 追踪服务，默认 `127.0.0.1:8765`；端口被占用时不会记录网络链接点击。
-- 库存列表列宽保存采用应用内表单写入 `.streamlit/library_column_widths.json`；Streamlit 当前不会把鼠标拖拽后的列宽变化回传到 Python。
-- 如果你的数据库结构发生变化，建议清空数据库，重新运行一次：
-
-```powershell
-python data_processing/all_csv_to_mysql.py
-python data_processing/build_vector_db.py
-```
-
-- 在线抓取脚本默认代理地址写死为 `127.0.0.1:7890`，需要按实际网络环境调整。
-
-## 💡 适合谁用
-
-如果你想要一个高度个人化、可解释、XP 可量化调节、支持本地浏览、语义检索和 LLM 问答的绅士漫画库存检索系统，这个项目非常适合你。
+本项目采用 [MIT License](LICENSE)。
