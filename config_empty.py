@@ -34,6 +34,7 @@ BASE_DIR = r"D:\YourMangaLibrary"
 
 # LM Studio 配置
 LM_STUDIO_API_BASE = "http://localhost:1234/v1"
+LM_STUDIO_API_KEY = ""
 LM_STUDIO_MODEL = "local-model"
 
 # 线上 AI 配置
@@ -56,7 +57,7 @@ INITIAL_TAG_WEIGHTS = {
 # 当 b64_cache、onlineimgtmp、本地目录都取不到封面时，直接从图源站点实时抓取并回写缓存
 ONLINE_COVER_FETCH_ENABLED = True
 # 实时抓取使用的代理（与爬虫一致）；设为 "" 表示直连
-ONLINE_COVER_PROXY = "http://127.0.0.1:7890"
+ONLINE_COVER_PROXY = ""
 # 后台并发抓取的线程数（修改后需重启应用生效）
 ONLINE_COVER_FETCH_CONCURRENCY = 6
 

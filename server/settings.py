@@ -19,7 +19,7 @@ def _bool_env(name: str, default: bool = False) -> bool:
 class Settings:
     app_name: str = "XP-Gacha 地下金库"
     environment: str = os.getenv("XP_GACHA_ENV", "development")
-    host: str = os.getenv("XP_GACHA_HOST", "0.0.0.0")
+    host: str = os.getenv("XP_GACHA_HOST", "127.0.0.1")
     port: int = int(os.getenv("XP_GACHA_PORT", "8000"))
     frontend_dist: Path = Path(
         os.getenv("XP_GACHA_FRONTEND_DIST", str(PROJECT_ROOT / "web" / "dist"))

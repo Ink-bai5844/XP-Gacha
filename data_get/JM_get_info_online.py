@@ -12,6 +12,11 @@ import cloudscraper
 from bs4 import BeautifulSoup
 from requests.exceptions import HTTPError
 
+try:
+    from data_get.proxy_config import configured_proxies
+except ModuleNotFoundError:
+    from proxy_config import configured_proxies
+
 
 MAX_WORKERS = 5
 BASE_URL = "https://18comic.vip"
@@ -31,10 +36,7 @@ DATE_COLUMN = "上传日期"
 ID_PREFIX = "JM"
 LANGUAGE_TAGS = {"中文", "英文", "日文"}
 DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})")
-PROXIES = {
-    "http": "http://127.0.0.1:7890",
-    "https": "http://127.0.0.1:7890",
-}
+PROXIES = configured_proxies()
 CSV_HEADERS = [ID_COLUMN, LINK_COLUMN, "标题", "标签", "作者", "团队", "语言", "页数", "上传日期"]
 thread_local = threading.local()
 

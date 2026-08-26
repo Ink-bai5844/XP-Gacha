@@ -4,10 +4,10 @@ import argparse
 import atexit
 import ctypes
 import hashlib
+import importlib.util
 import json
 import os
 import secrets
-import shutil
 import signal
 import socket
 import subprocess
@@ -23,6 +23,7 @@ from typing import Any
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
+DATA_ROOT = PACKAGE_ROOT
 RUNTIME_ROOT = PACKAGE_ROOT / "runtime"
 PYTHON_HOME = RUNTIME_ROOT / "python"
 PYTHON_EXE = PYTHON_HOME / "python.exe"
@@ -32,14 +33,14 @@ MYSQLD_EXE = MYSQL_BIN / "mysqld.exe"
 MYSQL_EXE = MYSQL_BIN / "mysql.exe"
 MYSQLADMIN_EXE = MYSQL_BIN / "mysqladmin.exe"
 
-USERDATA_ROOT = PACKAGE_ROOT / "userdata"
-CONFIG_ROOT = USERDATA_ROOT / "config"
-RUN_ROOT = USERDATA_ROOT / "run"
-LOG_ROOT = USERDATA_ROOT / "logs"
-TMP_ROOT = USERDATA_ROOT / "tmp"
-MYSQL_DATA_ROOT = USERDATA_ROOT / "mysql" / "data"
+CONFIG_ROOT = PACKAGE_ROOT / "config"
+RUN_ROOT = PACKAGE_ROOT / "run"
+LOG_ROOT = PACKAGE_ROOT / "logs"
+TMP_ROOT = PACKAGE_ROOT / "tmp"
+MYSQL_DATA_ROOT = PACKAGE_ROOT / "mysql" / "data"
 MYSQL_CONFIG_FILE = CONFIG_ROOT / "mysql.ini"
 PORTABLE_CONFIG_FILE = CONFIG_ROOT / "portable.json"
+INITIALIZATION_MARKER_FILE = CONFIG_ROOT / ".config-mysql-initialization-pending.json"
 STATE_FILE = RUN_ROOT / "state.json"
 STOP_REQUEST_FILE = RUN_ROOT / "stop.request"
 SETTINGS_FILE = PACKAGE_ROOT / "portable-settings.env"
@@ -117,6 +118,7 @@ def parse_settings_file(path: Path) -> dict[str, str]:
         "XP_GACHA_IMPORT_MAX_MB",
         "MAX_DISPLAY",
         "LM_STUDIO_API_BASE",
+        "LM_STUDIO_API_KEY",
         "LM_STUDIO_MODEL",
         "ONLINE_API_BASE",
         "ONLINE_API_KEY",
@@ -138,7 +140,13 @@ def parse_settings_file(path: Path) -> dict[str, str]:
         if key not in allowed:
             continue
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            try:
+                decoded = json.loads(value)
+                value = decoded if isinstance(decoded, str) else str(decoded)
+            except json.JSONDecodeError:
+                value = value[1:-1]
+        elif len(value) >= 2 and value[0] == value[-1] == "'":
             value = value[1:-1]
         result[key] = value
     return result
@@ -187,14 +195,95 @@ def wait_for_tcp(port: int, process: subprocess.Popen[bytes], timeout: float) ->
     return False
 
 
-def fetch_json(url: str, timeout: float = 2.0) -> dict[str, Any] | None:
+def request_json(
+    url: str,
+    timeout: float = 2.0,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "XP-Gacha-Portable/1"})
+        body = None
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "XP-Gacha-Portable/1",
+        }
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            return payload if isinstance(payload, dict) else None
+            response_payload = json.loads(response.read().decode("utf-8"))
+            return response_payload if isinstance(response_payload, dict) else None
     except (OSError, ValueError, urllib.error.URLError):
         return None
+
+
+def fetch_json(url: str, timeout: float = 2.0) -> dict[str, Any] | None:
+    return request_json(url, timeout=timeout)
+
+
+def verify_job_runner(base_url: str, timeout: float = 30.0) -> None:
+    started = request_json(
+        base_url.rstrip("/") + "/api/jobs",
+        timeout=timeout,
+        method="POST",
+        payload={"scriptId": "cache-delete", "parameters": {"confirm": True, "targets": []}},
+    )
+    job_id = started.get("id") if isinstance(started, dict) else None
+    if not isinstance(job_id, str) or not job_id:
+        raise RuntimeError("便携版自检无法启动后台任务。")
+
+    deadline = time.monotonic() + timeout
+    last_job: dict[str, Any] | None = started
+    while time.monotonic() < deadline:
+        current = request_json(
+            base_url.rstrip("/") + f"/api/jobs/{urllib.parse.quote(job_id)}?after=0",
+            timeout=min(timeout, 5.0),
+        )
+        if current is not None:
+            last_job = current
+            status = current.get("status")
+            if status == "completed" and current.get("returnCode") == 0:
+                return
+            if status in {"failed", "cancelled"}:
+                lines = current.get("lines") if isinstance(current.get("lines"), list) else []
+                detail = "\n".join(str(line) for line in lines[-20:])
+                raise RuntimeError(f"便携版后台任务自检失败（状态：{status}）。\n{detail}")
+        time.sleep(0.2)
+    raise RuntimeError(f"便携版后台任务自检超时，最后状态：{last_job}")
+
+
+def verify_root_data_paths(status: dict[str, Any]) -> None:
+    paths = status.get("paths") if isinstance(status.get("paths"), dict) else {}
+    expected = {
+        "dataRoot": DATA_ROOT,
+        "library": DATA_ROOT / "library",
+        "dictionaries": DATA_ROOT / "dictionaries",
+    }
+    mismatches: list[str] = []
+    for name, expected_path in expected.items():
+        actual = paths.get(name)
+        if not actual or os.path.normcase(str(Path(str(actual)).resolve())) != os.path.normcase(str(expected_path.resolve())):
+            mismatches.append(f"{name}: {actual!r}（期望 {expected_path}）")
+
+    capabilities = status.get("searchCapabilities") if isinstance(status.get("searchCapabilities"), dict) else {}
+    semantic = capabilities.get("semantic") if isinstance(capabilities.get("semantic"), dict) else {}
+    cover = capabilities.get("cover") if isinstance(capabilities.get("cover"), dict) else {}
+    semantic_dependencies = semantic.get("dependencies") if isinstance(semantic.get("dependencies"), dict) else {}
+    cover_dependencies = cover.get("dependencies") if isinstance(cover.get("dependencies"), dict) else {}
+    search_paths = {
+        "semantic.model": (semantic_dependencies.get("model"), DATA_ROOT / "models" / "Qwen3-Embedding-0.6B"),
+        "semantic.vector": (semantic_dependencies.get("vector"), DATA_ROOT / "manga_vectors" / "manga_vectors_Qwen3.pkl"),
+        "cover.model": (cover_dependencies.get("model"), DATA_ROOT / "models" / "clip-vit-base-patch32"),
+        "cover.vector": (cover_dependencies.get("vector"), DATA_ROOT / "manga_vectors" / "clip_image_index.pkl"),
+    }
+    for name, (dependency, expected_path) in search_paths.items():
+        actual = dependency.get("path") if isinstance(dependency, dict) else None
+        if not actual or os.path.normcase(str(Path(str(actual)).resolve())) != os.path.normcase(str(expected_path.resolve())):
+            mismatches.append(f"{name}: {actual!r}（期望 {expected_path}）")
+    if mismatches:
+        raise RuntimeError("便携版数据路径未指向发行包根目录：\n" + "\n".join(mismatches))
 
 
 def open_browser(url: str) -> None:
@@ -362,11 +451,69 @@ class WindowsJob:
             self.handle = None
 
 
+def validate_config_mysql_pair() -> None:
+    config_exists = PORTABLE_CONFIG_FILE.is_file()
+    mysql_initialized = (MYSQL_DATA_ROOT / "mysql").is_dir()
+    initialization_pending = INITIALIZATION_MARKER_FILE.is_file()
+    if config_exists == mysql_initialized or (config_exists and initialization_pending):
+        return
+
+    if config_exists:
+        mismatch = "检测到 config/portable.json，但 mysql/data 尚未初始化"
+    else:
+        mismatch = "检测到已初始化的 mysql/data，但缺少 config/portable.json"
+    raise RuntimeError(
+        f"{mismatch}。便携版配置凭据与数据库必须来自同一次完整备份，启动已中止。"
+        "请关闭旧版后将 config 与 mysql 两个目录成套迁移；"
+        "若要全新初始化，请先备份并移走当前残留项。"
+    )
+
+
+def begin_config_mysql_initialization() -> None:
+    config_exists = PORTABLE_CONFIG_FILE.is_file()
+    mysql_initialized = (MYSQL_DATA_ROOT / "mysql").is_dir()
+    if config_exists or mysql_initialized or INITIALIZATION_MARKER_FILE.is_file():
+        return
+    atomic_write_json(
+        INITIALIZATION_MARKER_FILE,
+        {
+            "schemaVersion": SCHEMA_VERSION,
+            "startedAt": time.time(),
+        },
+    )
+
+
+def complete_config_mysql_initialization() -> None:
+    config_exists = PORTABLE_CONFIG_FILE.is_file()
+    mysql_initialized = (MYSQL_DATA_ROOT / "mysql").is_dir()
+    if not config_exists or not mysql_initialized:
+        raise RuntimeError("便携版配置与 MySQL 尚未同时完成初始化，无法清除首次启动恢复标记。")
+    INITIALIZATION_MARKER_FILE.unlink(missing_ok=True)
+
+
 def ensure_package_layout() -> None:
-    required = [PYTHON_EXE, MYSQLD_EXE, MYSQL_EXE, MYSQLADMIN_EXE, PACKAGE_ROOT / "web" / "dist" / "index.html"]
+    required = [
+        PYTHON_EXE,
+        MYSQLD_EXE,
+        MYSQL_EXE,
+        MYSQLADMIN_EXE,
+        PACKAGE_ROOT / "server" / "main.py",
+        PACKAGE_ROOT / "server" / "job_tasks.py",
+        PACKAGE_ROOT / "web" / "dist" / "index.html",
+    ]
     missing = [str(path.relative_to(PACKAGE_ROOT)) for path in required if not path.is_file()]
     if missing:
         raise RuntimeError("发行包不完整，缺少：" + "、".join(missing))
+
+    legacy_data_root = PACKAGE_ROOT / "userdata"
+    if legacy_data_root.is_dir() and any(legacy_data_root.iterdir()):
+        raise RuntimeError(
+            "检测到旧版 userdata 数据目录。新版不会读取该目录，以免数据库与凭据错配。"
+            "请先按 README 的 v0.2.2 → v0.2.3 迁移表，把 config 与 mysql 成套迁移，"
+            "并将其他数据目录移动到发行包根目录。"
+        )
+
+    validate_config_mysql_pair()
 
     directories = [
         CONFIG_ROOT,
@@ -374,18 +521,18 @@ def ensure_package_layout() -> None:
         LOG_ROOT,
         TMP_ROOT,
         MYSQL_DATA_ROOT.parent,
-        USERDATA_ROOT / "data" / "gallery_info",
-        USERDATA_ROOT / "data" / "gallery_info_no_name",
-        USERDATA_ROOT / "data" / "local_data",
-        USERDATA_ROOT / "datacache" / "imports",
-        USERDATA_ROOT / "b64_cache",
-        USERDATA_ROOT / "b64_tmp",
-        USERDATA_ROOT / "localimgtmp",
-        USERDATA_ROOT / "onlineimgtmp",
-        USERDATA_ROOT / "library",
-        USERDATA_ROOT / "manga_vectors",
-        USERDATA_ROOT / "models",
-        USERDATA_ROOT / "models" / "cache",
+        PACKAGE_ROOT / "data" / "gallery_info",
+        PACKAGE_ROOT / "data" / "gallery_info_no_name",
+        PACKAGE_ROOT / "data" / "local_data",
+        PACKAGE_ROOT / "datacache" / "imports",
+        PACKAGE_ROOT / "b64_cache",
+        PACKAGE_ROOT / "b64_tmp",
+        PACKAGE_ROOT / "localimgtmp",
+        PACKAGE_ROOT / "onlineimgtmp",
+        PACKAGE_ROOT / "library",
+        PACKAGE_ROOT / "manga_vectors",
+        PACKAGE_ROOT / "models",
+        PACKAGE_ROOT / "models" / "cache",
     ]
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
@@ -397,8 +544,7 @@ def ensure_package_layout() -> None:
     except OSError as exc:
         raise RuntimeError(f"发行包目录不可写，请移动到普通可写目录后重试：{exc}") from exc
 
-    seed_root = PACKAGE_ROOT / "dictionaries"
-    dictionary_root = USERDATA_ROOT / "dictionaries"
+    dictionary_root = PACKAGE_ROOT / "dictionaries"
     dictionary_root.mkdir(parents=True, exist_ok=True)
     defaults = {
         "STOP_TAGS.txt": "",
@@ -408,12 +554,8 @@ def ensure_package_layout() -> None:
     }
     for name, default_content in defaults.items():
         destination = dictionary_root / name
-        source = seed_root / name
         if not destination.exists():
-            if source.is_file():
-                shutil.copy2(source, destination)
-            else:
-                destination.write_text(default_content, encoding="utf-8")
+            destination.write_text(default_content, encoding="utf-8")
 
 
 def load_or_create_config(settings: dict[str, str]) -> dict[str, Any]:
@@ -449,9 +591,22 @@ def base_environment(settings: dict[str, str], app_port: int, mysql_port: int, c
         XP_GACHA_ENV="production",
         XP_GACHA_HOST="127.0.0.1",
         XP_GACHA_PORT=str(app_port),
-        XP_GACHA_DATA_ROOT=str(USERDATA_ROOT),
+        XP_GACHA_DATA_ROOT=str(PACKAGE_ROOT),
         XP_GACHA_FRONTEND_DIST=str(PACKAGE_ROOT / "web" / "dist"),
         XP_GACHA_ALLOW_OPEN_LOCAL="1",
+        XP_GACHA_RUNTIME_MODE="portable",
+        XP_GACHA_SETTINGS_FILE=str(SETTINGS_FILE),
+        ONLINE_IMG_DIR=str(DATA_ROOT / "onlineimgtmp"),
+        IMG_CACHE_DIR=str(DATA_ROOT / "localimgtmp"),
+        CACHE_DIR=str(DATA_ROOT / "datacache"),
+        B64_CACHE_DIR=str(DATA_ROOT / "b64_cache"),
+        MODEL_DIR=str(DATA_ROOT / "models"),
+        DICTIONARY_DIR=str(DATA_ROOT / "dictionaries"),
+        HISTORY_CACHE_FILE=str(DATA_ROOT / "datacache" / "recommendation_history.json"),
+        VECTOR_FILE=str(DATA_ROOT / "manga_vectors" / "manga_vectors_Qwen3.pkl"),
+        IMG_VECTOR_FILE=str(DATA_ROOT / "manga_vectors" / "clip_image_index.pkl"),
+        LOCAL_MODEL_PATH=str(DATA_ROOT / "models" / "Qwen3-Embedding-0.6B"),
+        CLIP_MODEL_PATH=str(DATA_ROOT / "models" / "clip-vit-base-patch32"),
         MYSQL_HOST="127.0.0.1",
         MYSQL_PORT=str(mysql_port),
         MYSQL_DATABASE=str(config["databaseName"]),
@@ -467,17 +622,23 @@ def base_environment(settings: dict[str, str], app_port: int, mysql_port: int, c
         TEMP=str(TMP_ROOT),
         TMP=str(TMP_ROOT),
         TMPDIR=str(TMP_ROOT),
-        HF_HOME=str(USERDATA_ROOT / "models" / "cache" / "huggingface"),
-        HUGGINGFACE_HUB_CACHE=str(USERDATA_ROOT / "models" / "cache" / "huggingface" / "hub"),
-        TRANSFORMERS_CACHE=str(USERDATA_ROOT / "models" / "cache" / "transformers"),
-        TORCH_HOME=str(USERDATA_ROOT / "models" / "cache" / "torch"),
-        XDG_CACHE_HOME=str(USERDATA_ROOT / "cache"),
+        HF_HOME=str(PACKAGE_ROOT / "models" / "cache" / "huggingface"),
+        HUGGINGFACE_HUB_CACHE=str(PACKAGE_ROOT / "models" / "cache" / "huggingface" / "hub"),
+        TRANSFORMERS_CACHE=str(PACKAGE_ROOT / "models" / "cache" / "transformers"),
+        TORCH_HOME=str(PACKAGE_ROOT / "models" / "cache" / "torch"),
+        XDG_CACHE_HOME=str(PACKAGE_ROOT / "models" / "cache" / "xdg"),
         STREAMLIT_BROWSER_GATHER_USAGE_STATS="false",
         TZ="Asia/Shanghai",
     )
 
-    library_value = settings.get("XP_GACHA_LIBRARY_PATH", "userdata/library")
+    library_value = settings.get("XP_GACHA_LIBRARY_PATH", "library")
     library_path = Path(library_value).expanduser()
+    legacy_library_parts = tuple(part.lower() for part in library_path.parts if part not in {"", "."})
+    if not library_path.is_absolute() and legacy_library_parts == ("userdata", "library"):
+        log("检测到旧版默认漫画路径，已自动改用根目录 library。")
+        library_path = Path("library")
+    elif not library_path.is_absolute() and legacy_library_parts[:1] == ("userdata",):
+        raise RuntimeError("XP_GACHA_LIBRARY_PATH 不能再指向 userdata；请改为 library 或包外绝对路径。")
     if not library_path.is_absolute():
         library_path = PACKAGE_ROOT / library_path
     library_path.mkdir(parents=True, exist_ok=True)
@@ -485,6 +646,7 @@ def base_environment(settings: dict[str, str], app_port: int, mysql_port: int, c
 
     optional_defaults = {
         "LM_STUDIO_API_BASE": "http://127.0.0.1:1234/v1",
+        "LM_STUDIO_API_KEY": "",
         "LM_STUDIO_MODEL": "local-model",
         "ONLINE_API_BASE": "",
         "ONLINE_API_KEY": "",
@@ -585,7 +747,7 @@ def initialize_mysql(env: dict[str, str]) -> None:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("MySQL 初始化超时，请查看 userdata/logs/mysql-initialize.log。") from exc
+            raise RuntimeError("MySQL 初始化超时，请查看 logs/mysql-initialize.log。") from exc
     if completed.returncode != 0 or not (MYSQL_DATA_ROOT / "mysql").is_dir():
         detail = tail_file(init_log)
         raise RuntimeError(f"MySQL 初始化失败（退出码 {completed.returncode}）。\n{detail}")
@@ -815,6 +977,7 @@ def run_start(no_browser: bool = False, verify: bool = False) -> int:
     job = WindowsJob()
     atexit.register(job.close)
     settings = parse_settings_file(SETTINGS_FILE)
+    begin_config_mysql_initialization()
     config = load_or_create_config(settings)
     mysql_port = choose_free_port(parse_port(config.get("preferredDatabasePort"), DEFAULT_MYSQL_PORT))
     app_port = choose_free_port(
@@ -830,6 +993,7 @@ def run_start(no_browser: bool = False, verify: bool = False) -> int:
     exit_code = 0
     try:
         initialize_mysql(env)
+        complete_config_mysql_initialization()
         log(f"正在启动包内 MySQL：127.0.0.1:{mysql_port}")
         mysql_process, mysql_log_handle = start_mysql(env, mysql_port, job)
         provision_mysql(config, mysql_port, env)
@@ -850,6 +1014,8 @@ def run_start(no_browser: bool = False, verify: bool = False) -> int:
             status = fetch_json(url + "/api/system/status", timeout=30)
             if meta is None or status is None:
                 raise RuntimeError("便携版自检未能访问核心 API。")
+            verify_root_data_paths(status)
+            verify_job_runner(url)
             log("便携版首启自检通过。")
             return 0
 
@@ -979,6 +1145,16 @@ def run_doctor() -> int:
             __import__(name)
         except Exception as exc:
             problems.append(f"Python 依赖 {name} 无法加载：{exc}")
+    expected_job_module = (PACKAGE_ROOT / "server" / "job_tasks.py").resolve()
+    try:
+        job_spec = importlib.util.find_spec("server.job_tasks")
+        job_origin = Path(job_spec.origin).resolve() if job_spec and job_spec.origin else None
+        if job_origin != expected_job_module:
+            problems.append(
+                f"后台任务模块无法从当前发行包加载：期望 {expected_job_module}，实际 {job_origin}"
+            )
+    except Exception as exc:
+        problems.append(f"后台任务模块无法加载：{exc}")
     if problems:
         log("自检失败：")
         for problem in problems:

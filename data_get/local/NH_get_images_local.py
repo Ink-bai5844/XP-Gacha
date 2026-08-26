@@ -4,6 +4,15 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup
 import time
 
+try:
+    from data_get.proxy_config import configured_proxies
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from proxy_config import configured_proxies
+
 ROOT_DIR = "output"
 INPUT_FILE = "data/local_data/NH_2.txt"
 ERROR_LOG = "logs/NH_error_log_images_local.txt"
@@ -12,10 +21,7 @@ REQUEST_INTERVAL_SECONDS = 1.5
 PAGE_RETRY_TIMES = 3
 LOCAL_LINK_PATTERN = re.compile(r'<A HREF="(.*?)".*?>(.*?)</A>')
 
-PROXIES = {
-    "http": "http://127.0.0.1:7890",
-    "https": "http://127.0.0.1:7890"
-}
+PROXIES = configured_proxies()
 
 def sanitize_folder_name(name):
     """移除文件夹名中的非法字符"""

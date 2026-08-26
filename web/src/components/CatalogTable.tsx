@@ -21,6 +21,7 @@ type CatalogTableProps = {
   selectedId: string | null;
   onSelect: (id: string | null) => void;
   onOpenSource?: (id: string) => void;
+  onPreview?: (item: DisplayItem | null) => void;
   showKeywordRelevance: boolean;
   showAiRelevance: boolean;
   showCoverRelevance: boolean;
@@ -98,6 +99,38 @@ function Score({ value }: { value: number }) {
   return <span className="signal-score mono">{value}</span>;
 }
 
+export const CatalogCoverPreview = memo(function CatalogCoverPreview({ item }: { item: DisplayItem | null }) {
+  return (
+    <aside className="cover-preview" aria-label="库存封面大图预览">
+      <span className="preview-kicker mono">COVER PREVIEW / HOVER OR FOCUS</span>
+      {item ? (
+        <div className="cover-reveal" key={item.id}>
+          <EditorialCover item={item} large />
+          <div className="preview-caption">
+            <span className="preview-number mono">{item.id}</span>
+            <h3>{item.titleZh || item.title}</h3>
+            <p>{item.titleZh && item.title ? item.title : item.artist || "—"}</p>
+            <dl>
+              <div><dt>作者</dt><dd>{item.artist || "—"}</dd></div>
+              <div><dt>团队</dt><dd>{item.circle || "—"}</dd></div>
+              <div><dt>语言</dt><dd>{item.language || "—"}</dd></div>
+              <div><dt>页数</dt><dd className="mono">{item.pages}</dd></div>
+              <div><dt>推荐分</dt><dd className="mono signal-text">{item.score}</dd></div>
+            </dl>
+          </div>
+        </div>
+      ) : (
+        <div className="cover-preview-empty">
+          <span className="mono">NO PREVIEW</span>
+          <p>将鼠标移到目录行，或用键盘聚焦行内操作，即可查看封面大图。</p>
+        </div>
+      )}
+    </aside>
+  );
+});
+
+CatalogCoverPreview.displayName = "CatalogCoverPreview";
+
 function ExpandedCatalogDetails({
   item,
   onOpenSource,
@@ -146,11 +179,9 @@ function ExpandedCatalogDetails({
     ["AI 相关度", current.aiRelevance.toFixed(2)],
     ["封面相关度", current.coverRelevance.toFixed(2)],
     ["标题特征词", remoteItem?.titleWords?.join("、") || "—"],
-    ["原始标签", remoteItem?.rawTags?.join("、") || current.tags.join("、") || "—"],
     ["文件名", current.filename || "—"],
     ["本地目录", current.localPath || "—"],
     ["网络来源", current.link || "未记录"],
-    ["搜索文本", [current.titleZh, current.title, current.artist, current.circle, ...current.tags].filter(Boolean).join(" ")],
   ];
 
   return (
@@ -199,6 +230,7 @@ export const CatalogTable = memo(function CatalogTable({
   selectedId,
   onSelect,
   onOpenSource,
+  onPreview,
   showKeywordRelevance,
   showAiRelevance,
   showCoverRelevance,
@@ -246,13 +278,14 @@ export const CatalogTable = memo(function CatalogTable({
   }, []);
 
   const handleScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    onPreview?.(null);
     pendingScrollTopRef.current = event.currentTarget.scrollTop;
     if (scrollFrameRef.current !== null) return;
     scrollFrameRef.current = window.requestAnimationFrame(() => {
       scrollFrameRef.current = null;
       startTransition(() => setScrollTop(pendingScrollTopRef.current));
     });
-  }, []);
+  }, [onPreview]);
 
   const handleDetailHeight = useCallback((height: number) => {
     setDetailHeight((current) => Math.abs(current - height) > 1 ? height : current);
@@ -318,6 +351,15 @@ export const CatalogTable = memo(function CatalogTable({
                 <tr
                   className={`catalog-row${selected ? " catalog-row-selected" : ""}`}
                   aria-rowindex={index + 2}
+                  onPointerEnter={() => onPreview?.(item)}
+                  onPointerLeave={(event) => {
+                    if (!event.currentTarget.contains(document.activeElement)) onPreview?.(null);
+                  }}
+                  onFocusCapture={() => onPreview?.(item)}
+                  onBlurCapture={(event) => {
+                    const nextTarget = event.relatedTarget as Node | null;
+                    if (!nextTarget || !event.currentTarget.contains(nextTarget)) onPreview?.(null);
+                  }}
                 >
                   <td className="index-col">
                     <button

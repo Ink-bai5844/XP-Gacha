@@ -2,7 +2,6 @@ import { ExternalLink, FolderOpen, RefreshCw, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { openLocal } from "../api/client";
-import { PreferenceCharts } from "../components/PreferenceCharts";
 import { findCatalogItem, titleWordOptions, useAppState } from "../state/AppState";
 
 export function HistoryPage() {
@@ -78,7 +77,6 @@ export function HistoryPage() {
         </>
       )}
 
-      <PreferenceCharts scope="history" />
     </div>
   );
 }

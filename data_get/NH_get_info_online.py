@@ -9,6 +9,11 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from curl_cffi import requests 
 from bs4 import BeautifulSoup
 
+try:
+    from data_get.proxy_config import build_proxies, configured_proxies
+except ModuleNotFoundError:
+    from proxy_config import build_proxies, configured_proxies
+
 BASE_URL = "https://nhentai.net"
 START_URL = f"{BASE_URL}/language/chinese/?sort=date"
 IMG_DIR = "onlineimgtmp"
@@ -21,10 +26,10 @@ ID_COLUMN = "ID"
 ID_PREFIX = "NH"
 GALLERY_URL_PATTERN = re.compile(r"/g/(\d+)/?")
 CSV_HEADERS = [ID_COLUMN, LINK_COLUMN, '标题', '标签', '作者', '团队', '语言', '页数', '上传日期']
-PROXIES = {
-    "http": "http://127.0.0.1:7890",
-    "https": "http://127.0.0.1:7890"
-}
+
+
+ONLINE_COVER_PROXY = os.getenv("ONLINE_COVER_PROXY", "")
+PROXIES = configured_proxies()
 
 MAX_WORKERS = 10
 csv_lock = threading.Lock()  # 保护 CSV 写入
@@ -425,6 +430,8 @@ def main(
         page = 1
         total_count = 0
         cycle_count = 1
+        successful_page_count = 0
+        failed_page_count = 0
         
         # 启动线程池
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -437,15 +444,9 @@ def main(
                     print(f"\n========== 开始第 {cycle_count} 轮循环爬取 1..{max_page} ==========")
 
                 items = get_page_urls(page, start_url=start_url, base_url=BASE_URL)
-                
-                if items is None:
-                    print(f"\n第 {page} 页不存在或没有漫画数据 (404)，停止扫描。")
-                    print(f"第 {page} 页不存在或返回 404，跳过该页，继续循环范围内的后续页。")
-                    page += 1
-                    time.sleep(3)
-                    continue
-                    
+
                 if items is False:
+                    failed_page_count += 1
                     error_msg = f"[页数: {page}] 页面列表获取失败\n"
                     print(f" ❌ {error_msg.strip()}，已写入日志，继续尝试下一页...")
                     with log_lock:
@@ -454,7 +455,16 @@ def main(
                     page += 1
                     time.sleep(3)
                     continue
-                    
+
+                successful_page_count += 1
+
+                if items is None:
+                    print(f"\n第 {page} 页不存在或没有漫画数据 (404)，停止扫描。")
+                    print(f"第 {page} 页不存在或返回 404，跳过该页，继续循环范围内的后续页。")
+                    page += 1
+                    time.sleep(3)
+                    continue
+
                 if not items:
                     print(f"第 {page} 页数据提取为空，尝试扫描下一页...")
                     page += 1
@@ -481,7 +491,14 @@ def main(
                 page += 1
                 time.sleep(1) # 翻页间歇，对服务器温柔一点
 
+    if failed_page_count and successful_page_count == 0:
+        raise RuntimeError(
+            f"列表页请求全部失败（{failed_page_count} 页）；请检查网络和 ONLINE_COVER_PROXY 配置"
+        )
+
     print("\n==============================")
+    if failed_page_count:
+        print(f"警告：有 {failed_page_count} 个列表页请求失败，详情见错误日志。")
     print(f"所有任务处理完成！本次共新抓取 {total_count} 条详情数据。")
     print(f"缺失的缩略图已同步至 {IMG_DIR} 文件夹。")
 

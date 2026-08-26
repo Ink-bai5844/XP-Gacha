@@ -2,7 +2,7 @@
 
 XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据维护工具。当前主程序已经从 Streamlit 重构为 React 单页应用 + FastAPI API + MySQL；旧 Streamlit 入口仍保留用于兼容和对照，但不再是推荐入口。
 
-**当前版本：`v0.2.1`**
+**当前版本：`v0.2.5`**
 
 | 项目 | 当前实现 |
 | --- | --- |
@@ -35,11 +35,11 @@ XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据�
 
 ### 第一次启动
 
-1. 完整解压 `XP-Gacha-v0.2.1-portable-win64.zip`，不要在压缩软件预览窗口中直接运行。
+1. 完整解压 `XP-Gacha-v0.2.5-portable-win64.zip`，不要在压缩软件预览窗口中直接运行。
 2. 把目录放到普通本地可写位置。不要放进 `Program Files`、只读目录、网络盘或同步盘。
 3. 双击 `Start XP-Gacha.cmd`。
-4. 首次启动会创建 `userdata`、初始化包内 MySQL、随机生成数据库凭据、启动应用并在健康检查通过后打开浏览器。
-5. 进入“附录 → 一键导入词典 / 数据”，上传 CSV 或 ZIP。
+4. 首次启动会在发行包根目录创建并列数据目录、初始化包内 MySQL、随机生成数据库凭据、启动应用并在健康检查通过后打开浏览器。
+5. 空数据库的库存首页会显示完整导入引导：打开 `Ink-bai/XP-Gacha-datasets` 下载 `input_data.zip`，保持 ZIP 原样，再跳转“附录 → 一键导入词典 / 数据”上传。
 
 启动窗口需要保持开启。正常停止请在窗口中按 `Ctrl+C`，或双击 `Stop XP-Gacha.cmd`。不要在 MySQL 写入期间直接结束进程或复制数据库目录。
 
@@ -52,13 +52,13 @@ XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据�
 | `Start XP-Gacha.cmd` | 启动当前这一份包内 MySQL、API 和 Web |
 | `Stop XP-Gacha.cmd` | 安全停止当前包实例 |
 | `Check XP-Gacha.cmd` | 检查必需文件和 Python 模块能否加载 |
-| `Open User Data.cmd` | 打开 `userdata` |
+| `Open XP-Gacha Folder.cmd` | 打开发行包根目录及其并列数据目录 |
 | `portable-settings.env` | 可选端口、漫画目录、LLM/API 和在线封面设置 |
 | `BUILD-INFO.json` | 版本、源码状态、运行时版本和构建验证结果 |
 | `requirements-lock.txt` | 实际打入发行版的 Python 包版本 |
 | `SHA256SUMS.txt` | 发行目录内逐文件 SHA-256 |
 
-`Check XP-Gacha.cmd` 不会启动 MySQL，也不验证网络或文件哈希；它通过不代表完整启动一定成功。ZIP 同目录的 `.sha256` 用于核对下载包整体，包内 `SHA256SUMS.txt` 用于核对逐文件完整性。
+`Check XP-Gacha.cmd` 不会启动 MySQL，也不验证网络或文件哈希；它通过不代表完整启动一定成功。ZIP 同目录的 `.sha256` 用于核对下载包整体，包内 `SHA256SUMS.txt` 用于核对逐文件完整性。逐文件清单针对刚解压、尚未使用的发行包；启动后生成数据库、缓存或修改根目录词典，相关文件变化是正常现象。
 
 ### 便携版设置
 
@@ -68,20 +68,23 @@ XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据�
 | --- | --- | --- |
 | `XP_GACHA_PORT` | `8000` | 首选网页端口 |
 | `MYSQL_PORT` | `3307` | 首选包内 MySQL 端口 |
-| `XP_GACHA_LIBRARY_PATH` | `userdata/library` | 漫画目录；相对路径以发行包根目录为基准，也可用绝对路径 |
+| `XP_GACHA_LIBRARY_PATH` | `library` | 漫画目录；相对路径以发行包根目录为基准，也可用绝对路径 |
 | `XP_GACHA_IMPORT_MAX_MB` | `1024` | ZIP/CSV 上传上限，单位 MB |
 | `MAX_DISPLAY` | `500` | 每页最多显示的库存条数 |
 | `LM_STUDIO_API_BASE` | `http://127.0.0.1:1234/v1` | 本地 OpenAI 兼容接口 |
+| `LM_STUDIO_API_KEY` | 空 | 本地接口密钥；LM Studio 不要求鉴权时可留空 |
 | `LM_STUDIO_MODEL` | `local-model` | 本地模型名 |
 | `ONLINE_API_BASE` | 空 | 在线 OpenAI 兼容 API 地址 |
 | `ONLINE_API_KEY` | 空 | 在线 API 密钥 |
 | `ONLINE_MODEL` | `deepseek-v4-flash` | 在线模型名 |
-| `ONLINE_COVER_PROXY` | 空 | 在线封面代理；空值表示直连 |
+| `ONLINE_COVER_PROXY` | 空 | 在线封面与 NH 采集代理；空值表示直连，本机代理可填 `http://127.0.0.1:7890` |
 | `ONLINE_COVER_FETCH_ENABLED` | `1` | 是否允许在线补抓封面 |
 
-`portable-settings.env` 可能包含 API 密钥，不要公开。它位于 `userdata` 外，升级时需要单独逐项合并。
+助手页可以直接填写本地或线上 API 的 URL、模型名和 Key；保存时会更新包根目录的 `portable-settings.env`，下一次对话立即使用新配置，无需重启。页面和配置读取接口只会显示 Key 是否已配置，不会把已保存的 Key 明文回传；输入框留空会保留原 Key，只有点击“清除 Key”并保存才会删除。
 
-`userdata/config/portable.json` 保存随机生成的 MySQL 账户和密码。它必须与 `userdata/mysql` 成套备份和迁移；不要单独删除、重建或分享该文件。
+`portable-settings.env` 可能包含 API 密钥，不要公开；升级时需要单独逐项合并。
+
+`config/portable.json` 保存随机生成的 MySQL 账户和密码。它必须与根目录 `mysql` 成套备份和迁移；不要单独删除、重建或分享该文件。
 
 ## Docker Compose
 
@@ -106,6 +109,8 @@ sh ./scripts/start.sh
 - Web：`http://127.0.0.1:8000`
 - 健康检查：`http://127.0.0.1:8000/api/health`
 - API 文档：`http://127.0.0.1:8000/api/docs`
+
+启动脚本会等到 Web 服务能够正常返回页面后才打印 `started`。库存较大且预处理缓存失效时，全量读取、标签解析和评分缓存会在后台继续构建；网页与健康监控不会再被这一步阻塞，库存目录会在预热完成后自动显示数据。
 
 如果修改了 `.env` 中的 `XP_GACHA_PORT`，请把上述网址的 `8000` 替换为实际端口。
 
@@ -137,12 +142,15 @@ docker compose down
 | `MYSQL_ROOT_PASSWORD` | `xp_gacha_root` | MySQL root 密码 |
 | `XP_GACHA_LIBRARY_PATH` | `./library` | 宿主机漫画目录，只读挂载到 `/library` |
 | `LM_STUDIO_API_BASE` | `http://host.docker.internal:1234/v1` | 容器访问宿主机 LM Studio |
+| `LM_STUDIO_API_KEY` | 空 | 本地接口密钥；LM Studio 不要求鉴权时可留空 |
 | `LM_STUDIO_MODEL` | `local-model` | 本地模型名 |
 | `ONLINE_API_BASE` | 空 | 在线兼容 API 地址 |
 | `ONLINE_API_KEY` | 空 | 在线 API 密钥 |
 | `ONLINE_MODEL` | `deepseek-v4-flash` | 在线模型名 |
-| `ONLINE_COVER_PROXY` | 空 | 在线封面代理 |
+| `ONLINE_COVER_PROXY` | 空 | 在线封面与 NH 采集代理；宿主机代理应填 `http://host.docker.internal:7890`，不能填 `127.0.0.1` |
 | `ADMINER_PORT` | `8081` | 可选 Adminer 端口 |
+
+Docker 运行时，助手页保存的 LLM 配置会通过 `/app/.env` 的文件挂载写回宿主项目根目录 `.env`，并在下一次对话请求中生效。无需为助手页保存操作重建或重启容器；如果是在容器外手动编辑 `.env`，仍应重新创建应用容器以重新注入其他 Compose 环境变量。
 
 如果数据库卷已经初始化，修改 `.env` 中的 MySQL 密码不会自动修改现有账户。请在第一次建库前设好密码；已有库应通过数据库命令迁移凭据。
 
@@ -155,7 +163,7 @@ docker compose --profile tools up -d adminer
 打开 `http://127.0.0.1:8081`，服务器填写 `mysql`，再使用 `.env` 中的数据库名和应用账户。
 
 > [!WARNING]
-> Compose 中 MySQL 和 Adminer 的宿主端口只绑定本机，但 Web 端口当前使用 `${XP_GACHA_PORT}:8000`，会监听宿主机所有接口。局域网或服务器部署前必须设置强密码，并自行增加防火墙、反向代理、HTTPS 和鉴权。
+> Compose 中 Web、MySQL 和 Adminer 的宿主端口默认都只绑定 `127.0.0.1`。如果自行修改端口映射并向局域网或公网开放，必须设置强密码，并增加防火墙、反向代理、HTTPS 和鉴权；助手页的 LLM 配置管理接口仍会拒绝非本机地址和非本机页面发起的请求。
 
 ## 从源码运行
 
@@ -203,7 +211,7 @@ uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload
 pnpm --dir web dev
 ```
 
-`.env` 文件由 Docker Compose 读取，Python 源码模式不会自动加载它。源码运行时请在 shell 中设置环境变量，或由进程管理器注入。
+Python 源码模式会自动读取项目根目录 `.env`，但不会覆盖进程启动前已经存在的同名环境变量；也可以继续在 shell 中设置变量，或由进程管理器注入。助手页保存 LLM 配置时，源码模式会写入这份根目录 `.env`，并同步更新当前进程，因此下一次对话立即生效。
 
 数据库连接优先级为：
 
@@ -216,10 +224,10 @@ pnpm --dir web dev
 
 | 路由 | 页面 | 主要功能 |
 | --- | --- | --- |
-| `/` | 库存 | 搜索、评分、筛选、排序、分页、封面、行内详情、复制当前页、全局图表 |
+| `/` | 库存 | 搜索、评分、筛选、排序、分页、封面、行内详情、可选悬停大图预览、复制当前页 |
 | `/detail/:id` | 漫画详情 | 完整元数据、原始与解析标签、打开本地目录、来源跳转 |
-| `/chat` | LLM 助手 | 本地/在线兼容 API、SSE 流式回答、库存上下文与引用 |
-| `/history` | 历史记录 | 刷新、逐条/批量删除、确认清空、重新打开、历史偏好图表 |
+| `/chat` | LLM 助手 | 本地/在线兼容 API、连接配置保存、深度思考与回答双流、当前页随机 RAG、Markdown 对话 |
+| `/history` | 历史记录 | 刷新、逐条/批量删除、确认清空、重新打开；历史偏好图表统一在“偏好图表”页查看 |
 | `/charts` | 偏好图表 | 全局/历史切换，标签、作者、标题词 Top 15 与 Top 150 |
 | `/admin` | 附录 | 一键导入、系统状态、26 个白名单数据任务、输出与中止 |
 | `/api/docs` | API 文档 | FastAPI 交互式 OpenAPI 文档 |
@@ -271,13 +279,16 @@ pnpm --dir web dev
 
 ### 固定布局与行内详情
 
+- 数据库可用但尚无馆藏时，库存页会隐藏无意义的排序与表格工具，显示从 Hugging Face 下载 `input_data.zip`、跳转一键导入、等待完成并返回库存的四步引导；数据库断连或仅筛选无结果时不会误显示该引导。
 - 表格采用固定比例列宽，总宽度适配当前容器，不依赖横向滚动查看右侧字段。
-- 大页使用虚拟滚动，只渲染视口附近的行。
+- 目录滚动区的最大高度会随窗口在 `720–1040px` 范围内扩展；大页使用虚拟滚动，只渲染视口附近的行。
 - 相关度列只在对应检索启用时显示。
 - 支持全局升序/降序和按推荐分、相关度、ID、日期、标题、作者、团队、标签、语言、页数、本地路径排序。
 - 可一键复制当前页为制表符分隔文本，也可批量提交当前页封面刷新。
 - 点击首列一次即可选择；选中后在当前行下直接展开完整信息，再次点击取消。
-- 展开内容包括封面、摘要、作者、团队、语言、页数、日期、基础/推荐分、三种相关度、标题词、原始标签、文件名、本地路径、来源链接和搜索文本。
+- 展开内容包括封面、摘要、作者、团队、语言、页数、日期、基础/推荐分、三种相关度、标题词、完整解析标签、文件名、本地路径和来源链接；原始未解析标签仍只在漫画详情页显示。
+- 右侧大图预览可在工具栏中展开或收起，是否显示的偏好会保存在当前浏览器；首次使用时宽屏默认展开，窄于 `1440px` 的窗口默认收起。开启后，鼠标悬停目录行或键盘聚焦行内操作会切换预览，移开时回到当前选中条目。
+- 库存主页不再重复显示全局偏好图表，目录表格直接向下占用这部分空间；完整图表仍在“偏好图表”页查看。
 
 选择条目本身不会写入历史；只有打开本地目录或网络来源时才记录。
 
@@ -301,22 +312,28 @@ pnpm --dir web dev
 ### 历史与图表
 
 - 默认保留最近 50 次“打开本地目录”或“打开网络来源”记录。
-- 源码/Docker 默认写入 `datacache/recommendation_history.json`；便携版写入 `userdata/datacache/recommendation_history.json`。
+- 源码版和便携版都默认写入项目/发行包根目录的 `datacache/recommendation_history.json`；Docker 容器中对应 `/app/datacache/recommendation_history.json`。
 - 支持刷新、单条删除、复选批量删除和二次确认清空。
 - 历史中的标签、作者和标题词会参与后续评分。
 - 全局和历史图表均提供标签、作者、标题词 Top 15 条形图和可展开 Top 150 数据表。
-- 库存页底部的全局图表进入视口后才加载。
 
 ### LLM 助手
 
 - 支持本地 LM Studio 和线上 OpenAI 兼容 API。
-- 可调 Temperature、最大 Tokens 和上下文条目数量。
-- 后端通过 Server-Sent Events 流式转发回答。
-- 可识别 `<think>...</think>` 与 `Thinking Process:`，思考过程折叠显示。
+- 在本地/线上模式之间切换后，可直接填写对应的 API URL、模型名和 API Key 并保存；URL 应填写 OpenAI 兼容根地址，服务会追加 `/chat/completions`。
+- 保存目标随运行方式自动选择：源码写项目根目录 `.env`，Docker 写宿主项目根目录 `.env`，Windows 便携版写包根目录 `portable-settings.env`。
+- 保存后下一次对话立即使用新配置，不需要重启服务；留空 Key 会保留原值，也可以显式清除。
+- 已保存的 Key 不会由后端明文回传，界面只显示“已配置/未配置”状态。本机配置接口仅接受通过 `127.0.0.1`、`localhost` 或 `::1` 访问的本机页面请求。
+- 可调 Temperature、最大 Tokens 和随机注入条目数量，并可逐轮开启或关闭深度思考模式。
+- 每次提问只会从库存主页当前页已经显示的条目中无放回随机抽取 N 条，不会固定取排序前 N 条，也不会在当前页为空时回退到全库抽取。
+- 后端通过 Server-Sent Events 分别流式转发真实的思考与回答；支持 `reasoning_content`、`reasoning`，并兼容跨流分块的 `<think>...</think>`。
+- 思考开始后会自动展开，回答开始或思考结束后自动折叠，完成后仍可手动重新展开；请求模式、Temperature 等参数单独显示，不会冒充思考内容。
+- 官方 DeepSeek API 使用 `thinking.type` 控制思考开关，阿里云百炼兼容接口使用 `enable_thinking`；其他兼容接口不会被强行注入供应商私有参数，但其实际返回的独立思考流仍会显示。
+- 用户名称显示为 `YOU`，用户发言与助手回答使用相同正文尺寸；输入、回答和思考过程均支持安全的 Markdown/GFM 渲染，原始 HTML 不会执行。
 - 旧对话折叠，最近一次问答保持展开。
-- 上下文条目以封面、ID、标题和作者链接回详情页。
+- 本轮实际注入的条目列表默认折叠，展开后可通过封面、ID、标题和作者信息返回详情页；条目快照不会因随后切换分页而消失。
 
-当前上下文从当前分页和当前排序结果的前 N 条取得，不是对全部筛选结果随机抽样。聊天和任务输出只保存在当前进程/浏览器状态中，重启后不会恢复。
+聊天和任务输出只保存在当前进程/浏览器状态中，重启后不会恢复。是否能产生独立思考流仍取决于所选模型和接口；未返回 reasoning 字段时，页面不会用请求参数伪造思考过程。
 
 ## 一键导入词典与数据
 
@@ -382,7 +399,7 @@ CSV 导入完成后会优化 MySQL 表与全文索引；所有成功导入都会
 <XP_GACHA_DATA_ROOT>/data/gallery_info/*.csv
 ```
 
-源码/Docker 默认对应项目的 `data/gallery_info`；便携版对应 `userdata/data/gallery_info`。上传导入使用临时文件，结束后会删除临时副本，请自行保留原始 CSV/ZIP。
+源码版和便携版都对应项目/发行包根目录的 `data/gallery_info`；Docker 容器中对应 `/app/data/gallery_info`。上传导入使用临时文件，结束后会删除临时副本，请自行保留原始 CSV/ZIP。
 
 ## 附录：数据处理与采集
 
@@ -477,7 +494,7 @@ XP-Gacha/
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `XP_GACHA_ENV` | `development` | `development` 时启用开发 CORS |
-| `XP_GACHA_HOST` | `0.0.0.0` | Uvicorn 监听地址；本机使用建议设为 `127.0.0.1` |
+| `XP_GACHA_HOST` | `127.0.0.1` | Uvicorn 监听地址；只有在已经增加统一鉴权、限流和网络防护后才应改为 `0.0.0.0` |
 | `XP_GACHA_PORT` | `8000` | Web/API 端口 |
 | `XP_GACHA_FRONTEND_DIST` | `web/dist` | React 构建产物 |
 | `XP_GACHA_ALLOW_OPEN_LOCAL` | `true` | 是否允许 Windows 服务端打开本地目录；Docker 强制为 `false` |
@@ -495,7 +512,7 @@ XP-Gacha/
 
 | 环境变量 | 默认值 |
 | --- | --- |
-| `XP_GACHA_DATA_ROOT` | 源码项目根目录；Docker `/app`；便携版 `userdata` |
+| `XP_GACHA_DATA_ROOT` | 源码项目根目录；Docker `/app`；便携版发行包根目录 |
 | `XP_GACHA_BASE_DIR` | `<DATA_ROOT>/library` |
 | `ONLINE_IMG_DIR` | `onlineimgtmp` |
 | `IMG_CACHE_DIR` | `localimgtmp` |
@@ -513,21 +530,22 @@ XP-Gacha/
 | `HISTORY_RECOMMENDATION_CACHE_SIZE` | `50` |
 | `HISTORY_CACHE_FILE` | `datacache/recommendation_history.json` |
 
-### LLM 与在线封面
+### LLM、在线封面与采集
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `LM_STUDIO_API_BASE` | `http://127.0.0.1:1234/v1` | 本地兼容接口 |
+| `LM_STUDIO_API_KEY` | 空 | 本地 API 密钥，可留空 |
 | `LM_STUDIO_MODEL` | `local-model` | 本地模型 |
 | `ONLINE_API_BASE` | 空 | 在线兼容接口 |
 | `ONLINE_API_KEY` | 空 | 在线 API 密钥 |
 | `ONLINE_MODEL` | `deepseek-v4-flash` | 在线模型 |
 | `SYSTEM_PROMPT` | 内置中文提示 | 助手系统提示 |
 | `ONLINE_COVER_FETCH_ENABLED` | `true` | 是否允许在线补抓 |
-| `ONLINE_COVER_PROXY` | 空 | 代理地址，空值直连 |
+| `ONLINE_COVER_PROXY` | 空 | 在线封面与 NH 采集代理，空值直连；Docker 访问宿主机代理使用 `host.docker.internal` |
 | `ONLINE_COVER_FETCH_CONCURRENCY` | `6` | 后台封面并发数 |
 
-不要把含密钥的 `.env`、`portable-settings.env` 或 `userdata/config/portable.json` 提交到版本库或发给他人。
+不要把含密钥的 `.env`、`portable-settings.env` 或 `config/portable.json` 提交到版本库或发给他人。
 
 ## 数据目录、备份与便携版边界
 
@@ -548,10 +566,10 @@ XP-Gacha/
 
 Docker 的 MySQL 数据位于命名卷 `xp-gacha_mysql-data`，不在项目目录 bind mount 中。备份 Docker 环境时要同时备份数据库卷和项目数据目录。
 
-便携版通常把同类目录放到 `userdata`，另有：
+便携版 v0.2.3 起不再使用 `userdata`。它与源码版使用同一套根目录相对路径，业务数据、缓存、模型和便携版运行数据都在发行包根目录并列存放：
 
 ```text
-userdata/
+XP-Gacha-v<version>-portable-win64/
 ├─ config/portable.json
 ├─ mysql/data/
 ├─ data/
@@ -568,28 +586,43 @@ userdata/
 └─ tmp/
 ```
 
-> [!CAUTION]
-> 当前附录任务把表单中的相对路径解析到源码/发行包根目录，而不是 `XP_GACHA_DATA_ROOT`。便携版执行附录任务时，请把路径显式写成 `userdata/data/...`、`userdata/models/...`、`userdata/manga_vectors/...`、`userdata/b64_cache/...` 等。否则任务可能在包根创建 `data`、`models`、`manga_vectors`、`b64_cache`、`logs` 或 `data_processing` 输出。升级前必须检查这些额外目录；仅备份 `userdata` 可能漏数据。自定义到包外的绝对漫画目录也需单独备份。
+附录任务的默认相对路径现在在源码版和便携版中完全一致。例如直接填写 `data/gallery_info`、`models/Qwen3-Embedding-0.6B`、`manga_vectors/manga_vectors_Qwen3.pkl` 或 `b64_cache`，均会解析到项目/发行包根目录。自定义到包外的绝对漫画目录仍需单独备份。
 
 ## 更新 Windows 便携包
 
-当前没有联网自动更新器、自动数据库迁移器或失败自动回滚。采用“新目录解压 + 数据迁移 + 保留旧版回滚”的手动升级流程：
+当前没有联网自动更新器、自动数据库迁移器或失败自动回滚。采用“新目录解压 + 数据迁移 + 保留旧版回滚”的手动升级流程。
 
-1. 在旧版运行 `Stop XP-Gacha.cmd`，确认程序和 MySQL 已停止。
-2. 备份旧版整个 `userdata`，不要只复制 `userdata/mysql/data`。
-3. 备份或记录旧版 `portable-settings.env` 的自定义项。
-4. 检查旧包根目录是否有附录任务生成的额外数据。
-5. 把新版 ZIP 解压到新的版本目录，不要直接覆盖旧版目录。
-6. 比较新旧 `BUILD-INFO.json` 中的 `runtime.mysql.version`。
-7. 若内置 MySQL 版本一致，删除新版尚未使用的空 `userdata`，再把旧版整个 `userdata` 复制到新版；不要合并两个数据目录。
-8. 逐项把旧设置合并进新版 `portable-settings.env`，不要盲目覆盖新版模板。
-9. 把第 4 步发现的包根用户输出迁移到新版对应位置；`data_processing`、`tools` 等同时包含程序代码的目录只能复制用户生成文件，不能用旧目录整体覆盖新版代码。优先迁移到 `userdata/...` 并同步修改任务路径。
-10. 启动新版，核对库存、历史、词典、封面、模型和漫画目录。
-11. 保留旧版目录作为回滚，确认稳定后再删除。
+### 从 v0.2.2 迁移到 v0.2.3
 
-MySQL 正在运行时，绝不能复制其原始数据目录。若新旧包内 MySQL 版本不同，不保证 `mysql/data` 可直接迁移；应等待该版本的迁移说明，或先使用逻辑导出/导入。
+v0.2.2 的数据位于 `userdata`，v0.2.3 起改为发行包根目录并列存放。迁移前必须在旧版运行 `Stop XP-Gacha.cmd`，确认 XP-Gacha 和 MySQL 已完全停止，再备份旧包整个 `userdata` 和 `portable-settings.env`。不要直接覆盖旧版目录，应把 v0.2.3 ZIP 解压到新目录。
 
-默认词典只会在 `userdata/dictionaries` 中对应文件不存在时播种；迁移旧 `userdata` 后，新包不会覆盖用户自定义词典。
+将下列旧版目录逐一复制到 v0.2.3 新包根目录的同名位置：
+
+| v0.2.2 源路径 | v0.2.3 目标路径 | 说明 |
+| --- | --- | --- |
+| `userdata/data` | `data` | CSV 和本地输入数据 |
+| `userdata/datacache` | `datacache` | 预处理缓存、历史、导入备份 |
+| `userdata/b64_cache` | `b64_cache` | Base64 封面缓存 |
+| `userdata/b64_tmp` | `b64_tmp` | Base64 增量缓存 |
+| `userdata/localimgtmp` | `localimgtmp` | 本地缩略图 |
+| `userdata/onlineimgtmp` | `onlineimgtmp` | 在线封面 |
+| `userdata/library` | `library` | 默认漫画目录 |
+| `userdata/manga_vectors` | `manga_vectors` | 文本与封面向量 |
+| `userdata/models` | `models` | 本地模型与模型缓存 |
+| `userdata/mysql` | `mysql` | 包内 MySQL 数据；必须与 `config` 成套迁移 |
+| `userdata/config` | `config` | 包含 MySQL 随机凭据；必须与 `mysql` 成套迁移 |
+| `userdata/logs` | `logs` | 运行和 MySQL 日志，可选 |
+| `userdata/cache` | `models/cache/xdg` | 旧版其他工具缓存，可选；通常可不迁移 |
+| `userdata/dictionaries/*` | `dictionaries/` | 将自定义词典文件复制到新包的根词典目录 |
+
+`userdata/run` 和 `userdata/tmp` 是临时目录，不要迁移。若旧包根目录已有附录任务产生的 `data`、`models`、`manga_vectors`、`b64_cache` 或其他输出，也要在停机后与对应新目录仔细合并。`data_processing`、`tools` 等同时包含程序代码的目录只能复制用户生成文件，不能整个覆盖新版代码。
+
+> [!CAUTION]
+> `mysql` 与 `config` 必须来自同一份完整备份并成套迁移。绝不能只复制 `mysql/data`、只复制 `config/portable.json`，或把两个不同实例的目录混用；启动器检测到只存在其中一项时会直接中止，避免静默初始化空库。MySQL 正在运行时也绝不能复制其原始数据目录。若新旧 `BUILD-INFO.json` 中的 `runtime.mysql.version` 不同，不保证原始 `mysql/data` 可直接迁移；应改用逻辑导出/导入或等待对应迁移说明。
+
+逐项把旧设置合并进新版 `portable-settings.env`，启动新版后核对库存、历史、词典、封面、模型和漫画目录。保留旧版目录作为回滚，确认稳定后再删除。
+
+v0.2.3 之后在两个根目录并列布局版本之间升级时，仍要先停机并完整备份所有数据目录；`mysql` 和 `config` 始终必须作为一个整体备份与迁移。
 
 ## 构建 Windows 便携发行版
 
@@ -634,7 +667,7 @@ MySQL 正在运行时，绝不能复制其原始数据目录。若新旧包内 M
 5. 执行依赖自检；
 6. 对空 MySQL 数据库执行首次启动 smoke test；
 7. 使用已生成的数据库凭据执行第二次重启 smoke test；
-8. 清空验证产生的 `userdata`；
+8. 清空验证产生的 MySQL、配置、日志、缓存等根目录运行数据；
 9. 审计发行包不含业务数据；
 10. 生成 `BUILD-INFO.json`、`requirements-lock.txt`、逐文件 SHA-256、ZIP 和 ZIP 校验值。
 
@@ -653,7 +686,9 @@ MySQL 正在运行时，绝不能复制其原始数据目录。若新旧包内 M
 
 正式发布不要使用 `-SkipVerification`；否则 `BUILD-INFO.json` 会记录首次启动未验证。下载和 pip 缓存位于项目的 `.portable-cache`，不会进入发行包。
 
-`-Force` 会递归删除输出目录中精确同版本的发行目录、ZIP 和校验文件。不要对已经放入真实 `userdata` 的活动发行目录使用它。推荐先更新 `server/__init__.py` 的版本号，再构建一个新的版本目录。
+根目录 `dictionaries` 中四个基础词典文件属于程序默认配置并纳入版本控制；构建只把这四个默认词典作为初始内容带入无数据发行包，漫画、数据库、历史、模型、向量和缓存仍不会打包。
+
+`-Force` 会递归删除输出目录中精确同版本的发行目录、ZIP 和校验文件。不要对已经含有真实 `data`、`mysql`、`config`、模型、封面或其他用户数据的活动发行目录使用它。推荐先更新 `server/__init__.py` 的版本号，再构建一个新的版本目录。
 
 推荐发布顺序：
 
@@ -678,12 +713,14 @@ MySQL 正在运行时，绝不能复制其原始数据目录。若新旧包内 M
 | 历史 | `GET/POST/DELETE /api/history`、`DELETE /api/history/all` |
 | 打开/跳转 | `POST /api/gallery/{id}/open-local`、`GET /api/track/{id}` |
 | 图表 | `GET /api/charts/global`、`GET /api/charts/history` |
-| LLM | `POST /api/chat/stream` |
+| LLM | `POST /api/chat/stream`、`GET/PUT /api/chat/settings` |
 | 任务 | `GET /api/scripts`、`POST /api/jobs`、`GET /api/jobs/{id}`、`POST /api/jobs/{id}/cancel` |
 | 导入 | `POST /api/import/bundle`、`POST /api/import/project` |
 | 偏好 | `GET/PUT /api/preferences` |
 
 `/api/preferences` 当前只提供列宽 JSON 的后端读写兼容接口，React 表格没有接入可视化列宽编辑，实际使用固定比例列宽。
+
+`/api/chat/settings` 是仅供助手页使用的本机配置管理接口：它拒绝非回环地址，写请求还需要同源页面校验标记；响应只包含 URL、模型名和 Key 是否已配置，不包含 Key 明文。
 
 ## 测试与校验
 
@@ -736,6 +773,16 @@ docker compose logs --tail 200 app mysql
 
 确认 `.env` 中的 Web/MySQL 端口没有被占用，并检查 `http://127.0.0.1:<XP_GACHA_PORT>/api/health`；未改配置时端口为 `8000`。第一次镜像构建会下载 CPU AI 依赖，耗时和磁盘占用都明显高于普通 Web 项目。
 
+### NH 在线采集提示 `curl (7) ... over proxy 127.0.0.1`
+
+新版 NH 采集器不再强制使用 `127.0.0.1:7890`，而是统一读取 `ONLINE_COVER_PROXY`。留空时明确直连；源码和便携版连接本机代理可填 `http://127.0.0.1:7890`。Docker 容器中的 `127.0.0.1` 指向容器自身，连接 Windows 宿主机代理必须填：
+
+```dotenv
+ONLINE_COVER_PROXY=http://host.docker.internal:7890
+```
+
+修改 `.env` 或更新采集器代码后，执行 `docker compose up -d --build app` 重建应用容器。若所有列表页都请求失败，任务现在会标记为失败，不再以 `[JOB] completed` 掩盖网络故障。
+
 ### 库存为空
 
 这是无数据发行版的正常状态。进入 `/admin` 上传 CSV/ZIP，或把 CSV 放入 `<XP_GACHA_DATA_ROOT>/data/gallery_info` 后点击“导入项目 data/gallery_info”。
@@ -755,7 +802,7 @@ models/clip-vit-base-patch32
 manga_vectors/clip_image_index.pkl
 ```
 
-需要时在“附录 → 缓存与向量”构建。便携版路径应显式填写 `userdata/models/...` 和 `userdata/manga_vectors/...`。
+需要时在“附录 → 缓存与向量”构建。源码版和便携版都直接使用 `models/...` 和 `manga_vectors/...` 路径。
 
 ### 便携版浏览器没有自动打开
 
@@ -766,21 +813,21 @@ manga_vectors/clip_image_index.pkl
 依次查看：
 
 ```text
-userdata/logs/mysql-initialize.log
-userdata/logs/mysql-error.log
-userdata/logs/mysql-console.log
-userdata/logs/app.log
+logs/mysql-initialize.log
+logs/mysql-error.log
+logs/mysql-console.log
+logs/app.log
 ```
 
-如果提示“MySQL 数据目录不完整且非空”，先停止程序并备份整个 `userdata`，不要直接删除。只有确认从未导入数据且允许完全重建时，才考虑清理旧数据。
+如果提示“MySQL 数据目录不完整且非空”，先停止程序并成套备份根目录 `mysql` 与 `config`，不要直接删除。只有确认从未导入数据且允许完全重建时，才考虑清理旧数据。
 
 ### `ERROR 1045 ... using password: NO`
 
-先查看 `BUILD-INFO.json`，确认使用的是 `v0.2.1`，不是旧的 `v0.2.0` 启动器。`v0.2.1` 已加入 MySQL 8.4 公钥认证参数。
+先查看 `BUILD-INFO.json`，确认使用的是当前 `v0.2.5`，不是旧的 `v0.2.0` 启动器。`v0.2.1` 及以后版本已加入 MySQL 8.4 公钥认证参数。
 
 同时确认：
 
-- `userdata/mysql` 与 `userdata/config/portable.json` 来自同一份完整备份；
+- 根目录 `mysql` 与 `config/portable.json` 来自同一份完整备份；
 - 没有单独删除或重建 `portable.json`；
 - 旧版程序已经完全停止。
 
@@ -800,7 +847,6 @@ userdata/logs/app.log
 - 任务状态、终端输出和聊天记录不持久化，服务重启后丢失。
 - 通用任务“超时秒数”尚未由任务管理器强制执行。
 - 便携版当前没有自动更新器，升级采用手动迁移。
-- 便携版附录任务的相对路径仍以发行包根目录解析，使用时应显式加 `userdata/`。
 
 ## Legacy Streamlit
 

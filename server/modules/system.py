@@ -6,6 +6,10 @@ import config
 from server.database import database_status
 
 
+QWEN_MODEL_URL = "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B"
+CLIP_MODEL_URL = "https://huggingface.co/openai/clip-vit-base-patch32"
+
+
 def _count_files(path: str, pattern: str = "*") -> int:
     directory = Path(path)
     if not directory.exists():
@@ -23,15 +27,109 @@ def _file_status(label: str, path: str) -> dict:
     }
 
 
+def _model_status(label: str, path: str, download_url: str, required_entries: tuple[str, ...] = ()) -> dict:
+    target = Path(path)
+    exists = target.is_dir()
+    has_config = (target / "config.json").is_file() and (target / "config.json").stat().st_size > 0
+    has_weight = any(
+        candidate.is_file() and candidate.stat().st_size > 0
+        for pattern in ("*.safetensors", "pytorch_model*.bin")
+        for candidate in target.glob(pattern)
+    ) if exists else False
+    required_ready = all(
+        (target / entry).is_file() and (target / entry).stat().st_size > 0
+        for entry in required_entries
+    )
+    ready = exists and has_config and has_weight and required_ready
+    return {
+        "kind": "model",
+        "label": label,
+        "path": str(target),
+        "exists": exists,
+        "ready": ready,
+        "state": "ready" if ready else ("incomplete" if exists else "missing"),
+        "downloadUrl": download_url,
+    }
+
+
+def _vector_status(label: str, path: str) -> dict:
+    target = Path(path)
+    exists = target.is_file()
+    ready = exists and target.stat().st_size > 0
+    return {
+        "kind": "vector",
+        "label": label,
+        "path": str(target),
+        "exists": exists,
+        "ready": ready,
+        "state": "ready" if ready else ("incomplete" if exists else "missing"),
+        "generatedLocally": True,
+    }
+
+
+def _search_capabilities() -> dict:
+    semantic_model = _model_status(
+        "Qwen3-Embedding-0.6B",
+        config.LOCAL_MODEL_PATH,
+        QWEN_MODEL_URL,
+        required_entries=("modules.json", "tokenizer.json", "1_Pooling/config.json"),
+    )
+    semantic_vector = _vector_status("文本语义向量", config.VECTOR_FILE)
+    clip_model = _model_status(
+        "CLIP ViT-B/32",
+        config.CLIP_MODEL_PATH,
+        CLIP_MODEL_URL,
+        required_entries=("preprocessor_config.json", "tokenizer.json"),
+    )
+    clip_vector = _vector_status("封面向量索引", config.IMG_VECTOR_FILE)
+
+    semantic_missing = [
+        kind for kind, dependency in (("model", semantic_model), ("vector", semantic_vector))
+        if not dependency["ready"]
+    ]
+    cover_missing = [
+        kind for kind, dependency in (("model", clip_model), ("vector", clip_vector))
+        if not dependency["ready"]
+    ]
+    return {
+        "semantic": {
+            "label": "AI 语义检索",
+            "ready": not semantic_missing,
+            "missing": semantic_missing,
+            "dependencies": {"model": semantic_model, "vector": semantic_vector},
+            "setup": {
+                "section": "cache",
+                "scriptId": "text-vector",
+                "actionLabel": "构建文本语义向量",
+            },
+        },
+        "cover": {
+            "label": "封面相似检索",
+            "ready": not cover_missing,
+            "idReady": clip_vector["ready"],
+            "uploadReady": clip_model["ready"] and clip_vector["ready"],
+            "missing": cover_missing,
+            "dependencies": {"model": clip_model, "vector": clip_vector},
+            "setup": {
+                "section": "cache",
+                "scriptId": "clip-vector",
+                "actionLabel": "构建或刷新封面 CLIP 向量",
+            },
+        },
+    }
+
+
 class SystemModule:
     def status(self) -> dict:
         db = database_status()
+        search_capabilities = _search_capabilities()
         return {
             "database": db,
             "models": {
-                "semantic": Path(config.LOCAL_MODEL_PATH).exists(),
-                "clip": Path(config.CLIP_MODEL_PATH).exists(),
+                "semantic": search_capabilities["semantic"]["dependencies"]["model"]["ready"],
+                "clip": search_capabilities["cover"]["dependencies"]["model"]["ready"],
             },
+            "searchCapabilities": search_capabilities,
             "counts": {
                 "csv": _count_files(str(Path(config.DATA_ROOT) / "data" / "gallery_info"), "*.csv"),
                 "onlineCovers": _count_files(config.ONLINE_IMG_DIR),

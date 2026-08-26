@@ -6,7 +6,11 @@
 /.env.local
 /data
 /datacache
-/dictionaries
+/dictionaries/*
+!/dictionaries/STOP_TAGS.txt
+!/dictionaries/SEMANTIC_MAP.json
+!/dictionaries/TITLE_STOP_WORDS.txt
+!/dictionaries/TITLE_SEMANTIC_MAP.json
 /localimgtmp
 /manga_vectors
 /models
@@ -16,6 +20,11 @@
 *.py[cod]
 *$py.class
 /logs
+/mysql/
+/config/
+/run/
+/tmp/
+/library/
 /output1
 /data_processing/title_translation_results.jsonl
 /web/node_modules

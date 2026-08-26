@@ -32,7 +32,7 @@ except ImportError:
 try:
     from config import ONLINE_COVER_PROXY
 except ImportError:
-    ONLINE_COVER_PROXY = "http://127.0.0.1:7890"
+    ONLINE_COVER_PROXY = ""
 
 try:
     from config import ONLINE_COVER_FETCH_CONCURRENCY

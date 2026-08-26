@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   BrainCircuit,
   ChevronLeft,
   ChevronRight,
@@ -6,8 +7,9 @@ import {
   Image,
   Search,
 } from "lucide-react";
-import { useDeferredValue, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { searchCoverFile, searchMetaOptions, type OptionKind, type OptionSearchResponse } from "../api/client";
+import { memo, useCallback, useDeferredValue, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { getSystemStatus, searchCoverFile, searchMetaOptions, type OptionKind, type OptionSearchResponse, type SystemStatus } from "../api/client";
+import { SearchUnavailableDialog, type SearchCapabilityKind } from "./SearchUnavailableDialog";
 import { titleWordOptions, useAppState, type WeightState } from "../state/AppState";
 
 type MarginPanelProps = { open: boolean; onToggle: () => void };
@@ -316,14 +318,86 @@ function DynamicWeights({ values, onChange, step = 0.1, fallback = 1 }: {
   );
 }
 
-export function MarginPanel({ open, onToggle }: MarginPanelProps) {
-  const { filters, setFilters, meta, backendStatus, catalogLoading, flash } = useAppState();
+export const MarginPanel = memo(function MarginPanel({ open, onToggle }: MarginPanelProps) {
+  const { filters, setFilters, meta, backendStatus, catalogLoading, catalogWarnings, flash } = useAppState();
   const [coverPreview, setCoverPreview] = useState("");
   const [coverSearching, setCoverSearching] = useState(false);
+  const [manualCoverError, setManualCoverError] = useState("");
+  const [diagnosticOpen, setDiagnosticOpen] = useState(false);
+  const [diagnosticKinds, setDiagnosticKinds] = useState<SearchCapabilityKind[]>([]);
+  const [diagnosticErrors, setDiagnosticErrors] = useState<string[]>([]);
+  const [diagnosticStatus, setDiagnosticStatus] = useState<SystemStatus | null>(null);
+  const [diagnosticLoading, setDiagnosticLoading] = useState(false);
+  const [diagnosticStatusError, setDiagnosticStatusError] = useState("");
+  const semanticInputRef = useRef<HTMLInputElement>(null);
+  const coverInputRef = useRef<HTMLInputElement>(null);
+  const coverFileInputRef = useRef<HTMLInputElement>(null);
+  const coverFileControlRef = useRef<HTMLLabelElement>(null);
+  const coverSearchRequestRef = useRef(0);
+  const diagnosticTriggerRef = useRef<HTMLElement | null>(null);
+  const diagnosticRequestRef = useRef(0);
+  const automaticWarningRef = useRef("");
   const tagOptions = meta.tags.length ? meta.tags : [...new Set(Object.keys(filters.tagWeights))].sort((a, b) => a.localeCompare(b, "zh-CN"));
   const artistOptions = meta.artists;
   const availableTitleWords = meta.titleWords.length ? meta.titleWords : titleWordOptions;
   const patchFilters = (patch: Partial<typeof filters>) => setFilters((current) => ({ ...current, ...patch }));
+  const semanticWarnings = useMemo(
+    () => catalogWarnings.filter((warning) => warning.startsWith("语义检索不可用：")),
+    [catalogWarnings],
+  );
+  const coverWarnings = useMemo(
+    () => catalogWarnings.filter((warning) => warning.startsWith("封面检索不可用：")),
+    [catalogWarnings],
+  );
+  const openSearchDiagnostics = useCallback((
+    kinds: SearchCapabilityKind[],
+    errors: string[],
+    trigger?: HTMLElement | null,
+  ) => {
+    diagnosticTriggerRef.current = trigger
+      ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    setDiagnosticKinds([...new Set(kinds)]);
+    setDiagnosticErrors([...new Set(errors)]);
+    setDiagnosticStatus(null);
+    setDiagnosticStatusError("");
+    setDiagnosticLoading(true);
+    setDiagnosticOpen(true);
+    const requestId = diagnosticRequestRef.current + 1;
+    diagnosticRequestRef.current = requestId;
+    void getSystemStatus()
+      .then((payload) => {
+        if (diagnosticRequestRef.current === requestId) setDiagnosticStatus(payload);
+      })
+      .catch((error: Error) => {
+        if (diagnosticRequestRef.current === requestId) setDiagnosticStatusError(error.message);
+      })
+      .finally(() => {
+        if (diagnosticRequestRef.current === requestId) setDiagnosticLoading(false);
+      });
+  }, []);
+
+  const closeSearchDiagnostics = useCallback(() => {
+    setDiagnosticOpen(false);
+    window.requestAnimationFrame(() => diagnosticTriggerRef.current?.focus());
+  }, []);
+
+  const automaticWarningSignature = [...semanticWarnings, ...coverWarnings].join("\n");
+  useEffect(() => {
+    if (!automaticWarningSignature) {
+      automaticWarningRef.current = "";
+      return;
+    }
+    if (automaticWarningRef.current === automaticWarningSignature) return;
+    automaticWarningRef.current = automaticWarningSignature;
+    const kinds: SearchCapabilityKind[] = [];
+    if (semanticWarnings.length) kinds.push("semantic");
+    if (coverWarnings.length) kinds.push("cover");
+    openSearchDiagnostics(
+      kinds,
+      [...semanticWarnings, ...coverWarnings],
+      semanticWarnings.length ? semanticInputRef.current : coverInputRef.current,
+    );
+  }, [automaticWarningSignature, coverWarnings, openSearchDiagnostics, semanticWarnings]);
 
   const setSelectedWeights = (
     key: "tagWeights" | "artistWeights" | "titleWeights",
@@ -351,7 +425,7 @@ export function MarginPanel({ open, onToggle }: MarginPanelProps) {
         <header className="margin-heading">
           <span className="section-code">MARGIN NOTES / 01</span>
           <h2>筛选与偏好</h2>
-          <p>完整复刻原版筛选、权重与检索入口。</p>
+          <p>集中设置关键词检索、相似度查询、评分权重与最低分阈值。</p>
         </header>
 
         <section className="note-group">
@@ -374,38 +448,100 @@ export function MarginPanel({ open, onToggle }: MarginPanelProps) {
           <label htmlFor="editorial-semantic">AI 语义检索</label>
           <div className="editorial-input">
             <BrainCircuit size={15} strokeWidth={1.5} aria-hidden="true" />
-            <input id="editorial-semantic" value={filters.semanticQuery} onChange={(event) => patchFilters({ semanticQuery: event.target.value })} placeholder="例如：猫娘与森林" />
+            <input
+              ref={semanticInputRef}
+              id="editorial-semantic"
+              value={filters.semanticQuery}
+              aria-invalid={semanticWarnings.length > 0}
+              aria-describedby={semanticWarnings.length ? "semantic-capability-error" : undefined}
+              onChange={(event) => patchFilters({ semanticQuery: event.target.value })}
+              placeholder="例如：猫娘与森林"
+            />
           </div>
+          {semanticWarnings.length > 0 && (
+            <div id="semantic-capability-error" className="capability-inline-alert" role="alert">
+              <AlertTriangle size={14} aria-hidden="true" />
+              <span>语义检索不可用</span>
+              <button type="button" onClick={(event) => openSearchDiagnostics(["semantic"], semanticWarnings, event.currentTarget)}>查看缺失项与修复步骤</button>
+            </div>
+          )}
           <details className="nested-note">
             <summary>封面相似检索 · CLIP</summary>
             <label htmlFor="editorial-cover">输入库内条目 ID</label>
             <div className="editorial-input">
               <Image size={15} strokeWidth={1.5} aria-hidden="true" />
-              <input id="editorial-cover" className="mono" value={filters.coverQuery} onChange={(event) => patchFilters({ coverQuery: event.target.value.toUpperCase() })} placeholder="JM114514 / NH123456" />
+              <input
+                ref={coverInputRef}
+                id="editorial-cover"
+                className="mono"
+                value={filters.coverQuery}
+                aria-invalid={coverWarnings.length > 0}
+                aria-describedby={coverWarnings.length ? "cover-id-capability-error" : undefined}
+                onChange={(event) => patchFilters({ coverQuery: event.target.value.toUpperCase() })}
+                placeholder="JM114514 / NH123456"
+              />
             </div>
-            <label className="file-control">
+            <label ref={coverFileControlRef} className="file-control" tabIndex={-1}>
               <FileImage size={15} />
               <span>{filters.coverFileName || "或上传一张图片"}</span>
               <input
+                ref={coverFileInputRef}
                 type="file"
                 accept=".jpg,.jpeg,.png,.webp,.bmp"
+                aria-invalid={Boolean(manualCoverError)}
+                aria-describedby={manualCoverError ? "cover-upload-capability-error" : undefined}
                 onChange={(event) => {
                   const file = event.target.files?.[0];
+                  const requestId = coverSearchRequestRef.current + 1;
+                  coverSearchRequestRef.current = requestId;
+                  setManualCoverError("");
                   patchFilters({ coverFileName: file?.name ?? "", coverMatches: {} });
-                  if (!file) return setCoverPreview("");
+                  if (!file) {
+                    setCoverSearching(false);
+                    setCoverPreview("");
+                    return;
+                  }
                   const reader = new FileReader();
-                  reader.onload = () => setCoverPreview(String(reader.result ?? ""));
+                  reader.onload = () => {
+                    if (coverSearchRequestRef.current === requestId) setCoverPreview(String(reader.result ?? ""));
+                  };
                   reader.readAsDataURL(file);
                   if (backendStatus === "online") {
                     setCoverSearching(true);
                     void searchCoverFile(file).then((payload) => {
+                      if (coverSearchRequestRef.current !== requestId) return;
                       patchFilters({ coverFileName: file.name, coverMatches: Object.fromEntries(payload.results.map((item) => [item.item_id, item.score])) });
+                      setManualCoverError("");
                       flash(`封面向量命中 ${payload.results.length} 条候选`);
-                    }).catch((error: Error) => flash(`封面检索失败：${error.message}`)).finally(() => setCoverSearching(false));
+                    }).catch((error: Error) => {
+                      if (coverSearchRequestRef.current !== requestId) return;
+                      const message = `封面检索不可用：${error.message}`;
+                      patchFilters({ coverFileName: "", coverMatches: {} });
+                      setCoverPreview("");
+                      setManualCoverError(message);
+                      if (coverFileInputRef.current) coverFileInputRef.current.value = "";
+                      openSearchDiagnostics(["cover"], [message], coverFileControlRef.current);
+                    }).finally(() => {
+                      if (coverSearchRequestRef.current === requestId) setCoverSearching(false);
+                    });
                   }
                 }}
               />
             </label>
+            {coverWarnings.length > 0 && (
+              <div id="cover-id-capability-error" className="capability-inline-alert" role="alert">
+                <AlertTriangle size={14} aria-hidden="true" />
+                <span>库内封面 ID 检索不可用</span>
+                <button type="button" onClick={(event) => openSearchDiagnostics(["cover"], coverWarnings, event.currentTarget)}>查看缺失项与修复步骤</button>
+              </div>
+            )}
+            {manualCoverError && (
+              <div id="cover-upload-capability-error" className="capability-inline-alert" role="alert">
+                <AlertTriangle size={14} aria-hidden="true" />
+                <span>上传图片封面检索不可用</span>
+                <button type="button" onClick={(event) => openSearchDiagnostics(["cover"], [manualCoverError], event.currentTarget)}>查看缺失项与修复步骤</button>
+              </div>
+            )}
             {coverPreview && <img className="cover-query-preview" src={coverPreview} alt="当前上传的封面查询图片" />}
             {coverSearching && <p className="control-help mono">CLIP SEARCHING…</p>}
             <p className="control-help">上传图片优先于 ID；在当前候选集内返回封面相似项。</p>
@@ -454,6 +590,17 @@ export function MarginPanel({ open, onToggle }: MarginPanelProps) {
           <p className="footnote"><sup>1</sup> {backendStatus === "online" ? "拖动时先即时预览参数，松开后只提交最终值并重算。" : "后端离线，使用内置样本即时重算。"}</p>
         </section>
       </div>
+      <SearchUnavailableDialog
+        open={diagnosticOpen}
+        kinds={diagnosticKinds}
+        errors={diagnosticErrors}
+        status={diagnosticStatus}
+        loading={diagnosticLoading}
+        statusError={diagnosticStatusError}
+        onClose={closeSearchDiagnostics}
+      />
     </aside>
   );
-}
+});
+
+MarginPanel.displayName = "MarginPanel";

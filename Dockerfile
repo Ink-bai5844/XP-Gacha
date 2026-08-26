@@ -32,6 +32,8 @@ RUN mkdir -p b64_cache b64_tmp data/gallery_info datacache dictionaries \
     localimgtmp logs manga_vectors models onlineimgtmp library
 
 EXPOSE 8000
+# Liveness must stay independent from the large catalogue warm-up. The API
+# health payload intentionally checks MySQL and may be slower while data loads.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
-    CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1
+    CMD curl -fsS http://127.0.0.1:8000/ || exit 1
 CMD ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]

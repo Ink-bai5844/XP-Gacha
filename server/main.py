@@ -5,14 +5,19 @@ import json
 import logging
 import mimetypes
 import os
+import threading
 from contextlib import asynccontextmanager
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
 
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -24,6 +29,7 @@ from server.modules.history import HistoryModule
 from server.modules.imports import ImportModule
 from server.modules.jobs import JobsModule
 from server.modules.library import LibraryModule
+from server.modules.llm_settings import LLMSettingsModule
 from server.modules.preferences import PreferencesModule
 from server.modules.system import SystemModule
 from server.schemas import (
@@ -33,10 +39,11 @@ from server.schemas import (
     ImportModeRequest,
     JobStartRequest,
     LibraryQuery,
+    LLMSettingsRequest,
     PreferencesRequest,
 )
 from server.settings import settings
-from utils_chat import get_ai_response_stream
+from utils_chat import get_ai_response_events
 from utils_core import get_cover_base64
 from utils_history import load_history_entries
 from utils_online_cover import has_cached_cover, is_online_cover_pending, submit_online_cover_fetches
@@ -50,14 +57,50 @@ imports = ImportModule(library)
 jobs = JobsModule(library.refresh)
 system = SystemModule()
 preferences = PreferencesModule()
+llm_settings = LLMSettingsModule()
 
 
-@asynccontextmanager
-async def app_lifespan(_app: FastAPI):
+def _require_local_settings_request(request: Request) -> None:
+    local_hosts = {"127.0.0.1", "localhost", "::1"}
+    if (request.url.hostname or "").lower() not in local_hosts:
+        raise HTTPException(403, "为保护 API Key，只能从本机地址修改 LLM 配置")
+    # In source/portable mode the ASGI server sees the real peer. Docker sees
+    # the bridge gateway instead, so Docker is protected by the loopback-only
+    # published port in docker-compose.yml plus the Host/Origin checks here.
+    if os.getenv("XP_GACHA_RUNTIME_MODE", "source").strip().lower() != "docker":
+        peer = request.client.host if request.client else ""
+        try:
+            peer_is_loopback = ip_address(peer).is_loopback
+        except ValueError:
+            peer_is_loopback = peer.lower() == "localhost"
+        if not peer_is_loopback:
+            raise HTTPException(403, "为保护 API Key，只能从本机浏览器修改 LLM 配置")
+    origin = request.headers.get("origin")
+    if origin and (urlparse(origin).hostname or "").lower() not in local_hosts:
+        raise HTTPException(403, "拒绝来自非本机页面的配置请求")
+    if request.method != "GET" and request.headers.get("x-xp-gacha-settings") != "same-origin":
+        raise HTTPException(403, "配置请求缺少本机页面校验标记")
+
+
+def _warm_library_metadata() -> None:
     try:
         library.meta()
     except Exception:
         logging.getLogger(__name__).exception("Library metadata warm-up failed")
+
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    # Loading and normalizing a large catalogue can take minutes. Keeping it on
+    # the ASGI startup path makes Uvicorn accept TCP connections before it can
+    # answer them, which surfaces as ERR_EMPTY_RESPONSE. Warm the cache in a
+    # daemon thread so health/static routes become available immediately; data
+    # routes safely wait on LibraryModule's existing lock until the cache is ready.
+    threading.Thread(
+        target=_warm_library_metadata,
+        name="xp-gacha-library-warmup",
+        daemon=True,
+    ).start()
     yield
 
 
@@ -69,6 +112,21 @@ def create_app() -> FastAPI:
         openapi_url="/api/openapi.json",
         lifespan=app_lifespan,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_without_llm_secrets(request: Request, exc: RequestValidationError):
+        if request.url.path == "/api/chat/settings":
+            safe_errors = [
+                {key: value for key, value in error.items() if key in {"type", "loc", "msg"}}
+                for error in exc.errors()
+            ]
+            return JSONResponse(
+                status_code=422,
+                content={"detail": jsonable_encoder(safe_errors)},
+                headers={"Cache-Control": "no-store"},
+            )
+        return await request_validation_exception_handler(request, exc)
+
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     if settings.environment == "development":
         app.add_middleware(
@@ -220,25 +278,65 @@ def register_api_routes(app: FastAPI) -> None:
 
     @app.post("/api/chat/stream")
     def chat_stream(request: ChatRequest) -> StreamingResponse:
-        context_ids = request.context_ids
-        if not context_ids and request.context_count > 0:
-            query_result = library.query(LibraryQuery(page_size=request.context_count))
-            context_ids = [item["id"] for item in query_result["items"]]
-        context = library.rows_for_ids(context_ids[: request.context_count])
+        requested_context_ids = request.context_ids[: request.context_count]
+        context = library.rows_for_ids(requested_context_ids)
+        context_ids = (
+            context["ID"].astype(str).tolist()
+            if not context.empty and "ID" in context.columns
+            else []
+        )
 
         def event_stream():
             yield f"data: {json.dumps({'type': 'meta', 'contextIds': context_ids}, ensure_ascii=False)}\n\n"
-            for chunk in get_ai_response_stream(
+            reasoning_started = False
+            reasoning_finished = False
+            for event in get_ai_response_events(
                 request.query,
                 context,
                 api_mode=request.api_mode,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
+                deep_thinking=request.deep_thinking,
             ):
-                yield f"data: {json.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
+                event_type = event.get("type")
+                if event_type == "reasoning":
+                    reasoning_started = True
+                elif event_type in {"content", "error"} and reasoning_started and not reasoning_finished:
+                    reasoning_finished = True
+                    yield f"data: {json.dumps({'type': 'reasoning_done'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if reasoning_started and not reasoning_finished:
+                yield f"data: {json.dumps({'type': 'reasoning_done'}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/chat/settings")
+    def get_chat_settings(request: Request) -> JSONResponse:
+        _require_local_settings_request(request)
+        return JSONResponse(llm_settings.status(), headers={"Cache-Control": "no-store"})
+
+    @app.put("/api/chat/settings")
+    def put_chat_settings(request: Request, payload: LLMSettingsRequest) -> JSONResponse:
+        _require_local_settings_request(request)
+        try:
+            saved = llm_settings.update(
+                local_api_base=payload.local_api_base,
+                local_model=payload.local_model,
+                local_api_key=payload.local_api_key.get_secret_value() if payload.local_api_key else None,
+                clear_local_api_key=payload.clear_local_api_key,
+                online_api_base=payload.online_api_base,
+                online_model=payload.online_model,
+                online_api_key=payload.online_api_key.get_secret_value() if payload.online_api_key else None,
+                clear_online_api_key=payload.clear_online_api_key,
+            )
+        except OSError as exc:
+            raise HTTPException(500, f"无法写入 {llm_settings.settings_file().name}：{exc}") from exc
+        return JSONResponse(saved, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/scripts")
     def scripts() -> dict:

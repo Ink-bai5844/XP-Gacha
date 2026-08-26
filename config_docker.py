@@ -51,6 +51,7 @@ BASE_DIR = os.getenv("XP_GACHA_BASE_DIR", "/library")
 
 # LM Studio 配置。容器访问宿主机服务时用 host.docker.internal。
 LM_STUDIO_API_BASE = os.getenv("LM_STUDIO_API_BASE", "http://host.docker.internal:1234/v1")
+LM_STUDIO_API_KEY = os.getenv("LM_STUDIO_API_KEY", "")
 LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "local-model")
 
 # 线上 AI 配置
@@ -70,7 +71,7 @@ INITIAL_TAG_WEIGHTS = {
     "NTR(netorare)": env_float("INITIAL_TAG_WEIGHT_NTR", -2.0),
 }
 
-# 线上封面实时抓取。容器内如需走宿主机代理可设 ONLINE_COVER_PROXY=http://host.docker.internal:7890
+# 线上封面与 NH 采集。容器内如需走宿主机代理可设 ONLINE_COVER_PROXY=http://host.docker.internal:7890
 ONLINE_COVER_FETCH_ENABLED = os.getenv("ONLINE_COVER_FETCH_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 ONLINE_COVER_PROXY = os.getenv("ONLINE_COVER_PROXY", "")
 ONLINE_COVER_FETCH_CONCURRENCY = env_int("ONLINE_COVER_FETCH_CONCURRENCY", 6)

@@ -1,15 +1,31 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ChevronDown,
   Clipboard,
+  Eye,
+  EyeOff,
   RefreshCw,
 } from "lucide-react";
-import { CatalogTable } from "../components/CatalogTable";
+import { CatalogCoverPreview, CatalogTable, type DisplayItem } from "../components/CatalogTable";
+import { CatalogImportGuide } from "../components/CatalogImportGuide";
 import { MarginPanel } from "../components/MarginPanel";
-import { PreferenceCharts } from "../components/PreferenceCharts";
 import { refreshCovers } from "../api/client";
 import { useAppState, useCatalogResults, type SortKey } from "../state/AppState";
+
+const COVER_PREVIEW_STORAGE_KEY = "xp-gacha.catalog.cover-preview";
+
+function initialCoverPreviewState() {
+  try {
+    const stored = window.localStorage.getItem(COVER_PREVIEW_STORAGE_KEY);
+    if (stored === "on" || stored === "off") return stored === "on";
+  } catch {
+    // Fall through to the viewport-aware default.
+  }
+  return typeof window.matchMedia === "function"
+    ? window.matchMedia("(min-width: 1440px)").matches
+    : window.innerWidth >= 1440;
+}
 
 const sortLabels: Record<SortKey, string> = {
   score: "推荐评分",
@@ -28,6 +44,78 @@ const sortLabels: Record<SortKey, string> = {
   localPath: "本地目录",
 };
 
+type CatalogWorkspaceProps = {
+  rows: DisplayItem[];
+  rowOffset: number;
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  onOpenSource: (id: string) => void;
+  previewOpen: boolean;
+  showKeywordRelevance: boolean;
+  showAiRelevance: boolean;
+  showCoverRelevance: boolean;
+};
+
+const CatalogWorkspace = memo(function CatalogWorkspace({
+  rows,
+  rowOffset,
+  selectedId,
+  onSelect,
+  onOpenSource,
+  previewOpen,
+  showKeywordRelevance,
+  showAiRelevance,
+  showCoverRelevance,
+}: CatalogWorkspaceProps) {
+  const [hoveredItem, setHoveredItem] = useState<DisplayItem | null>(null);
+  const previewFrameRef = useRef<number | null>(null);
+  const selectedItem = useMemo(
+    () => rows.find((item) => item.id === selectedId) ?? null,
+    [rows, selectedId],
+  );
+
+  const handlePreview = useCallback((item: DisplayItem | null) => {
+    if (previewFrameRef.current !== null) window.cancelAnimationFrame(previewFrameRef.current);
+    previewFrameRef.current = window.requestAnimationFrame(() => {
+      previewFrameRef.current = null;
+      setHoveredItem(item);
+    });
+  }, []);
+
+  useEffect(() => () => {
+    if (previewFrameRef.current !== null) window.cancelAnimationFrame(previewFrameRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!previewOpen) setHoveredItem(null);
+  }, [previewOpen]);
+
+  useEffect(() => {
+    setHoveredItem((current) => current
+      ? rows.find((item) => item.id === current.id) ?? null
+      : null);
+  }, [rows]);
+
+  return (
+    <div className={`catalog-spread${previewOpen ? " catalog-spread-with-preview" : ""}`}>
+      <CatalogTable
+        rows={rows}
+        rowOffset={rowOffset}
+        selectedId={selectedId}
+        onSelect={onSelect}
+        onOpenSource={onOpenSource}
+        onPreview={previewOpen ? handlePreview : undefined}
+        showKeywordRelevance={showKeywordRelevance}
+        showAiRelevance={showAiRelevance}
+        showCoverRelevance={showCoverRelevance}
+      />
+      {previewOpen && <CatalogCoverPreview item={hoveredItem ?? selectedItem} />}
+    </div>
+  );
+});
+
+CatalogWorkspace.displayName = "CatalogWorkspace";
+
 export function CatalogPage() {
   const {
     filters,
@@ -42,9 +130,11 @@ export function CatalogPage() {
     recordHistory,
     flash,
     backendStatus,
+    databaseAvailable,
     catalogTotal,
     catalogMetrics,
     catalogLoading,
+    catalogReady,
     catalogWarnings,
     recall,
     pageSize,
@@ -53,9 +143,19 @@ export function CatalogPage() {
   const rows = useCatalogResults();
   const [panelOpen, setPanelOpen] = useState(true);
   const [queueCount, setQueueCount] = useState(0);
+  const [coverPreviewOpen, setCoverPreviewOpen] = useState(initialCoverPreviewState);
   const handleOpenSource = useCallback((id: string) => recordHistory(id, "打开网络来源"), [recordHistory]);
+  const handlePanelToggle = useCallback(() => setPanelOpen((current) => !current), []);
 
-  const filterSignature = JSON.stringify(filters);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(COVER_PREVIEW_STORAGE_KEY, coverPreviewOpen ? "on" : "off");
+    } catch {
+      // Storage can be unavailable in privacy-restricted browser contexts.
+    }
+  }, [coverPreviewOpen]);
+
+  const filterSignature = useMemo(() => JSON.stringify(filters), [filters]);
   useEffect(() => setPage(0), [filterSignature, setPage]);
 
   const totalPages = Math.max(1, Math.ceil(catalogTotal / pageSize));
@@ -64,6 +164,7 @@ export function CatalogPage() {
   }, [page, setPage, totalPages]);
 
   const pageRows = rows;
+  const databaseEmpty = backendStatus === "online" && databaseAvailable === true && catalogReady && catalogMetrics.items === 0;
 
   const availableSorts = useMemo<SortKey[]>(() => {
     const optional: SortKey[] = [];
@@ -105,7 +206,7 @@ export function CatalogPage() {
 
   return (
     <div className={`catalog-layout${panelOpen ? " catalog-layout-panel-open" : ""}`}>
-      <MarginPanel open={panelOpen} onToggle={() => setPanelOpen((current) => !current)} />
+      <MarginPanel open={panelOpen} onToggle={handlePanelToggle} />
 
       <section className="catalog-content" aria-label="库存目录工作区">
         <div className="metrics-ledger" aria-label="库存摘要">
@@ -117,14 +218,19 @@ export function CatalogPage() {
 
         <header className="catalog-heading">
           <div><span className="section-code">SECTION 01 / LIBRARY</span><h2>库存目录</h2></div>
-          <p>原版 Streamlit 的 MySQL 召回、动态打分、语义与封面检索已经接入同一套服务。<sup>01</sup></p>
+          <p>整合 MySQL 关键词召回、动态评分、语义检索与封面相似检索，集中浏览和筛选库存。<sup>01</sup></p>
         </header>
 
+        {databaseEmpty ? (
+          <CatalogImportGuide />
+        ) : <>
         {filters.keyword && (
           <p className="recall-caption mono">关键词召回：{recall.mode} · {recall.candidateCount} 个候选 · {filters.keywordRelevance ? "已使用全文相关度" : "仅候选召回"}</p>
         )}
 
-        {catalogWarnings.map((warning) => <p className="recall-caption mono" role="status" key={warning}>{warning}</p>)}
+        {catalogWarnings
+          .filter((warning) => !warning.startsWith("语义检索不可用：") && !warning.startsWith("封面检索不可用："))
+          .map((warning) => <p className="recall-caption mono" role="status" key={warning}>{warning}</p>)}
 
         <div className="catalog-toolbar" aria-label="库存表格工具栏">
           <span className="toolbar-folio mono">VOL.2026 — 结果 {catalogTotal} 条 — 第 {page + 1}/{totalPages} 页{catalogLoading ? " · LOADING" : ""}</span>
@@ -157,6 +263,15 @@ export function CatalogPage() {
           }}>
             <RefreshCw size={13} />刷新封面{queueCount > 0 && <sup className="queue-count mono">{queueCount}</sup>}
           </button>
+          <button
+            className="cover-preview-toggle"
+            type="button"
+            aria-pressed={coverPreviewOpen}
+            onClick={() => setCoverPreviewOpen((current) => !current)}
+          >
+            {coverPreviewOpen ? <EyeOff size={13} /> : <Eye size={13} />}
+            {coverPreviewOpen ? "收起大图预览" : "展开大图预览"}
+          </button>
         </div>
 
         {(filters.keywordRelevance || filters.semanticQuery || filters.coverQuery || filters.coverFileName || filters.blockedTags.length > 0) && (
@@ -169,25 +284,24 @@ export function CatalogPage() {
           </div>
         )}
 
-        <div className="catalog-spread">
-          <CatalogTable
-            rows={pageRows}
-            rowOffset={page * pageSize}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
-            onOpenSource={handleOpenSource}
-            showKeywordRelevance={filters.keywordRelevance}
-            showAiRelevance={Boolean(filters.semanticQuery)}
-            showCoverRelevance={Boolean(filters.coverQuery || filters.coverFileName)}
-          />
-        </div>
+        <CatalogWorkspace
+          rows={pageRows}
+          rowOffset={page * pageSize}
+          selectedId={selectedId}
+          onSelect={setSelectedId}
+          onOpenSource={handleOpenSource}
+          previewOpen={coverPreviewOpen}
+          showKeywordRelevance={filters.keywordRelevance}
+          showAiRelevance={Boolean(filters.semanticQuery)}
+          showCoverRelevance={Boolean(filters.coverQuery || filters.coverFileName)}
+        />
 
         {queueCount > 0 && <p className="pending-caption mono">有 {queueCount} 个封面正在后台抓取；完成后点击「刷新封面」查看。</p>}
-        <PreferenceCharts scope="global" compact />
         <footer className="catalog-footnotes">
           <p><sup>01</sup> 默认排序：推荐评分降序，其次按上传日期降序。当前范围 {start} ~ {end}。</p>
           <p><sup>02</sup> 运行模式：{backendStatus === "online" ? "API / MySQL 实际数据" : "离线演示数据"}。</p>
         </footer>
+        </>}
       </section>
     </div>
   );

@@ -32,10 +32,78 @@ export type MetaOptions = {
 export type OptionKind = "tags" | "artists" | "titleWords";
 export type OptionSearchResponse = { items: string[]; total: number; offset: number; hasMore: boolean };
 
+export type SearchDependencyStatus = {
+  kind: "model" | "vector";
+  label: string;
+  path: string;
+  exists: boolean;
+  ready: boolean;
+  state: "ready" | "missing" | "incomplete";
+  downloadUrl?: string;
+  generatedLocally?: boolean;
+};
+
+export type SearchCapabilityStatus = {
+  label: string;
+  ready: boolean;
+  idReady?: boolean;
+  uploadReady?: boolean;
+  missing: Array<"model" | "vector">;
+  dependencies: { model: SearchDependencyStatus; vector: SearchDependencyStatus };
+  setup: { section: string; scriptId: string; actionLabel: string };
+};
+
+export type SystemStatus = {
+  database: { available: boolean; table_ready: boolean; row_count: number; error?: string };
+  models: { semantic: boolean; clip: boolean };
+  searchCapabilities: {
+    semantic: SearchCapabilityStatus;
+    cover: SearchCapabilityStatus;
+  };
+  counts: { csv: number; onlineCovers: number; localThumbnails: number; base64: number };
+  caches: Array<{ name: string; path: string; exists: boolean; sizeKb: number }>;
+  paths: { dataRoot: string; library: string; dictionaries: string };
+};
+
+export type LLMSettings = {
+  local: { apiBase: string; model: string; apiKeyConfigured: boolean };
+  online: { apiBase: string; model: string; apiKeyConfigured: boolean };
+  persistence: {
+    runtimeMode: "source" | "docker" | "portable" | string;
+    fileName: string;
+    writable: boolean;
+    restartRequired: boolean;
+  };
+};
+
+export type LLMSettingsUpdate = {
+  localApiBase: string;
+  localModel: string;
+  localApiKey?: string;
+  clearLocalApiKey: boolean;
+  onlineApiBase: string;
+  onlineModel: string;
+  onlineApiKey?: string;
+  clearOnlineApiKey: boolean;
+};
+
 async function readError(response: Response) {
   try {
-    const payload = await response.json() as { detail?: string };
-    return payload.detail || `${response.status} ${response.statusText}`;
+    const payload = await response.json() as {
+      detail?: string | Array<{ loc?: Array<string | number>; msg?: string }>;
+    };
+    if (Array.isArray(payload.detail)) {
+      const messages = payload.detail
+        .map((item) => {
+          const field = item.loc?.at(-1);
+          const message = item.msg?.replace(/^Value error,\s*/i, "");
+          return [field, message].filter(Boolean).join("：");
+        })
+        .filter(Boolean);
+      if (messages.length) return messages.join("；");
+    }
+    if (typeof payload.detail === "string") return payload.detail;
+    return `${response.status} ${response.statusText}`;
   } catch {
     return `${response.status} ${response.statusText}`;
   }
@@ -53,7 +121,11 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 }
 
 export function getHealth(signal?: AbortSignal) {
-  return apiFetch<{ status: string; version: string; database: { available: boolean; row_count: number } }>("/api/health", { signal });
+  return apiFetch<{
+    status: string;
+    version: string;
+    database: { available: boolean; table_ready: boolean; row_count: number; error?: string };
+  }>("/api/health", { signal });
 }
 
 export function queryLibrary(
@@ -137,12 +209,19 @@ export function getCharts(scope: "global" | "history", signal?: AbortSignal) {
 }
 
 export function getSystemStatus(signal?: AbortSignal) {
-  return apiFetch<{
-    database: { available: boolean; table_ready: boolean; row_count: number; error?: string };
-    models: { semantic: boolean; clip: boolean };
-    counts: { csv: number; onlineCovers: number; localThumbnails: number; base64: number };
-    caches: Array<{ name: string; path: string; exists: boolean; sizeKb: number }>;
-  }>("/api/system/status", { signal });
+  return apiFetch<SystemStatus>("/api/system/status", { signal });
+}
+
+export function getLLMSettings(signal?: AbortSignal) {
+  return apiFetch<LLMSettings>("/api/chat/settings", { signal });
+}
+
+export function saveLLMSettings(payload: LLMSettingsUpdate) {
+  return apiFetch<LLMSettings>("/api/chat/settings", {
+    method: "PUT",
+    headers: { "X-XP-Gacha-Settings": "same-origin" },
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function importBundle(file: File, mode: "upsert" | "replace", includeDictionaries = true) {
@@ -184,6 +263,13 @@ export function cancelJob(jobId: string) {
   return apiFetch<JobResponse>(`/api/jobs/${jobId}/cancel`, { method: "POST" });
 }
 
+export type ChatStreamEvent = {
+  type: "meta" | "reasoning" | "reasoning_done" | "content" | "error" | "done" | "chunk";
+  content?: string;
+  message?: string;
+  contextIds?: string[];
+};
+
 export async function streamChat(
   payload: {
     query: string;
@@ -192,13 +278,14 @@ export async function streamChat(
     maxTokens: number;
     contextIds: string[];
     contextCount: number;
+    deepThinking: boolean;
   },
-  onEvent: (event: { type: string; content?: string; contextIds?: string[] }) => void,
+  onEvent: (event: ChatStreamEvent) => void,
   signal?: AbortSignal,
 ) {
   const response = await fetch("/api/chat/stream", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Accept": "text/event-stream", "Content-Type": "application/json" },
     body: JSON.stringify(payload),
     signal,
   });
@@ -207,15 +294,24 @@ export async function streamChat(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const dispatchBlock = (block: string) => {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (!data || data === "[DONE]") return;
+    onEvent(JSON.parse(data) as ChatStreamEvent);
+  };
   while (true) {
     const { done, value } = await reader.read();
     buffer += decoder.decode(value, { stream: !done });
-    const blocks = buffer.split("\n\n");
+    const blocks = buffer.split(/\r?\n\r?\n/);
     buffer = blocks.pop() ?? "";
-    for (const block of blocks) {
-      const line = block.split("\n").find((entry) => entry.startsWith("data: "));
-      if (line) onEvent(JSON.parse(line.slice(6)) as { type: string; content?: string; contextIds?: string[] });
+    blocks.forEach(dispatchBlock);
+    if (done) {
+      if (buffer.trim()) dispatchBlock(buffer);
+      break;
     }
-    if (done) break;
   }
 }

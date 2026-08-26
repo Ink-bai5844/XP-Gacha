@@ -5,6 +5,15 @@ import time
 from curl_cffi import requests 
 from bs4 import BeautifulSoup
 
+try:
+    from data_get.proxy_config import configured_proxies
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from proxy_config import configured_proxies
+
 ID_COLUMN = "ID"
 LINK_COLUMN = "链接"
 ID_PREFIX = "NH"
@@ -15,10 +24,7 @@ REQUEST_INTERVAL_SECONDS = 2.0
 GALLERY_URL_PATTERN = re.compile(r"/g/(\d+)/?")
 LOCAL_LINK_PATTERN = re.compile(r'<A HREF="(https://nhentai\.net/g/\d+/)"')
 
-PROXIES = {
-    "http": "http://127.0.0.1:7890",
-    "https": "http://127.0.0.1:7890"
-}
+PROXIES = configured_proxies()
 
 
 def extract_nh_id(url):

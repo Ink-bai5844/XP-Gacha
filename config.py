@@ -12,8 +12,42 @@ import os
 import re
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _load_project_env(path: Path) -> None:
+    """Load the project's simple KEY=VALUE file without an extra dependency.
+
+    Existing process variables always win.  Quoted values written by the
+    assistant settings page are JSON strings, so characters such as ``#`` and
+    ``=`` round-trip without being mistaken for comments or delimiters.
+    """
+
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in os.environ:
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            try:
+                decoded = json.loads(value)
+                value = decoded if isinstance(decoded, str) else str(decoded)
+            except json.JSONDecodeError:
+                value = value[1:-1]
+        elif len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+_load_project_env(PROJECT_ROOT / ".env")
 DATA_ROOT = Path(os.getenv("XP_GACHA_DATA_ROOT", str(PROJECT_ROOT))).expanduser().resolve()
 
 
@@ -74,7 +108,13 @@ BASE_DIR = str(
     Path(os.getenv("XP_GACHA_BASE_DIR", str(DATA_ROOT / "library"))).expanduser().resolve()
 )
 
-LM_STUDIO_API_BASE = os.getenv("LM_STUDIO_API_BASE", "http://127.0.0.1:1234/v1").rstrip("/")
+DEFAULT_LM_STUDIO_API_BASE = (
+    "http://host.docker.internal:1234/v1"
+    if os.getenv("XP_GACHA_RUNTIME_MODE", "").strip().lower() == "docker"
+    else "http://127.0.0.1:1234/v1"
+)
+LM_STUDIO_API_BASE = os.getenv("LM_STUDIO_API_BASE", DEFAULT_LM_STUDIO_API_BASE).rstrip("/")
+LM_STUDIO_API_KEY = os.getenv("LM_STUDIO_API_KEY", "")
 LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "local-model")
 ONLINE_API_BASE = os.getenv("ONLINE_API_BASE", "").rstrip("/")
 ONLINE_API_KEY = os.getenv("ONLINE_API_KEY", "")

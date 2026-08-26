@@ -28,6 +28,7 @@ $WixSha256 = "6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31"
 $TorchIndexUrl = "https://download.pytorch.org/whl/cpu"
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$PortableRuntimeVerifier = Join-Path $PSScriptRoot "verify_portable_runtime.ps1"
 if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
     $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 }
@@ -36,6 +37,28 @@ else {
 }
 $CacheRoot = Join-Path $ProjectRoot ".portable-cache"
 $DownloadRoot = Join-Path $CacheRoot "downloads"
+$PortableDataDirectories = @(
+    "data",
+    "datacache",
+    "b64_cache",
+    "b64_tmp",
+    "localimgtmp",
+    "onlineimgtmp",
+    "library",
+    "manga_vectors",
+    "models",
+    "mysql",
+    "config",
+    "run",
+    "logs",
+    "tmp"
+)
+$DefaultDictionaryFiles = @(
+    "STOP_TAGS.txt",
+    "SEMANTIC_MAP.json",
+    "TITLE_STOP_WORDS.txt",
+    "TITLE_SEMANTIC_MAP.json"
+)
 
 function Write-Step {
     param([string]$Message)
@@ -64,7 +87,30 @@ function Remove-VerifiedTree {
         return
     }
     Assert-ChildPath -Path $Path -Parent $Parent
-    Remove-Item -LiteralPath $Path -Recurse -Force
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+        return
+    }
+    catch {
+        $removeError = $_
+        Write-Step "PowerShell could not remove a long-path tree; retrying with the Windows file copier."
+        $emptyRoot = Join-Path $Parent (".portable-delete-empty-" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $emptyRoot -Force | Out-Null
+        try {
+            & robocopy.exe $emptyRoot $Path /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+            $robocopyExitCode = $LASTEXITCODE
+            if ($robocopyExitCode -gt 7) {
+                throw "robocopy cleanup failed with exit code $robocopyExitCode"
+            }
+            Remove-Item -LiteralPath $Path -Force
+        }
+        catch {
+            throw "Unable to remove verified tree $Path. Initial error: $($removeError.Exception.Message). Fallback error: $($_.Exception.Message)"
+        }
+        finally {
+            Remove-Item -LiteralPath $emptyRoot -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Get-LowerHash {
@@ -200,8 +246,17 @@ function Copy-ApplicationFiles {
         Copy-Item -LiteralPath $source -Destination (Join-Path $Destination $relativePath) -Force
     }
 
-    foreach ($directory in @("Integration", "data_get", "data_processing", "server", "tools", "dictionaries", "UI-imgs")) {
+    foreach ($directory in @("Integration", "data_get", "data_processing", "server", "tools", "UI-imgs")) {
         Invoke-RobocopyTree -Source (Join-Path $ProjectRoot $directory) -Destination (Join-Path $Destination $directory)
+    }
+    $dictionaryDestination = Join-Path $Destination "dictionaries"
+    New-Item -ItemType Directory -Path $dictionaryDestination -Force | Out-Null
+    foreach ($dictionaryFile in $DefaultDictionaryFiles) {
+        $dictionarySource = Join-Path (Join-Path $ProjectRoot "dictionaries") $dictionaryFile
+        if (-not (Test-Path -LiteralPath $dictionarySource -PathType Leaf)) {
+            throw "Required default dictionary is missing: dictionaries\$dictionaryFile"
+        }
+        Copy-Item -LiteralPath $dictionarySource -Destination (Join-Path $dictionaryDestination $dictionaryFile) -Force
     }
     Invoke-RobocopyTree -Source (Join-Path $ProjectRoot "web\dist") -Destination (Join-Path $Destination "web\dist")
 
@@ -224,6 +279,7 @@ function Expand-PythonRuntime {
     $pthContent = @(
         "python313.zip",
         ".",
+        "..\..",
         "Lib",
         "Lib\site-packages",
         "import site",
@@ -403,6 +459,8 @@ function Invoke-PortableVerification {
     $env:PYTHONNOUSERSITE = "1"
     $env:PYTHONUTF8 = "1"
     try {
+        Write-Step "Verifying bundled application module resolution."
+        & $PortableRuntimeVerifier -ReleaseRoot $ReleaseRoot
         Write-Step "Running bundled dependency doctor."
         & $python -X utf8 $launcher doctor
         if ($LASTEXITCODE -ne 0) {
@@ -426,18 +484,23 @@ function Invoke-PortableVerification {
     }
 }
 
-function Reset-ReleaseUserData {
+function Reset-ReleaseDataDirectories {
     param([string]$ReleaseRoot)
-    $userData = Join-Path $ReleaseRoot "userdata"
-    Remove-VerifiedTree -Path $userData -Parent $ReleaseRoot
-    New-Item -ItemType Directory -Path $userData -Force | Out-Null
-    $message = @(
-        "XP-Gacha portable user data directory.",
-        "",
-        "This release intentionally contains no catalogue database, CSV files, covers, history, vectors, or models.",
-        "The first launch creates all runtime data inside this folder."
-    ) -join "`r`n"
-    [System.IO.File]::WriteAllText((Join-Path $userData "README.txt"), $message, [System.Text.UTF8Encoding]::new($false))
+    foreach ($relativePath in $PortableDataDirectories) {
+        $target = Join-Path $ReleaseRoot $relativePath
+        Remove-VerifiedTree -Path $target -Parent $ReleaseRoot
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+    }
+    foreach ($relativePath in @(
+        "data\gallery_info",
+        "data\gallery_info_no_name",
+        "data\local_data",
+        "datacache\imports",
+        "models\cache",
+        "mysql\data"
+    )) {
+        New-Item -ItemType Directory -Path (Join-Path $ReleaseRoot $relativePath) -Force | Out-Null
+    }
 }
 
 function Assert-NoProjectData {
@@ -447,16 +510,7 @@ function Assert-NoProjectData {
         ".streamlit",
         ".env",
         ".env.local",
-        "data",
-        "datacache",
-        "b64_cache",
-        "b64_tmp",
-        "localimgtmp",
-        "onlineimgtmp",
-        "manga_vectors",
-        "models",
-        "library",
-        "logs",
+        "userdata",
         "web\node_modules"
     )
     foreach ($relativePath in $forbiddenPaths) {
@@ -464,9 +518,29 @@ function Assert-NoProjectData {
             throw "Data exclusion audit failed: $relativePath is present in the release root."
         }
     }
-    $unexpectedUserData = Get-ChildItem -LiteralPath (Join-Path $ReleaseRoot "userdata") -Force | Where-Object Name -ne "README.txt"
-    if ($unexpectedUserData) {
-        throw "Data exclusion audit failed: userdata is not blank."
+    foreach ($relativePath in $PortableDataDirectories) {
+        $dataDirectory = Join-Path $ReleaseRoot $relativePath
+        if (-not (Test-Path -LiteralPath $dataDirectory -PathType Container)) {
+            throw "Data exclusion audit failed: blank data directory is missing: $relativePath"
+        }
+        $unexpectedFiles = Get-ChildItem -LiteralPath $dataDirectory -File -Recurse -Force -ErrorAction SilentlyContinue
+        if ($unexpectedFiles) {
+            throw "Data exclusion audit failed: $relativePath contains packaged user files."
+        }
+    }
+    $dictionaryRoot = Join-Path $ReleaseRoot "dictionaries"
+    $packagedDictionaryFiles = @(
+        Get-ChildItem -LiteralPath $dictionaryRoot -File -Force -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name
+    )
+    $unexpectedDictionaries = @($packagedDictionaryFiles | Where-Object { $_ -notin $DefaultDictionaryFiles })
+    $missingDictionaries = @($DefaultDictionaryFiles | Where-Object { $_ -notin $packagedDictionaryFiles })
+    if ($unexpectedDictionaries -or $missingDictionaries) {
+        throw (
+            "Default dictionary audit failed. Missing: {0}; unexpected: {1}" -f
+            ($missingDictionaries -join ", "),
+            ($unexpectedDictionaries -join ", ")
+        )
     }
     $sourcePycache = Get-ChildItem -LiteralPath $ReleaseRoot -Directory -Filter "__pycache__" -Recurse -ErrorAction SilentlyContinue |
         Where-Object { -not $_.FullName.StartsWith((Join-Path $ReleaseRoot "runtime"), [System.StringComparison]::OrdinalIgnoreCase) }
@@ -486,12 +560,28 @@ function Write-ReleaseMetadata {
         [System.Management.Automation.Signature]$VcSignature,
         [bool]$Verified
     )
-    $sourceCommit = (& git -C $ProjectRoot rev-parse HEAD 2>$null)
-    $sourceDirty = [bool](& git -C $ProjectRoot status --porcelain 2>$null)
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $sourceCommit = (& git -C $ProjectRoot rev-parse HEAD 2>$null)
+        $commitExitCode = $LASTEXITCODE
+        $sourceStatus = (& git -C $ProjectRoot status --porcelain 2>$null)
+        $statusExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
+    if ($commitExitCode -ne 0) {
+        $sourceCommit = ""
+    }
+    $sourceDirty = $statusExitCode -ne 0 -or [bool]$sourceStatus
     $metadata = [ordered]@{
         product = "XP-Gacha"
         version = $ReleaseVersion
         platform = "windows-x64"
+        dataLayout = "project-root"
+        portableDataDirectories = @($PortableDataDirectories + @("dictionaries"))
+        modelCacheDirectory = "models/cache"
         createdAtUtc = [DateTime]::UtcNow.ToString("o")
         sourceCommit = [string]$sourceCommit
         sourceDirty = $sourceDirty
@@ -527,7 +617,7 @@ function Write-ReleaseMetadata {
                 }
             }
         }
-        excludedUserData = @(
+        excludedRuntimeData = @(
             "catalogue CSV/database",
             "covers and Base64 caches",
             "history and UI preferences",
@@ -547,13 +637,18 @@ function Write-ReleaseMetadata {
 function Write-FileManifest {
     param([string]$ReleaseRoot)
     $manifestPath = Join-Path $ReleaseRoot "SHA256SUMS.txt"
+    $releasePrefix = [System.IO.Path]::GetFullPath($ReleaseRoot).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
     $entries = [System.Collections.Generic.List[string]]::new()
     $files = Get-ChildItem -LiteralPath $ReleaseRoot -File -Recurse |
         Where-Object FullName -ne $manifestPath |
         Sort-Object FullName
     $count = 0
     foreach ($file in $files) {
-        $relative = [System.IO.Path]::GetRelativePath($ReleaseRoot, $file.FullName).Replace('\', '/')
+        $fullFilePath = [System.IO.Path]::GetFullPath($file.FullName)
+        if (-not $fullFilePath.StartsWith($releasePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Manifest entry is outside the release root: $fullFilePath"
+        }
+        $relative = $fullFilePath.Substring($releasePrefix.Length).Replace('\', '/')
         $hash = Get-LowerHash -Path $file.FullName -Algorithm SHA256
         $entries.Add("$hash  $relative")
         $count += 1
@@ -637,7 +732,7 @@ try {
         Invoke-PortableVerification -ReleaseRoot $StagingRoot
         $verified = $true
     }
-    Reset-ReleaseUserData -ReleaseRoot $StagingRoot
+    Reset-ReleaseDataDirectories -ReleaseRoot $StagingRoot
     Assert-NoProjectData -ReleaseRoot $StagingRoot
     Write-ReleaseMetadata -ReleaseRoot $StagingRoot -ReleaseVersion $ReleaseVersion -PythonArchive $pythonArchive -MySqlArchive $mysqlArchive -VcRedist $vcRedist -WixArchive $wixArchive -VcSignature $vcSignature -Verified $verified
 

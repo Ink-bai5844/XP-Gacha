@@ -23,8 +23,8 @@ export default function App() {
     <div className="editorial-app">
       <header className="masthead">
         <div className="masthead-title">
-          <span className="masthead-overline mono">XP—GACHA / PRIVATE CATALOGUE</span>
-          <h1>地下金库</h1>
+          <span className="masthead-overline mono">PRIVATE CATALOGUE</span>
+          <h1>XP-Gacha</h1>
           <p>墨白的个人馆藏目录与偏好索引</p>
         </div>
         <div className="issue-info mono">

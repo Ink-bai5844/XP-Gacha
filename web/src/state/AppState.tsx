@@ -54,8 +54,16 @@ export type HistoryEntry = {
   tags?: string[];
   titleWords?: string[];
 };
-export type ChatMessage = { id: string; role: "user" | "assistant"; content: string; thinking?: string; citations?: string[] };
 export type ScoredCatalogItem = CatalogItem & { score: number };
+export type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  thinking?: string;
+  thinkingStreaming?: boolean;
+  requestMeta?: string;
+  injectedItems?: ScoredCatalogItem[];
+};
 
 type RecallState = { mode: string; candidateCount: number; usedFulltext: boolean };
 type AppStateValue = {
@@ -80,10 +88,12 @@ type AppStateValue = {
   flash: (message: string) => void;
   backendStatus: BackendStatus;
   backendVersion: string;
+  databaseAvailable: boolean | null;
   catalogRows: ScoredCatalogItem[];
   catalogTotal: number;
   catalogMetrics: LibraryMetrics;
   catalogLoading: boolean;
+  catalogReady: boolean;
   catalogWarnings: string[];
   recall: RecallState;
   meta: MetaOptions;
@@ -153,10 +163,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [backendStatus, setBackendStatus] = useState<BackendStatus>("checking");
   const [backendVersion, setBackendVersion] = useState("");
+  const [databaseAvailable, setDatabaseAvailable] = useState<boolean | null>(null);
   const [catalogRows, setCatalogRows] = useState<ScoredCatalogItem[]>([]);
   const [catalogTotal, setCatalogTotal] = useState(0);
   const [catalogMetrics, setCatalogMetrics] = useState(emptyMetrics);
   const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogReady, setCatalogReady] = useState(false);
   const [catalogWarnings, setCatalogWarnings] = useState<string[]>([]);
   const [recall, setRecall] = useState<RecallState>({ mode: "none", candidateCount: 0, usedFulltext: false });
   const [meta, setMeta] = useState<MetaOptions>(emptyMeta);
@@ -177,6 +189,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     void getHealth(controller.signal)
       .then((health) => {
         setBackendVersion(health.version);
+        setDatabaseAvailable(health.database.available);
         setBackendStatus("online");
         void Promise.all([getMeta(controller.signal), getHistory(controller.signal)])
           .then(([metaPayload, historyPayload]) => {
@@ -187,7 +200,10 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
             if (error.name !== "AbortError") setCatalogWarnings([`选项元数据读取失败：${error.message}`]);
           });
       })
-      .catch(() => setBackendStatus("offline"));
+      .catch(() => {
+        setDatabaseAvailable(null);
+        setBackendStatus("offline");
+      });
     return () => controller.abort();
   }, []);
 
@@ -200,6 +216,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       setCatalogRows(allRows.slice(page * pageSize, (page + 1) * pageSize));
       setCatalogTotal(allRows.length);
       setCatalogMetrics({ items: catalogItems.length, artists: new Set(catalogItems.map((item) => item.artist)).size, tags: new Set(catalogItems.flatMap((item) => item.tags)).size, titleWords: titleWordOptions.length });
+      setCatalogReady(true);
       setCatalogWarnings(["后端不可用，当前显示内置演示数据。"]);
       setRecall({ mode: "DEMO", candidateCount: allRows.length, usedFulltext: false });
       return;
@@ -212,6 +229,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
           setCatalogRows(payload.items);
           setCatalogTotal(payload.total);
           setCatalogMetrics(payload.metrics);
+          setCatalogReady(true);
           setCatalogWarnings(payload.warnings);
           setRecall(payload.recall);
         })
@@ -246,10 +264,10 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const value = useMemo<AppStateValue>(() => ({
     filters, setFilters, sortKey, setSortKey, descending, setDescending, page, setPage,
     selectedId, setSelectedId, history, recordHistory, deleteHistory, clearHistory, refreshHistory,
-    messages, setMessages, notice, flash, backendStatus, backendVersion, catalogRows, catalogTotal,
-    catalogMetrics, catalogLoading, catalogWarnings, recall, meta, pageSize,
+    messages, setMessages, notice, flash, backendStatus, backendVersion, databaseAvailable, catalogRows, catalogTotal,
+    catalogMetrics, catalogLoading, catalogReady, catalogWarnings, recall, meta, pageSize,
     refreshLibrary: () => setRefreshToken((value) => value + 1),
-  }), [filters, sortKey, descending, page, selectedId, history, recordHistory, deleteHistory, clearHistory, refreshHistory, messages, notice, flash, backendStatus, backendVersion, catalogRows, catalogTotal, catalogMetrics, catalogLoading, catalogWarnings, recall, meta, pageSize]);
+  }), [filters, sortKey, descending, page, selectedId, history, recordHistory, deleteHistory, clearHistory, refreshHistory, messages, notice, flash, backendStatus, backendVersion, databaseAvailable, catalogRows, catalogTotal, catalogMetrics, catalogLoading, catalogReady, catalogWarnings, recall, meta, pageSize]);
 
   return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>;
 }

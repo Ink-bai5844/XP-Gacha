@@ -1,5 +1,6 @@
-import { Database, FileArchive, Play, RefreshCw, Square, Terminal, Upload } from "lucide-react";
+import { ArrowLeft, Database, FileArchive, Play, RefreshCw, Square, Terminal, Upload } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { cancelJob, getJob, getSystemStatus, importBundle, importProject, startJob } from "../api/client";
 import {
   collectionScripts,
@@ -128,22 +129,55 @@ function AppendixTerminal({ job, cancel }: { job: Job | null; cancel: () => void
 
 export function AdminPage() {
   const { flash, backendStatus, refreshLibrary } = useAppState();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedSection = searchParams.get("section");
+  const initialSection = dataSections.some((section) => section.id === requestedSection) || requestedSection === "collection"
+    ? requestedSection!
+    : dataSections[0].id;
   const allScripts = useMemo(() => [...dataSections.flatMap((section) => section.scripts), ...collectionScripts], []);
-  const [activeSection, setActiveSection] = useState(dataSections[0].id);
+  const [activeSection, setActiveSection] = useState(initialSection);
   const [collectionMode, setCollectionMode] = useState(collectionScripts[0].id);
   const [statsToken, setStatsToken] = useState(0);
   const [values, setValues] = useState<Record<string, Record<string, ScriptFieldValue>>>(() => Object.fromEntries(allScripts.map((script) => [script.id, initialScriptValues(script)])));
   const [job, setJob] = useState<Job | null>(null);
   const timerRef = useRef<number | null>(null);
+  const importSectionRef = useRef<HTMLElement | null>(null);
+  const importFileInputRef = useRef<HTMLInputElement | null>(null);
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importMode, setImportMode] = useState<"upsert" | "replace">("upsert");
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState("");
+  const [importSucceeded, setImportSucceeded] = useState(false);
 
   useEffect(() => () => {
     if (timerRef.current) window.clearInterval(timerRef.current);
   }, []);
+
+  useEffect(() => {
+    if (!requestedSection) return;
+    const valid = dataSections.some((section) => section.id === requestedSection) || requestedSection === "collection";
+    if (!valid) return;
+    setActiveSection(requestedSection);
+    window.requestAnimationFrame(() => {
+      document.getElementById("appendix-workbench")?.scrollIntoView({ block: "start" });
+    });
+  }, [requestedSection]);
+
+  const importFocusRequested = searchParams.get("focus") === "import";
+  useEffect(() => {
+    if (!importFocusRequested) return;
+    const frame = window.requestAnimationFrame(() => {
+      importSectionRef.current?.scrollIntoView({ block: "start" });
+      importFileInputRef.current?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [importFocusRequested]);
+
+  const selectSection = (sectionId: string) => {
+    setActiveSection(sectionId);
+    setSearchParams({ section: sectionId }, { replace: true });
+  };
 
   const loadSystem = () => {
     if (backendStatus !== "online") return;
@@ -191,13 +225,16 @@ export function AdminPage() {
     if (importMode === "replace" && !window.confirm("覆盖模式会重建 gallery_info 表，确认继续？")) return;
     setImporting(true);
     setImportResult("");
+    setImportSucceeded(false);
     try {
       const result = projectData ? await importProject(importMode) : await importBundle(importFile!, importMode, true);
       setImportResult(`已导入 ${result.imported} 条，当前总计 ${result.total ?? "—"} 条；识别 CSV ${result.csvFiles} 个。`);
+      setImportSucceeded((result.total ?? 0) > 0);
       refreshLibrary();
       loadSystem();
       flash("一键导入完成");
     } catch (error) {
+      setImportSucceeded(false);
       setImportResult(`导入失败：${(error as Error).message}`);
     } finally {
       setImporting(false);
@@ -211,20 +248,21 @@ export function AdminPage() {
     <div className="admin-page">
       <header className="page-intro page-intro-split">
         <div><span className="section-code">APPENDIX A / PROCESSING</span><h2>附录 A<br />数据处理</h2></div>
-        <p>保留原版六个分区、全部脚本参数、确认开关和输出区域。任务现在由后端安全白名单启动，同一时间只允许一个真实进程运行。</p>
+        <p>用于导入馆藏数据、维护词典与缓存、执行采集和索引任务；同一时间只运行一个后台任务。</p>
       </header>
 
-      <section className="system-overview">
+      <section id="one-click-import" ref={importSectionRef} className="system-overview import-overview" aria-busy={importing}>
         <div className="overview-toolbar"><span><FileArchive size={14} />一键导入词典 / 数据</span><span className="mono">ZIP 可同时包含 CSV 与四个标准词典文件</span></div>
         <div className="script-fields">
-          <label className="admin-field"><span>导入包</span><input type="file" accept=".zip,.csv" onChange={(event) => setImportFile(event.target.files?.[0] ?? null)} /><small>{importFile?.name || "可上传 ZIP 或单个 CSV"}</small></label>
+          <label className="admin-field"><span>导入包</span><input ref={importFileInputRef} type="file" accept=".zip,.csv" aria-describedby="import-file-help" onChange={(event) => setImportFile(event.target.files?.[0] ?? null)} /><small id="import-file-help">{importFile?.name || "可上传 ZIP 或单个 CSV；input_data.zip 无需解压"}</small></label>
           <label className="admin-field"><span>数据库模式</span><select value={importMode} onChange={(event) => setImportMode(event.target.value as "upsert" | "replace")}><option value="upsert">增量写入 / 更新</option><option value="replace">覆盖重建</option></select></label>
         </div>
         <div className="detail-actions">
           <button type="button" disabled={importing || !importFile} onClick={() => void runImport(false)}><Upload size={14} />{importing ? "导入中…" : "上传并一键导入"}</button>
           <button type="button" disabled={importing} onClick={() => void runImport(true)}><Database size={14} />导入项目 data/gallery_info</button>
         </div>
-        {importResult && <p className="terminal-result mono" role="status">{importResult}</p>}
+        {importResult && <p className="terminal-result mono" role={importResult.startsWith("导入失败：") ? "alert" : "status"}>{importResult}</p>}
+        {importSucceeded && <Link className="import-return-link" to="/"><ArrowLeft size={14} />返回库存目录查看已导入数据</Link>}
       </section>
 
       <section className="system-overview">
@@ -243,9 +281,9 @@ export function AdminPage() {
 
       <AppendixTerminal job={job} cancel={cancel} />
 
-      <nav className="appendix-tabs" aria-label="数据处理分区">
-        {dataSections.map((section) => <button type="button" className={activeSection === section.id ? "active" : ""} onClick={() => setActiveSection(section.id)} key={section.id}><span className="mono">{section.code}</span>{section.title}</button>)}
-        <button type="button" className={activeSection === "collection" ? "active" : ""} onClick={() => setActiveSection("collection")}><span className="mono">A.6</span>采集入口</button>
+      <nav id="appendix-workbench" className="appendix-tabs" aria-label="数据处理分区">
+        {dataSections.map((section) => <button type="button" className={activeSection === section.id ? "active" : ""} onClick={() => selectSection(section.id)} key={section.id}><span className="mono">{section.code}</span>{section.title}</button>)}
+        <button type="button" className={activeSection === "collection" ? "active" : ""} onClick={() => selectSection("collection")}><span className="mono">A.6</span>采集入口</button>
       </nav>
 
       {currentSection && (
@@ -257,7 +295,7 @@ export function AdminPage() {
 
       {activeSection === "collection" && (
         <section className="appendix-section">
-          <header><span className="mono">A.6</span><h3>采集入口</h3><p>对应原版“流程”选择器，只显示当前采集流程的完整参数。</p></header>
+          <header><span className="mono">A.6</span><h3>采集入口</h3><p>选择采集流程，并配置网址、页数、输出路径、并发数与超时参数。</p></header>
           <label className="collection-mode">流程<select value={collectionMode} onChange={(event) => setCollectionMode(event.target.value)}>{collectionScripts.map((script) => <option value={script.id} key={script.id}>{script.title}</option>)}</select></label>
           <ScriptPanel script={collectionSelected} values={values[collectionSelected.id]} setValues={(next) => setValues((current) => ({ ...current, [collectionSelected.id]: next }))} activeJob={job} run={run} />
         </section>

@@ -32,7 +32,7 @@ services:
       mysql:
         condition: service_healthy
     ports:
-      - "${XP_GACHA_PORT:-8000}:8000"
+      - "127.0.0.1:${XP_GACHA_PORT:-8000}:8000"
     environment:
       XP_GACHA_ENV: production
       XP_GACHA_DATA_ROOT: /app
@@ -43,14 +43,16 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-xp_gacha}
       MYSQL_USER: ${MYSQL_USER:-xp_gacha}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-xp_gacha}
-      LM_STUDIO_API_BASE: ${LM_STUDIO_API_BASE:-http://host.docker.internal:1234/v1}
-      LM_STUDIO_MODEL: ${LM_STUDIO_MODEL:-local-model}
-      ONLINE_API_BASE: ${ONLINE_API_BASE:-}
-      ONLINE_API_KEY: ${ONLINE_API_KEY:-}
-      ONLINE_MODEL: ${ONLINE_MODEL:-deepseek-v4-flash}
       ONLINE_COVER_PROXY: ${ONLINE_COVER_PROXY:-}
+      XP_GACHA_RUNTIME_MODE: docker
+      XP_GACHA_SETTINGS_FILE: /app/.env
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        bind:
+          create_host_path: false
       - ./b64_cache:/app/b64_cache
       - ./b64_tmp:/app/b64_tmp
       - ./data:/app/data
