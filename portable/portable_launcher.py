@@ -44,6 +44,7 @@ INITIALIZATION_MARKER_FILE = CONFIG_ROOT / ".config-mysql-initialization-pending
 STATE_FILE = RUN_ROOT / "state.json"
 STOP_REQUEST_FILE = RUN_ROOT / "stop.request"
 SETTINGS_FILE = PACKAGE_ROOT / "portable-settings.env"
+UPDATE_LOCK_FILE = PACKAGE_ROOT / "updates" / "update.lock"
 
 SCHEMA_VERSION = 1
 DEFAULT_APP_PORT = 8000
@@ -558,6 +559,25 @@ def ensure_package_layout() -> None:
             destination.write_text(default_content, encoding="utf-8")
 
 
+def ensure_update_not_in_progress() -> None:
+    if os.environ.get("XP_GACHA_UPDATE_RESTART") == "1":
+        return
+    try:
+        descriptor = os.open(UPDATE_LOCK_FILE, os.O_RDWR)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError("一键更新正在进行，请等待更新窗口完成后再启动。") from exc
+    else:
+        os.close(descriptor)
+        try:
+            UPDATE_LOCK_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RuntimeError("检测到无法清理的更新锁，请先重新运行 Update XP-Gacha.cmd。") from exc
+
+
 def load_or_create_config(settings: dict[str, str]) -> dict[str, Any]:
     config = read_json(PORTABLE_CONFIG_FILE) or {}
     if int(config.get("schemaVersion", 0) or 0) != SCHEMA_VERSION:
@@ -962,6 +982,7 @@ def build_state(
 def run_start(no_browser: bool = False, verify: bool = False) -> int:
     if os.name != "nt":
         raise RuntimeError("此发行包仅支持 Windows x64。")
+    ensure_update_not_in_progress()
     ensure_package_layout()
     mutex = SingleInstanceMutex()
     if not mutex.acquire():
@@ -1145,6 +1166,14 @@ def run_doctor() -> int:
             __import__(name)
         except Exception as exc:
             problems.append(f"Python 依赖 {name} 无法加载：{exc}")
+    try:
+        from server import main as server_main
+
+        route_paths = {getattr(route, "path", "") for route in server_main.app.routes}
+        if "/api/health" not in route_paths or "/api/system/status" not in route_paths:
+            problems.append("FastAPI 应用缺少核心健康检查路由。")
+    except Exception as exc:
+        problems.append(f"FastAPI 应用无法完整导入：{exc}")
     expected_job_module = (PACKAGE_ROOT / "server" / "job_tasks.py").resolve()
     try:
         job_spec = importlib.util.find_spec("server.job_tasks")

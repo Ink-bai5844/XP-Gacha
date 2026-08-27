@@ -106,6 +106,32 @@ class PortableJobVerificationTests(unittest.TestCase):
 
 
 class PortableRootDataLayoutTests(unittest.TestCase):
+    def test_stale_update_lock_is_removed_before_manual_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_file = Path(temporary) / "updates" / "update.lock"
+            lock_file.parent.mkdir(parents=True)
+            lock_file.write_text("", encoding="ascii")
+            with mock.patch.object(portable_launcher, "UPDATE_LOCK_FILE", lock_file):
+                portable_launcher.ensure_update_not_in_progress()
+
+            self.assertFalse(lock_file.exists())
+
+    def test_active_update_lock_blocks_manual_start(self) -> None:
+        with (
+            mock.patch.object(portable_launcher.os, "open", side_effect=PermissionError("locked")),
+            self.assertRaisesRegex(RuntimeError, "一键更新正在进行"),
+        ):
+            portable_launcher.ensure_update_not_in_progress()
+
+    def test_updater_owned_restart_can_bypass_its_lock(self) -> None:
+        with (
+            mock.patch.dict(portable_launcher.os.environ, {"XP_GACHA_UPDATE_RESTART": "1"}),
+            mock.patch.object(portable_launcher.os, "open") as open_file,
+        ):
+            portable_launcher.ensure_update_not_in_progress()
+
+        open_file.assert_not_called()
+
     def test_fresh_install_records_recovery_marker_before_config_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

@@ -29,6 +29,7 @@ $TorchIndexUrl = "https://download.pytorch.org/whl/cpu"
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $PortableRuntimeVerifier = Join-Path $PSScriptRoot "verify_portable_runtime.ps1"
+$PortableUpdateBuilder = Join-Path $PSScriptRoot "build_portable_update.ps1"
 if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
     $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 }
@@ -50,6 +51,7 @@ $PortableDataDirectories = @(
     "mysql",
     "config",
     "run",
+    "updates",
     "logs",
     "tmp"
 )
@@ -236,7 +238,8 @@ function Copy-ApplicationFiles {
         "utils_online_cover.py",
         "requirements.txt",
         "README.md",
-        "LICENSE"
+        "LICENSE",
+        "Update XP-Gacha.cmd"
     )
     foreach ($relativePath in $rootFiles) {
         $source = Join-Path $ProjectRoot $relativePath
@@ -497,7 +500,8 @@ function Reset-ReleaseDataDirectories {
         "data\local_data",
         "datacache\imports",
         "models\cache",
-        "mysql\data"
+        "mysql\data",
+        "updates\backups"
     )) {
         New-Item -ItemType Directory -Path (Join-Path $ReleaseRoot $relativePath) -Force | Out-Null
     }
@@ -664,26 +668,61 @@ New-Item -ItemType Directory -Path $OutputRoot, $DownloadRoot -Force | Out-Null
 $versionFile = Get-Content -LiteralPath (Join-Path $ProjectRoot "server\__init__.py") -Raw
 $versionMatch = [regex]::Match($versionFile, '__version__\s*=\s*["'']([^"'']+)["'']')
 $ReleaseVersion = if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { "0.0.0" }
+$sourceHead = (& git -C $ProjectRoot rev-parse HEAD 2>$null)
+if ($LASTEXITCODE -ne 0 -or -not $sourceHead) {
+    throw "The portable release must be built from a Git checkout."
+}
+$sourceHead = ([string]$sourceHead).Trim()
+$sourceStatus = @(& git -C $ProjectRoot status --porcelain --untracked-files=all 2>$null)
+if ($LASTEXITCODE -ne 0 -or $sourceStatus.Count -gt 0) {
+    throw "The portable release requires a clean source tree. Commit the release before building."
+}
+$releaseTagRef = "refs/tags/v$ReleaseVersion^{}"
+$releaseTagCommit = (& git -C $ProjectRoot rev-parse $releaseTagRef 2>$null)
+if ($LASTEXITCODE -ne 0 -or ([string]$releaseTagCommit).Trim() -ne $sourceHead) {
+    throw "Tag v$ReleaseVersion must exist and resolve to current HEAD $sourceHead before building the portable release."
+}
 $ReleaseName = "XP-Gacha-v$ReleaseVersion-portable-win64"
 $FinalRoot = Join-Path $OutputRoot $ReleaseName
 $ZipPath = Join-Path $OutputRoot "$ReleaseName.zip"
+$ZipSidecarPath = "$ZipPath.sha256"
+$UpdateAssetBase = "$ReleaseName-update"
+$UpdateZipPath = Join-Path $OutputRoot "$UpdateAssetBase.zip"
+$UpdateManifestPath = Join-Path $OutputRoot "$UpdateAssetBase.json"
+$UpdateSidecarPath = "$UpdateZipPath.sha256"
 $StagingRoot = Join-Path $OutputRoot (".build-" + [guid]::NewGuid().ToString("N").Substring(0, 10))
 
 Assert-ChildPath -Path $FinalRoot -Parent $OutputRoot
 Assert-ChildPath -Path $ZipPath -Parent $OutputRoot
+Assert-ChildPath -Path $ZipSidecarPath -Parent $OutputRoot
+Assert-ChildPath -Path $UpdateZipPath -Parent $OutputRoot
+Assert-ChildPath -Path $UpdateManifestPath -Parent $OutputRoot
+Assert-ChildPath -Path $UpdateSidecarPath -Parent $OutputRoot
 Assert-ChildPath -Path $StagingRoot -Parent $OutputRoot
 
-if ((Test-Path -LiteralPath $FinalRoot) -or (Test-Path -LiteralPath $ZipPath)) {
+$releaseArtifacts = @(
+    $FinalRoot,
+    $ZipPath,
+    $ZipSidecarPath,
+    $UpdateZipPath,
+    $UpdateManifestPath,
+    $UpdateSidecarPath
+)
+$existingReleaseArtifacts = @($releaseArtifacts | Where-Object { Test-Path -LiteralPath $_ })
+if ($existingReleaseArtifacts.Count -gt 0) {
     if (-not $Force) {
-        throw "Release already exists. Use -Force to replace exactly $ReleaseName."
+        throw "Release assets already exist for version $ReleaseVersion. Use -Force to replace the complete $ReleaseName asset set."
     }
-    Remove-VerifiedTree -Path $FinalRoot -Parent $OutputRoot
-    if (Test-Path -LiteralPath $ZipPath) {
-        Remove-Item -LiteralPath $ZipPath -Force
-    }
-    $sidecar = "$ZipPath.sha256"
-    if (Test-Path -LiteralPath $sidecar) {
-        Remove-Item -LiteralPath $sidecar -Force
+    foreach ($artifact in $releaseArtifacts) {
+        if (-not (Test-Path -LiteralPath $artifact)) {
+            continue
+        }
+        if (Test-Path -LiteralPath $artifact -PathType Container) {
+            Remove-VerifiedTree -Path $artifact -Parent $OutputRoot
+        }
+        else {
+            Remove-Item -LiteralPath $artifact -Force
+        }
     }
 }
 
@@ -753,10 +792,19 @@ try {
     }
     $zipHash = Get-LowerHash -Path $ZipPath -Algorithm SHA256
     [System.IO.File]::WriteAllText(
-        "$ZipPath.sha256",
+        $ZipSidecarPath,
         "$zipHash  $(Split-Path -Leaf $ZipPath)`n",
         [System.Text.UTF8Encoding]::new($false)
     )
+
+    if (-not (Test-Path -LiteralPath $PortableUpdateBuilder -PathType Leaf)) {
+        throw "Portable update builder is missing: $PortableUpdateBuilder"
+    }
+    Write-Step "Creating the data-safe incremental update assets."
+    $updateResult = & $PortableUpdateBuilder `
+        -ReleaseRoot $FinalRoot `
+        -OutputRoot $OutputRoot `
+        -Version $ReleaseVersion
 
     $releaseSize = (Get-ChildItem -LiteralPath $FinalRoot -File -Recurse | Measure-Object Length -Sum).Sum
     $zipSize = (Get-Item -LiteralPath $ZipPath).Length
@@ -766,6 +814,10 @@ try {
     Write-Host ("Folder size: {0:N2} GiB" -f ($releaseSize / 1GB))
     Write-Host ("ZIP size:    {0:N2} GiB" -f ($zipSize / 1GB))
     Write-Host "ZIP SHA256:  $zipHash"
+    Write-Host "Update ZIP:  $($updateResult.PackagePath)"
+    Write-Host "Update JSON: $($updateResult.ManifestPath)"
+    Write-Host "Update SUM:  $($updateResult.SidecarPath)"
+    Write-Host "Update SHA:  $($updateResult.PackageSha256)"
 }
 catch {
     Write-Host "[portable-build] ERROR: $($_.Exception.Message)" -ForegroundColor Red

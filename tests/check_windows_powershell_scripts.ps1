@@ -1,7 +1,10 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$scriptPaths = Get-ChildItem -Path (Join-Path $projectRoot "scripts") -Filter "*.ps1"
+$scriptPaths = @(
+    Get-ChildItem -Path (Join-Path $projectRoot "scripts") -Filter "*.ps1"
+    Get-Item -LiteralPath (Join-Path $projectRoot "tools\update_xp_gacha.ps1")
+)
 $hasErrors = $false
 
 foreach ($scriptPath in $scriptPaths) {

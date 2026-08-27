@@ -24,6 +24,7 @@
 /config/
 /run/
 /tmp/
+/updates/
 /library/
 /output1
 /data_processing/title_translation_results.jsonl

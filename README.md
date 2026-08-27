@@ -2,7 +2,7 @@
 
 XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据维护工具。当前主程序已经从 Streamlit 重构为 React 单页应用 + FastAPI API + MySQL；旧 Streamlit 入口仍保留用于兼容和对照，但不再是推荐入口。
 
-**当前版本：`v0.2.6`**
+**当前版本：`v0.2.7`**
 
 | 项目 | 当前实现 |
 | --- | --- |
@@ -35,7 +35,7 @@ XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据�
 
 ### 第一次启动
 
-1. 完整解压 `XP-Gacha-v0.2.6-portable-win64.zip`，不要在压缩软件预览窗口中直接运行。
+1. 完整解压 `XP-Gacha-v0.2.7-portable-win64.zip`，不要在压缩软件预览窗口中直接运行。
 2. 把目录放到普通本地可写位置。不要放进 `Program Files`、只读目录、网络盘或同步盘。
 3. 双击 `Start XP-Gacha.cmd`。
 4. 首次启动会在发行包根目录创建并列数据目录、初始化包内 MySQL、随机生成数据库凭据、启动应用并在健康检查通过后打开浏览器。
@@ -52,6 +52,7 @@ XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据�
 | `Start XP-Gacha.cmd` | 启动当前这一份包内 MySQL、API 和 Web |
 | `Stop XP-Gacha.cmd` | 安全停止当前包实例 |
 | `Check XP-Gacha.cmd` | 检查必需文件和 Python 模块能否加载 |
+| `Update XP-Gacha.cmd` | 在线检查 GitHub Release，并按当前源码版/便携版模式安全更新 |
 | `Open XP-Gacha Folder.cmd` | 打开发行包根目录及其并列数据目录 |
 | `portable-settings.env` | 可选端口、漫画目录、LLM/API 和在线封面设置 |
 | `BUILD-INFO.json` | 版本、源码状态、运行时版本和构建验证结果 |
@@ -82,7 +83,7 @@ XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据�
 
 助手页可以直接填写本地或线上 API 的 URL、模型名和 Key；保存时会更新包根目录的 `portable-settings.env`，下一次对话立即使用新配置，无需重启。页面和配置读取接口只会显示 Key 是否已配置，不会把已保存的 Key 明文回传；输入框留空会保留原 Key，只有点击“清除 Key”并保存才会删除。
 
-`portable-settings.env` 可能包含 API 密钥，不要公开；升级时需要单独逐项合并。
+`portable-settings.env` 可能包含 API 密钥，不要公开。一键增量更新不会覆盖它；改用完整 ZIP 手动迁移时需要单独逐项合并。
 
 `config/portable.json` 保存随机生成的 MySQL 账户和密码。它必须与根目录 `mysql` 成套备份和迁移；不要单独删除、重建或分享该文件。
 
@@ -466,11 +467,12 @@ XP-Gacha/
 ├─ scripts/
 │  ├─ start.ps1 / start.sh
 │  ├─ stop.ps1
-│  └─ build_portable_release.ps1
+│  ├─ build_portable_release.ps1
+│  └─ build_portable_update.ps1
 ├─ tests/                       API、便携启动器与 PowerShell 检查
 ├─ data_get/                    NH/JM 采集器
 ├─ data_processing/             CSV、翻译、缓存和向量脚本
-├─ tools/                       维护脚本
+├─ tools/                       维护脚本与通用更新器
 ├─ dictionaries/                四个标准词典
 ├─ data/gallery_info/           项目 CSV
 ├─ datacache/                   预处理、历史、导入备份
@@ -482,6 +484,7 @@ XP-Gacha/
 ├─ library/                     默认漫画目录
 ├─ config.py                    无密钥、环境变量驱动的运行配置
 ├─ launcher.py                  源码单进程入口
+├─ Update XP-Gacha.cmd          源码版/便携版共用的一键更新入口
 ├─ app.py                       Legacy Streamlit 入口
 ├─ Dockerfile
 └─ docker-compose.yml
@@ -583,14 +586,43 @@ XP-Gacha-v<version>-portable-win64/
 ├─ library/
 ├─ logs/
 ├─ run/
+├─ updates/backups/             便携增量更新的程序文件回滚备份
 └─ tmp/
 ```
 
 附录任务的默认相对路径现在在源码版和便携版中完全一致。例如直接填写 `data/gallery_info`、`models/Qwen3-Embedding-0.6B`、`manga_vectors/manga_vectors_Qwen3.pkl` 或 `b64_cache`，均会解析到项目/发行包根目录。自定义到包外的绝对漫画目录仍需单独备份。
 
-## 更新 Windows 便携包
+## 一键在线检查与增量更新
 
-当前没有联网自动更新器、自动数据库迁移器或失败自动回滚。采用“新目录解压 + 数据迁移 + 保留旧版回滚”的手动升级流程。
+源码版和 Windows 便携版都使用项目根目录的同一个入口：
+
+```text
+Update XP-Gacha.cmd
+```
+
+双击会检查 GitHub 上最新的正式 Release；只想检查、不安装时，可以在 PowerShell 或命令提示符中运行：
+
+```powershell
+.\Update XP-Gacha.cmd -CheckOnly
+```
+
+更新器会根据当前目录自动选择模式：
+
+| 当前目录 | 更新方式 | 安全边界 |
+| --- | --- | --- |
+| 源码仓库 | 从官方仓库获取最新 Release 对应的 Git tag，确认当前 `HEAD` 是目标提交的祖先后执行 `git merge --ff-only`；更新前 Docker 正在运行时才会重新构建并启动，原本已停止则保持停止 | 必须使用官方 `origin`、处于已签出的 `main` 分支且工作区干净；本地提交领先时不降级，历史分叉或有未提交文件时直接中止，不会自动 stash、reset 或覆盖本地修改 |
+| Windows 便携版 | 只下载 Release 中的小型应用层清单和增量 ZIP；校验版本、文件 SHA-256 与包内运行时兼容性后，停止当前实例、替换有变化的程序文件并按需重启 | 不下载或替换 Python/MySQL 运行时，不修改任何业务数据、模型、词典或个人设置；失败时从 `updates/backups` 自动恢复本次改动 |
+
+便携增量更新始终保护 `runtime`、`data`、`datacache`、`mysql`、`config`、`models`、`manga_vectors`、`library`、封面/缓存目录、`dictionaries`、`portable-settings.env` 等用户与运行时内容。旧的前端哈希文件只在受控的 `web/dist` 内整体替换；其他未知文件不会被顺手删除。`updates` 保存更新锁、下载暂存和按版本/时间划分的程序文件备份，也不会进入 Git。
+
+如果 Python、MySQL 或 `requirements-lock.txt` 与目标版本不兼容，更新器会保持现状并提示改用完整便携 ZIP；应用层增量包不负责运行时升级或数据库迁移。网络下载、清单、ZIP、逐文件校验、安装后自检中的任一步失败，都会在启动新版前中止或回滚。
+
+> [!IMPORTANT]
+> `v0.2.6` 及更早版本本身没有 `Update XP-Gacha.cmd`。首次接入自动更新时，请下载 `v0.2.7` 或更高版本的完整便携 ZIP，按下方迁移说明把原有数据与设置移入新目录；之后即可一直使用同一个一键入口。源码仓库只要拉取到包含该入口的版本即可。
+
+### 旧版手动迁移
+
+手动迁移仍用于 `v0.2.6` 及更早版本首次接入、运行时不兼容或需要数据库迁移的版本。采用“新目录解压 + 数据迁移 + 保留旧版回滚”的流程，不要把完整新版 ZIP 直接覆盖正在使用的旧目录。
 
 ### 从 v0.2.2 迁移到 v0.2.3
 
@@ -655,8 +687,13 @@ v0.2.3 之后在两个根目录并列布局版本之间升级时，仍要先停�
 ..\XP-Gacha-Releases/
 ├─ XP-Gacha-v<version>-portable-win64/
 ├─ XP-Gacha-v<version>-portable-win64.zip
-└─ XP-Gacha-v<version>-portable-win64.zip.sha256
+├─ XP-Gacha-v<version>-portable-win64.zip.sha256
+├─ XP-Gacha-v<version>-portable-win64-update.json
+├─ XP-Gacha-v<version>-portable-win64-update.zip
+└─ XP-Gacha-v<version>-portable-win64-update.zip.sha256
 ```
+
+完整 ZIP 与紧随其后的 `.sha256` 是首次安装/运行时升级所需的下载及校验值；三个 `-update` 文件是供一键更新器使用的应用层清单、增量 ZIP 和 ZIP 校验值。创建 GitHub Release 时应把这五个文件全部作为 Release assets 上传，且 tag 必须与 `v<version>` 一致；不要只上传增量包。
 
 构建流程会：
 
@@ -669,7 +706,8 @@ v0.2.3 之后在两个根目录并列布局版本之间升级时，仍要先停�
 7. 使用已生成的数据库凭据执行第二次重启 smoke test；
 8. 清空验证产生的 MySQL、配置、日志、缓存等根目录运行数据；
 9. 审计发行包不含业务数据；
-10. 生成 `BUILD-INFO.json`、`requirements-lock.txt`、逐文件 SHA-256、ZIP 和 ZIP 校验值。
+10. 生成 `BUILD-INFO.json`、`requirements-lock.txt`、逐文件 SHA-256、完整 ZIP 和 ZIP 校验值；
+11. 从验证完成的发行目录生成不含运行时与受保护数据的应用层更新快照、清单及校验值。
 
 常用参数：
 
@@ -696,9 +734,9 @@ v0.2.3 之后在两个根目录并列布局版本之间升级时，仍要先停�
 2. 更新 `server/__init__.py`；
 3. 运行前端构建和测试；
 4. 保持 Git 工作区干净并提交；
-5. 运行默认的完整便携包构建；
-6. 核对 `BUILD-INFO.json`、ZIP `.sha256` 和 `sourceDirty`；
-7. 发布 ZIP 与对应校验文件。
+5. 先在该提交创建与版本一致的 `v<version>` tag，并确认 tag 正好指向当前 `HEAD`；
+6. 运行默认的完整便携包构建；构建器会拒绝脏工作区、未通过首启验证或 tag/`sourceCommit` 不一致的自动更新资产；
+7. 核对 `BUILD-INFO.json`、完整 ZIP 与增量 ZIP 的 `.sha256`、更新清单和 `sourceDirty`，再把完整 ZIP/校验值以及三项 `-update` assets 发布到第 5 步的 Release tag。
 
 ## API 概览
 
@@ -742,6 +780,8 @@ Windows PowerShell 脚本检查：
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\check_windows_powershell_scripts.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\check_start_script_failure.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\update_xp_gacha.ps1 -SelfTest
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_portable_update.ps1 -SelfTest
 ```
 
 常用运行检查：
@@ -823,7 +863,7 @@ logs/app.log
 
 ### `ERROR 1045 ... using password: NO`
 
-先查看 `BUILD-INFO.json`，确认使用的是当前 `v0.2.6`，不是旧的 `v0.2.0` 启动器。`v0.2.1` 及以后版本已加入 MySQL 8.4 公钥认证参数。
+先查看 `BUILD-INFO.json`，确认使用的是当前 `v0.2.7`，不是旧的 `v0.2.0` 启动器。`v0.2.1` 及以后版本已加入 MySQL 8.4 公钥认证参数。
 
 同时确认：
 
@@ -846,7 +886,7 @@ logs/app.log
 - 同时只能运行一个附录任务。
 - 任务状态、终端输出和聊天记录不持久化，服务重启后丢失。
 - 通用任务“超时秒数”尚未由任务管理器强制执行。
-- 便携版当前没有自动更新器，升级采用手动迁移。
+- 一键更新只跟随 GitHub 最新正式 Release，不自动安装预发布版本；运行时或数据库需要迁移时仍须使用完整便携包和对应迁移说明。
 
 ## Legacy Streamlit
 

@@ -16,6 +16,7 @@
 - `Start XP-Gacha.cmd`：启动数据库、后端与网页并打开浏览器。
 - `Stop XP-Gacha.cmd`：安全停止当前这一份发行包的进程。
 - `Check XP-Gacha.cmd`：检查内置运行时和全部 Python 功能依赖。
+- `Update XP-Gacha.cmd`：在线检查最新正式版，并安全安装兼容的应用层增量更新。
 - `Open XP-Gacha Folder.cmd`：打开发行包根目录，数据库、缓存、日志和导入目录都在这里并列存放。
 - `portable-settings.env`：可选端口、漫画目录、LLM/API、在线封面与 NH 采集代理配置；不修改也能启动。
 - `logs`：启动失败时查看 `app.log`、`mysql-error.log` 和初始化日志。
@@ -26,7 +27,7 @@
 
 为了避免泄露密钥，后端不会把已保存的 Key 明文传回页面，只会显示是否已经配置。Key 输入框留空会保留原值；需要删除时，请点击“清除 Key”后再保存。本地 LM Studio 无需鉴权时，`LM_STUDIO_API_KEY` 可以留空。配置管理接口仅接受通过 `127.0.0.1`、`localhost` 或 `::1` 打开的本机页面请求。
 
-`portable-settings.env` 含有 Key 时不要分享、提交或随日志一起发送。升级到新版本时，应把其中的自定义项逐项合并到新包，而不是用旧文件整体覆盖新版模板。
+`portable-settings.env` 含有 Key 时不要分享、提交或随日志一起发送。一键增量更新不会覆盖该文件；改用完整新版 ZIP 手动迁移时，应把其中的自定义项逐项合并到新包，而不是用旧文件整体覆盖新版模板。
 
 ## 数据与模型
 
@@ -34,7 +35,28 @@
 
 如果使用本地语义/封面模型，请把模型和向量放入根目录的 `models` 与 `manga_vectors`，或在附录任务中按界面默认路径生成。AI 对话仍需要你自己的 LM Studio 或线上兼容 API；采集、在线封面和线上 API 功能仍需要网络。这些是项目功能本身的外部数据/服务，不属于需要安装的运行环境。
 
-便携版与源码版现在使用同一套根目录相对路径：`data`、`datacache`、`b64_cache`、`b64_tmp`、`localimgtmp`、`onlineimgtmp`、`library`、`manga_vectors`、`models`、`mysql`、`config`、`run`、`logs` 和 `tmp` 均与程序文件并列；词典位于根目录 `dictionaries`，工具缓存位于 `models/cache`。
+便携版与源码版现在使用同一套根目录相对路径：`data`、`datacache`、`b64_cache`、`b64_tmp`、`localimgtmp`、`onlineimgtmp`、`library`、`manga_vectors`、`models`、`mysql`、`config`、`run`、`logs` 和 `tmp` 均与程序文件并列；词典位于根目录 `dictionaries`，工具缓存位于 `models/cache`。`updates` 仅用于更新锁、下载暂存和 `updates/backups` 中的程序文件回滚备份。
+
+## 一键在线检查与增量更新
+
+双击根目录的 `Update XP-Gacha.cmd` 即可检查 GitHub 上最新的正式 Release，并在有兼容更新时完成下载、校验、停机、替换、自检和按需重启。只检查版本、不安装时，在 PowerShell 或命令提示符中运行：
+
+```powershell
+.\Update XP-Gacha.cmd -CheckOnly
+```
+
+更新包只包含应用程序层文件，不包含包内 Python、MySQL 或 VC++ 运行时。安装前会校验 Release 清单、更新 ZIP 和逐文件 SHA-256，并确认当前 Python、MySQL 和 `requirements-lock.txt` 与目标版本兼容；不兼容时会保持当前版本不变并提示下载完整便携 ZIP。
+
+下列内容始终受保护，不会被增量更新覆盖或删除：
+
+- `runtime`、`mysql`、`config`、`run`、`logs` 和 `tmp`；
+- `data`、`datacache`、`library`、`models`、`manga_vectors`、封面与缓存目录；
+- `dictionaries`、`portable-settings.env` 以及目录中的其他未知用户文件。
+
+更新器只在受控范围内整体替换 `web/dist`，其他程序文件按哈希仅复制有变化的内容。变更前的程序文件保存在 `updates/backups`；安装失败或安装后自检失败时会自动回滚。它不执行数据库或运行时迁移，因此看到兼容性提示时，应按 Release 说明解压完整新版到新目录并手动迁移数据。
+
+> [!IMPORTANT]
+> `v0.2.6` 及更早版本没有一键更新入口。请先下载 `v0.2.7` 或更高版本的完整便携 ZIP，并按下方说明迁移一次；以后即可直接使用同一个 `Update XP-Gacha.cmd`。
 
 ## 从 v0.2.2 升级到 v0.2.3
 
@@ -78,4 +100,4 @@ userdata/dictionaries/*   -> dictionaries/
 - 默认端口为网页 `8000`、MySQL `3307`；冲突时自动选择其他本机端口。
 - 可以复制整个文件夹制作互不共享数据库的独立实例。
 - 请把发行版放在普通可写目录，不要放入 `Program Files`、只读介质或需要管理员权限的位置。
-- 更新前先停止程序，并整体备份上述根目录数据文件夹、`dictionaries`、`portable-settings.env`；其中 `mysql` 与 `config` 必须成套备份。
+- 一键增量更新会自动停机并备份本次变更的程序文件；遇到运行时/数据库迁移或改用完整 ZIP 时，仍应先手动停机并整体备份上述数据目录、`dictionaries`、`portable-settings.env`，其中 `mysql` 与 `config` 必须成套备份。
