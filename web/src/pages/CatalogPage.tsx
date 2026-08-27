@@ -295,14 +295,18 @@ export function CatalogPage() {
           showAiRelevance={Boolean(filters.semanticQuery)}
           showCoverRelevance={Boolean(filters.coverQuery || filters.coverFileName)}
         />
-
-        {queueCount > 0 && <p className="pending-caption mono">有 {queueCount} 个封面正在后台抓取；完成后点击「刷新封面」查看。</p>}
-        <footer className="catalog-footnotes">
-          <p><sup>01</sup> 默认排序：推荐评分降序，其次按上传日期降序。当前范围 {start} ~ {end}。</p>
-          <p><sup>02</sup> 运行模式：{backendStatus === "online" ? "API / MySQL 实际数据" : "离线演示数据"}。</p>
-        </footer>
         </>}
       </section>
+
+      {!databaseEmpty && (
+        <div className="catalog-postscript">
+          {queueCount > 0 && <p className="pending-caption mono">有 {queueCount} 个封面正在后台抓取；完成后点击「刷新封面」查看。</p>}
+          <footer className="catalog-footnotes">
+            <p><sup>01</sup> 默认排序：推荐评分降序，其次按上传日期降序。当前范围 {start} ~ {end}。</p>
+            <p><sup>02</sup> 运行模式：{backendStatus === "online" ? "API / MySQL 实际数据" : "离线演示数据"}。</p>
+          </footer>
+        </div>
+      )}
     </div>
   );
 }
