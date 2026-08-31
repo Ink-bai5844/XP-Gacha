@@ -26,6 +26,7 @@ warnings.filterwarnings("ignore", message="Using `httpx` with `starlette.testcli
 from fastapi.testclient import TestClient
 
 from config import MAX_DISPLAY
+import server.main as server_main
 from server.main import app
 
 
@@ -154,6 +155,35 @@ class APISmokeTest(unittest.TestCase):
         scripts = self.client.get("/api/scripts")
         self.assertEqual(scripts.status_code, 200)
         self.assertEqual(len(scripts.json()["scripts"]), 26)
+
+    def test_health_does_not_request_full_system_status(self) -> None:
+        database = {
+            "available": True,
+            "table_ready": True,
+            "row_count": 12,
+            "error": None,
+        }
+        with (
+            patch.object(server_main.system, "health_status", return_value={"database": database}) as health,
+            patch.object(server_main.system, "status", side_effect=AssertionError("full status must not run")) as status,
+        ):
+            response = self.client.get("/api/health")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["database"], database)
+        health.assert_called_once_with()
+        status.assert_not_called()
+
+    def test_system_status_refresh_is_opt_in(self) -> None:
+        payload = {"counts": {"csv": 3}}
+        with patch.object(server_main.system, "status", return_value=payload) as status:
+            normal = self.client.get("/api/system/status")
+            refreshed = self.client.get("/api/system/status?refresh=true")
+
+        self.assertEqual(normal.status_code, 200, normal.text)
+        self.assertEqual(refreshed.status_code, 200, refreshed.text)
+        self.assertEqual(status.call_args_list[0].kwargs, {"refresh": False})
+        self.assertEqual(status.call_args_list[1].kwargs, {"refresh": True})
 
     def test_meta_exposes_configured_page_size(self) -> None:
         response = self.client.get("/api/meta/options")

@@ -56,6 +56,7 @@ charts = ChartsModule(library)
 imports = ImportModule(library)
 jobs = JobsModule(library.refresh)
 system = SystemModule()
+system.prime_counts()
 preferences = PreferencesModule()
 llm_settings = LLMSettingsModule()
 
@@ -146,7 +147,7 @@ def create_app() -> FastAPI:
 def register_api_routes(app: FastAPI) -> None:
     @app.get("/api/health")
     def health() -> dict:
-        status = system.status()
+        status = system.health_status()
         return {
             "status": "ok",
             "version": __version__,
@@ -155,8 +156,8 @@ def register_api_routes(app: FastAPI) -> None:
         }
 
     @app.get("/api/system/status")
-    def system_status() -> dict:
-        return system.status()
+    def system_status(refresh: bool = Query(False)) -> dict:
+        return system.status(refresh=refresh)
 
     @app.get("/api/meta/options")
     def meta_options() -> dict:

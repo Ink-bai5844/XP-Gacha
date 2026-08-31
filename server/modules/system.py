@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import copy
+import fnmatch
+import os
+import threading
 from pathlib import Path
 
 import config
@@ -11,10 +15,15 @@ CLIP_MODEL_URL = "https://huggingface.co/openai/clip-vit-base-patch32"
 
 
 def _count_files(path: str, pattern: str = "*") -> int:
-    directory = Path(path)
-    if not directory.exists():
+    try:
+        with os.scandir(path) as entries:
+            return sum(
+                1
+                for entry in entries
+                if fnmatch.fnmatch(entry.name, pattern) and entry.is_file()
+            )
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
         return 0
-    return sum(1 for entry in directory.glob(pattern) if entry.is_file())
 
 
 def _file_status(label: str, path: str) -> dict:
@@ -120,7 +129,43 @@ def _search_capabilities() -> dict:
 
 
 class SystemModule:
-    def status(self) -> dict:
+    def __init__(self) -> None:
+        self._counts_lock = threading.RLock()
+        self._counts_cache: dict | None = None
+
+    def health_status(self) -> dict:
+        """Return service dependencies without scanning any cache directories."""
+        return {"database": database_status()}
+
+    @staticmethod
+    def _build_counts() -> dict:
+        return {
+            "csv": _count_files(str(Path(config.DATA_ROOT) / "data" / "gallery_info"), "*.csv"),
+            "onlineCovers": _count_files(config.ONLINE_IMG_DIR),
+            "localThumbnails": _count_files(config.IMG_CACHE_DIR),
+            "base64": _count_files(config.B64_CACHE_DIR, "*.txt"),
+        }
+
+    def _counts(self, *, refresh: bool = False) -> dict:
+        """Return the cached directory counts, rebuilding only when requested."""
+        with self._counts_lock:
+            if self._counts_cache is None or refresh:
+                latest = self._build_counts()
+                self._counts_cache = latest
+            return copy.deepcopy(self._counts_cache)
+
+    def prime_counts(self) -> None:
+        """Build the initial snapshot before catalogue warm-up starts."""
+        self._counts()
+
+    def status(self, *, refresh: bool = False) -> dict:
+        """Return live lightweight state plus a cached directory-count snapshot.
+
+        The first status request builds the counts synchronously so callers never
+        receive misleading zero placeholders. Later requests, including browser
+        reloads, reuse the counts; ``refresh=True`` explicitly rebuilds only them.
+        Database, model, cache-file and path state remain lightweight and current.
+        """
         db = database_status()
         search_capabilities = _search_capabilities()
         return {
@@ -130,12 +175,7 @@ class SystemModule:
                 "clip": search_capabilities["cover"]["dependencies"]["model"]["ready"],
             },
             "searchCapabilities": search_capabilities,
-            "counts": {
-                "csv": _count_files(str(Path(config.DATA_ROOT) / "data" / "gallery_info"), "*.csv"),
-                "onlineCovers": _count_files(config.ONLINE_IMG_DIR),
-                "localThumbnails": _count_files(config.IMG_CACHE_DIR),
-                "base64": _count_files(config.B64_CACHE_DIR, "*.txt"),
-            },
+            "counts": self._counts(refresh=refresh),
             "caches": [
                 _file_status("预处理 DataFrame", str(Path(config.CACHE_DIR) / "preprocessed_df.pkl")),
                 _file_status("预处理 Hash", str(Path(config.CACHE_DIR) / "data.hash")),

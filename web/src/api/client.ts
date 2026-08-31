@@ -208,8 +208,9 @@ export function getCharts(scope: "global" | "history", signal?: AbortSignal) {
   return apiFetch<ChartPayload>(`/api/charts/${scope}`, { signal });
 }
 
-export function getSystemStatus(signal?: AbortSignal) {
-  return apiFetch<SystemStatus>("/api/system/status", { signal });
+export function getSystemStatus(options: { refresh?: boolean; signal?: AbortSignal } = {}) {
+  const params = options.refresh ? "?refresh=true" : "";
+  return apiFetch<SystemStatus>(`/api/system/status${params}`, { signal: options.signal });
 }
 
 export function getLLMSettings(signal?: AbortSignal) {

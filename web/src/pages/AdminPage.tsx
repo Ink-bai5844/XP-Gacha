@@ -1,5 +1,5 @@
 import { ArrowLeft, Database, FileArchive, Play, RefreshCw, Square, Terminal, Upload } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { cancelJob, getJob, getSystemStatus, importBundle, importProject, startJob } from "../api/client";
 import {
@@ -137,13 +137,16 @@ export function AdminPage() {
   const allScripts = useMemo(() => [...dataSections.flatMap((section) => section.scripts), ...collectionScripts], []);
   const [activeSection, setActiveSection] = useState(initialSection);
   const [collectionMode, setCollectionMode] = useState(collectionScripts[0].id);
-  const [statsToken, setStatsToken] = useState(0);
   const [values, setValues] = useState<Record<string, Record<string, ScriptFieldValue>>>(() => Object.fromEntries(allScripts.map((script) => [script.id, initialScriptValues(script)])));
   const [job, setJob] = useState<Job | null>(null);
   const timerRef = useRef<number | null>(null);
   const importSectionRef = useRef<HTMLElement | null>(null);
   const importFileInputRef = useRef<HTMLInputElement | null>(null);
+  const statsRequestRef = useRef(0);
   const [system, setSystem] = useState<SystemStatus | null>(null);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const [statsRefreshing, setStatsRefreshing] = useState(false);
+  const [statsError, setStatsError] = useState("");
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importMode, setImportMode] = useState<"upsert" | "replace">("upsert");
   const [importing, setImporting] = useState(false);
@@ -179,12 +182,39 @@ export function AdminPage() {
     setSearchParams({ section: sectionId }, { replace: true });
   };
 
-  const loadSystem = () => {
-    if (backendStatus !== "online") return;
-    void getSystemStatus().then(setSystem).catch((error: Error) => flash(`系统状态读取失败：${error.message}`));
-  };
+  const loadSystem = useCallback(async (refresh = false) => {
+    if (backendStatus !== "online") return false;
+    const requestId = statsRequestRef.current + 1;
+    statsRequestRef.current = requestId;
+    setStatsLoading(true);
+    setStatsRefreshing(refresh);
+    setStatsError("");
+    try {
+      const payload = await getSystemStatus({ refresh });
+      if (statsRequestRef.current === requestId) setSystem(payload);
+      return true;
+    } catch (error) {
+      if (statsRequestRef.current === requestId) {
+        const message = (error as Error).message;
+        setStatsError(message);
+        flash(`系统状态读取失败：${message}`);
+      }
+      return false;
+    } finally {
+      if (statsRequestRef.current === requestId) {
+        setStatsLoading(false);
+        setStatsRefreshing(false);
+      }
+    }
+  }, [backendStatus, flash]);
 
-  useEffect(loadSystem, [backendStatus, statsToken]);
+  useEffect(() => {
+    void loadSystem(false);
+  }, [loadSystem]);
+
+  const refreshStats = async () => {
+    if (await loadSystem(true)) flash("处理统计已重新扫描");
+  };
 
   const watchJob = (jobId: string, title: string) => {
     timerRef.current = window.setInterval(() => {
@@ -193,7 +223,7 @@ export function AdminPage() {
         if (["completed", "failed", "cancelled"].includes(current.status)) {
           if (timerRef.current) window.clearInterval(timerRef.current);
           timerRef.current = null;
-          loadSystem();
+          void loadSystem();
           refreshLibrary();
           flash(`${title}：${current.status === "completed" ? "任务完成" : "任务已结束"}`);
         }
@@ -231,7 +261,7 @@ export function AdminPage() {
       setImportResult(`已导入 ${result.imported} 条，当前总计 ${result.total ?? "—"} 条；识别 CSV ${result.csvFiles} 个。`);
       setImportSucceeded((result.total ?? 0) > 0);
       refreshLibrary();
-      loadSystem();
+      void loadSystem();
       flash("一键导入完成");
     } catch (error) {
       setImportSucceeded(false);
@@ -265,17 +295,34 @@ export function AdminPage() {
         {importSucceeded && <Link className="import-return-link" to="/"><ArrowLeft size={14} />返回库存目录查看已导入数据</Link>}
       </section>
 
-      <section className="system-overview">
-        <div className="overview-toolbar"><button type="button" onClick={() => { setStatsToken((value) => value + 1); flash("处理统计已刷新"); }}><RefreshCw size={14} />刷新统计</button><span className="mono">大目录文件数默认不自动扫描 · TOKEN {String(statsToken).padStart(3, "0")}</span></div>
+      <section className="system-overview" aria-busy={statsLoading}>
+        <div className="overview-toolbar">
+          <button type="button" disabled={backendStatus !== "online" || statsLoading} onClick={() => void refreshStats()}>
+            <RefreshCw size={14} />{statsRefreshing ? "正在重新统计…" : statsLoading ? "正在读取…" : "刷新统计"}
+          </button>
+          <span className="mono">
+            {statsRefreshing
+              ? "正在重新扫描大目录，请稍候"
+              : statsLoading
+                ? "正在读取已缓存的统计"
+                : statsError
+                  ? `读取失败：${statsError}`
+                  : system
+                    ? "普通加载使用缓存 · 点击按钮才重新扫描"
+                    : backendStatus === "offline" ? "后端离线" : "等待后端连接"}
+          </span>
+        </div>
         <div className="system-metrics">
-          <article><span>CSV</span><strong className="mono">{system?.counts.csv ?? 0}</strong></article>
-          <article><span>线上封面</span><strong className="mono">{system?.counts.onlineCovers ?? 0}</strong></article>
-          <article><span>本地缩略图</span><strong className="mono">{system?.counts.localThumbnails ?? 0}</strong></article>
-          <article><span>Base64</span><strong className="mono">{system?.counts.base64 ?? 0}</strong></article>
-          <article><span>数据库</span><strong className="mono">{system?.database.available ? system.database.row_count : "OFF"}</strong></article>
+          <article><span>CSV</span><strong className="mono">{system ? system.counts.csv : statsLoading ? "…" : "—"}</strong></article>
+          <article><span>线上封面</span><strong className="mono">{system ? system.counts.onlineCovers : statsLoading ? "…" : "—"}</strong></article>
+          <article><span>本地缩略图</span><strong className="mono">{system ? system.counts.localThumbnails : statsLoading ? "…" : "—"}</strong></article>
+          <article><span>Base64</span><strong className="mono">{system ? system.counts.base64 : statsLoading ? "…" : "—"}</strong></article>
+          <article><span>数据库</span><strong className="mono">{system ? system.database.available ? system.database.row_count : "OFF" : statsLoading ? "…" : "—"}</strong></article>
         </div>
         <table className="cache-status-table"><thead><tr><th>项目</th><th>路径</th><th>状态</th><th>大小 KB</th></tr></thead><tbody>
-          {system?.caches.map((cache) => <tr key={cache.name}><td>{cache.name}</td><td className="mono">{cache.path}</td><td>{cache.exists ? "存在" : "缺失"}</td><td className="mono number-col">{cache.sizeKb.toLocaleString()}</td></tr>)}
+          {system
+            ? system.caches.map((cache) => <tr key={cache.name}><td>{cache.name}</td><td className="mono">{cache.path}</td><td>{cache.exists ? "存在" : "缺失"}</td><td className="mono number-col">{cache.sizeKb.toLocaleString()}</td></tr>)
+            : <tr><td colSpan={4}>{statsLoading ? "正在读取统计缓存…" : "暂无统计数据"}</td></tr>}
         </tbody></table>
       </section>
 

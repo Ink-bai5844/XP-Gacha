@@ -16,6 +16,7 @@
 /models
 /onlineimgtmp
 # Python bytecode and caches at any directory depth
+/.venv/
 **/__pycache__/
 *.py[cod]
 *$py.class
