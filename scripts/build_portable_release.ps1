@@ -496,7 +496,7 @@ function Reset-ReleaseDataDirectories {
     }
     foreach ($relativePath in @(
         "data\gallery_info",
-        "data\gallery_info_no_name",
+        "data\gallery_info_origin",
         "data\local_data",
         "datacache\imports",
         "models\cache",

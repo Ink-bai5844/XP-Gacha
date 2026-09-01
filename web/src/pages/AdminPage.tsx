@@ -18,6 +18,7 @@ type Job = {
   title: string;
   status: "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
   lines: string[];
+  lineCount: number;
 };
 
 type SystemStatus = Awaited<ReturnType<typeof getSystemStatus>>;
@@ -85,7 +86,7 @@ function ScriptPanel({ script, values, setValues, activeJob, run }: {
   const [error, setError] = useState("");
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (script.confirmField && !values[script.confirmField]) {
+    if (script.confirmField && !values[script.confirmField] && !values.dryRun) {
       setError("请先勾选确认项。");
       return;
     }
@@ -140,6 +141,8 @@ export function AdminPage() {
   const [values, setValues] = useState<Record<string, Record<string, ScriptFieldValue>>>(() => Object.fromEntries(allScripts.map((script) => [script.id, initialScriptValues(script)])));
   const [job, setJob] = useState<Job | null>(null);
   const timerRef = useRef<number | null>(null);
+  const jobCursorRef = useRef(0);
+  const jobWatchTokenRef = useRef(0);
   const importSectionRef = useRef<HTMLElement | null>(null);
   const importFileInputRef = useRef<HTMLInputElement | null>(null);
   const statsRequestRef = useRef(0);
@@ -154,7 +157,8 @@ export function AdminPage() {
   const [importSucceeded, setImportSucceeded] = useState(false);
 
   useEffect(() => () => {
-    if (timerRef.current) window.clearInterval(timerRef.current);
+    jobWatchTokenRef.current += 1;
+    if (timerRef.current) window.clearTimeout(timerRef.current);
   }, []);
 
   useEffect(() => {
@@ -217,36 +221,71 @@ export function AdminPage() {
   };
 
   const watchJob = (jobId: string, title: string) => {
-    timerRef.current = window.setInterval(() => {
-      void getJob(jobId).then((current) => {
-        setJob({ id: current.id, scriptId: current.scriptId, title, status: current.status, lines: current.lines });
+    jobWatchTokenRef.current += 1;
+    const watchToken = jobWatchTokenRef.current;
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+
+    const poll = async () => {
+      if (watchToken !== jobWatchTokenRef.current) return;
+      let finished = false;
+      try {
+        const current = await getJob(jobId, jobCursorRef.current);
+        if (watchToken !== jobWatchTokenRef.current) return;
+        jobCursorRef.current = current.lineCount;
+        setJob((existing) => ({
+          id: current.id,
+          scriptId: current.scriptId,
+          title,
+          status: current.status,
+          lines: existing?.id === current.id ? [...existing.lines, ...current.lines] : current.lines,
+          lineCount: current.lineCount,
+        }));
         if (["completed", "failed", "cancelled"].includes(current.status)) {
-          if (timerRef.current) window.clearInterval(timerRef.current);
-          timerRef.current = null;
+          finished = true;
           void loadSystem();
           refreshLibrary();
           flash(`${title}：${current.status === "completed" ? "任务完成" : "任务已结束"}`);
         }
-      }).catch((error: Error) => {
-        if (timerRef.current) window.clearInterval(timerRef.current);
-        timerRef.current = null;
-        flash(`任务状态读取失败：${error.message}`);
-      });
-    }, 650);
+      } catch (error) {
+        if (watchToken !== jobWatchTokenRef.current) return;
+        finished = true;
+        flash(`任务状态读取失败：${(error as Error).message}`);
+      } finally {
+        if (watchToken === jobWatchTokenRef.current && !finished) {
+          timerRef.current = window.setTimeout(() => void poll(), 650);
+        } else if (watchToken === jobWatchTokenRef.current) {
+          timerRef.current = null;
+        }
+      }
+    };
+
+    timerRef.current = window.setTimeout(() => void poll(), 650);
   };
 
   const run = (script: ScriptDefinition) => {
     if (job && ["queued", "running", "cancelling"].includes(job.status)) return;
     if (backendStatus !== "online") { flash("后端离线，无法执行真实任务"); return; }
     void startJob(script.id, values[script.id] as Record<string, unknown>).then((started) => {
-      setJob({ id: started.id, scriptId: script.id, title: script.title, status: started.status, lines: started.lines });
+      jobCursorRef.current = started.lineCount;
+      setJob({ id: started.id, scriptId: script.id, title: script.title, status: started.status, lines: started.lines, lineCount: started.lineCount });
       watchJob(started.id, script.title);
     }).catch((error: Error) => flash(`启动失败：${error.message}`));
   };
 
   const cancel = () => {
     if (!job?.id) return;
-    void cancelJob(job.id).then((current) => setJob((existing) => existing ? { ...existing, status: current.status, lines: current.lines } : existing)).catch((error: Error) => flash(error.message));
+    const cancellingJob = job;
+    jobWatchTokenRef.current += 1;
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+    void cancelJob(cancellingJob.id).then((current) => {
+      jobCursorRef.current = current.lineCount;
+      setJob((existing) => existing ? { ...existing, status: current.status, lines: current.lines, lineCount: current.lineCount } : existing);
+      if (["queued", "running", "cancelling"].includes(current.status)) watchJob(current.id, cancellingJob.title);
+    }).catch((error: Error) => {
+      flash(error.message);
+      watchJob(cancellingJob.id, cancellingJob.title);
+    });
   };
 
   const runImport = async (projectData = false) => {
@@ -342,7 +381,7 @@ export function AdminPage() {
 
       {activeSection === "collection" && (
         <section className="appendix-section">
-          <header><span className="mono">A.6</span><h3>采集入口</h3><p>选择采集流程，并配置网址、页数、输出路径、并发数与超时参数。</p></header>
+          <header><span className="mono">A.6</span><h3>采集入口</h3><p>选择采集流程，并配置范围、输出路径、并发数与自动重试参数。</p></header>
           <label className="collection-mode">流程<select value={collectionMode} onChange={(event) => setCollectionMode(event.target.value)}>{collectionScripts.map((script) => <option value={script.id} key={script.id}>{script.title}</option>)}</select></label>
           <ScriptPanel script={collectionSelected} values={values[collectionSelected.id]} setValues={(next) => setValues((current) => ({ ...current, [collectionSelected.id]: next }))} activeJob={job} run={run} />
         </section>

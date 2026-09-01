@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 
-CSV_DIR = Path("data/gallery_info_no_name")
+CSV_DIR = Path("data/gallery_info_origin")
 LINK_COLUMN = "链接"
 ID_COLUMN = "ID"
 ID_PREFIX = "NH"

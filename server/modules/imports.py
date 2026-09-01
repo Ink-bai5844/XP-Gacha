@@ -169,6 +169,17 @@ def import_dataframe(frame: pd.DataFrame, mode: str = "upsert") -> dict:
                     connection.execute(text(f"DROP TABLE IF EXISTS `{staging}`"))
         else:
             existing = pd.read_sql("SELECT * FROM gallery_info", engine)
+            if not existing.empty:
+                existing = normalize_dataframe(existing)
+                translations = existing.set_index(ID_COLUMN)["标题译文"].astype(str)
+                incoming_translation = frame["标题译文"].astype(str).str.strip()
+                missing_translation = incoming_translation == ""
+                frame = frame.copy()
+                frame.loc[missing_translation, "标题译文"] = (
+                    frame.loc[missing_translation, ID_COLUMN]
+                    .map(translations)
+                    .fillna("")
+                )
             combined = pd.concat([existing, frame], ignore_index=True)
             combined = normalize_dataframe(combined)
             combined.to_sql("gallery_info", engine, if_exists="replace", index=False)

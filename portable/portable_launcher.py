@@ -523,7 +523,7 @@ def ensure_package_layout() -> None:
         TMP_ROOT,
         MYSQL_DATA_ROOT.parent,
         PACKAGE_ROOT / "data" / "gallery_info",
-        PACKAGE_ROOT / "data" / "gallery_info_no_name",
+        PACKAGE_ROOT / "data" / "gallery_info_origin",
         PACKAGE_ROOT / "data" / "local_data",
         PACKAGE_ROOT / "datacache" / "imports",
         PACKAGE_ROOT / "b64_cache",

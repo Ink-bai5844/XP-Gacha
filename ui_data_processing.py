@@ -331,7 +331,7 @@ def render_overview() -> None:
 def render_csv_tools() -> None:
     with st.expander("补全文件名列", expanded=False):
         with st.form("process-addname"):
-            csv_file = st.text_input("CSV 文件", "data/gallery_info_no_name/JM_info_yuri.csv")
+            csv_file = st.text_input("CSV 文件", "data/gallery_info_origin/JM_info_yuri.csv")
             txt_file = st.text_input("本地链接 HTML/TXT", "data/local_data/NH_all.txt")
             output_file = st.text_input("输出 CSV", "data/gallery_info/JM_info_yuri_full.csv")
             timeout = st.number_input("超时秒数", 10, 7200, 600, 10, key="addname-timeout")
@@ -349,7 +349,7 @@ def render_csv_tools() -> None:
 
     with st.expander("NH 链接补 ID", expanded=False):
         with st.form("process-add-id"):
-            csv_dir = st.text_input("CSV 目录", "data/gallery_info_no_name", key="add-id-dir")
+            csv_dir = st.text_input("CSV 目录", "data/gallery_info_origin", key="add-id-dir")
             prefix = st.text_input("ID 前缀", "NH", key="add-id-prefix")
             timeout = st.number_input("超时秒数", 10, 7200, 600, 10, key="add-id-timeout")
             code = module_call_code(
@@ -362,7 +362,7 @@ def render_csv_tools() -> None:
 
     with st.expander("迁移语言标签", expanded=False):
         with st.form("process-add-lang"):
-            csv_path = st.text_input("CSV 文件", "data/gallery_info_no_name/JM_info_gender_bender.csv")
+            csv_path = st.text_input("CSV 文件", "data/gallery_info_origin/JM_info_gender_bender.csv")
             language_tags_raw = st.text_input("语言标签", "中文, 英文, 日文")
             timeout = st.number_input("超时秒数", 10, 7200, 600, 10, key="add-lang-timeout")
             language_tags = {
@@ -791,6 +791,58 @@ def render_maintenance_tools() -> None:
             )
         render_result("merge-b64", "操作输出会显示在这里。")
 
+    with st.expander("从数据库中提取标题译文至 gallery_info CSV", expanded=False):
+        with st.form("maintenance-export-title-translations"):
+            csv_dir = st.text_input(
+                "CSV 目录",
+                "data/gallery_info",
+                key="export-title-translations-csv-dir",
+            )
+            pattern = st.text_input(
+                "文件匹配规则",
+                "*_full.csv",
+                help="只匹配当前目录内的文件名，不支持子目录或路径分隔符。",
+                key="export-title-translations-pattern",
+            )
+            dry_run = st.checkbox(
+                "仅预览，不写入 CSV",
+                value=True,
+                key="export-title-translations-dry-run",
+            )
+            timeout = st.number_input(
+                "超时秒数",
+                10,
+                7200,
+                600,
+                10,
+                key="export-title-translations-timeout",
+            )
+            confirm = st.checkbox(
+                "确认批量更新匹配的 CSV 文件",
+                value=False,
+                disabled=dry_run,
+                key="export-title-translations-confirm",
+            )
+            command = [
+                PYTHON,
+                str(PROJECT_ROOT / "tools" / "export_title_translations_to_csv.py"),
+                "--csv-dir",
+                csv_dir,
+                "--pattern",
+                pattern,
+            ]
+            if dry_run:
+                command.append("--dry-run")
+            submit_subprocess(
+                "预览译文回填" if dry_run else "提取并写入标题译文",
+                "export-title-translations",
+                command,
+                timeout,
+                disabled=not csv_dir.strip() or not pattern.strip(),
+                require_confirm=dry_run or confirm,
+            )
+        render_result("export-title-translations", "脚本输出会显示在这里。")
+
     with st.expander("清理标题翻译 JSONL failed 条目", expanded=False):
         with st.form("maintenance-clean-title-jsonl"):
             jsonl_path = st.text_input(
@@ -924,17 +976,16 @@ def render_collection_tools() -> None:
     mode = st.selectbox(
         "流程",
         [
-            "NH 在线抓信息",
-            "JM 在线抓信息",
-            "NH 在线失败页重试",
-            "JM 在线失败页重试",
-            "NH 本地链接抓信息",
-            "NH 本地链接抓图片",
+            "NH 在线完整采集",
+            "JM 在线完整采集",
+            "NH 本地链接完整采集",
+            "NH 本地链接抓取分册图片",
         ],
         key="collection-script",
     )
+    st.caption("首轮结束后只重试上一轮未完成项；最多轮数为 0 时会持续到全部成功，或由用户终止进程。")
 
-    if mode == "NH 在线抓信息":
+    if mode == "NH 在线完整采集":
         with st.form("process-nh-online"):
             base_url = st.text_input("站点 Base URL", "https://nhentai.net")
             start_url = st.text_input(
@@ -942,43 +993,89 @@ def render_collection_tools() -> None:
                 "https://nhentai.net/language/chinese/?sort=date",
                 help="作为第 1 页；后续页会自动追加或替换 page 参数。",
             )
-            max_page = st.number_input("抓到多少页截止", 1, 100000, 1, 1)
-            output_csv = st.text_input("保存 CSV 文件名及路径", "gallery_info_chinese.csv")
-            image_dir = st.text_input("缩略图保存目录", "onlineimgtmp")
-            error_log = st.text_input("错误日志路径", "logs/NH_error_log_online.txt")
-            max_workers = st.number_input("并发线程数", 1, 64, 10, 1, key="nh-online-workers")
-            timeout = st.number_input("超时秒数", 10, 86400, 1800, 60, key="nh-online-timeout")
-            confirm = st.checkbox("确认执行采集脚本", value=False)
-            code = module_call_code(
-                "data_get.NH_get_info_online",
-                {
-                    "BASE_URL": base_url,
-                    "START_URL": start_url,
-                    "MAX_PAGE": int(max_page),
-                    "OUTPUT_CSV": output_csv,
-                    "IMG_DIR": image_dir,
-                    "ERROR_LOG": error_log,
-                    "MAX_WORKERS": int(max_workers),
-                    "LOOP_CRAWL": False,
-                },
-                (
-                    "mod.main("
-                    "max_page=mod.MAX_PAGE, "
-                    "start_url=mod.START_URL, "
-                    "base_url=mod.BASE_URL, "
-                    "output_csv=mod.OUTPUT_CSV, "
-                    "image_dir=mod.IMG_DIR, "
-                    "error_log=mod.ERROR_LOG, "
-                    "max_workers=mod.MAX_WORKERS, "
-                    "loop=mod.LOOP_CRAWL"
-                    ")"
-                ),
+            max_pages = st.number_input("抓到多少页截止", 1, 100000, 1, 1)
+            output_csv = st.text_input(
+                "原始信息 CSV",
+                "data/gallery_info_origin/NH_info_chinese.csv",
             )
-            submit_python_code("开始抓取 NH 信息", "collection-nh-online", code, timeout, require_confirm=confirm)
+            image_dir = st.text_input("缩略图保存目录", "onlineimgtmp")
+            workers = st.number_input("并发线程数", 1, 64, 10, 1, key="nh-online-workers")
+            request_attempts = st.number_input("单次请求尝试次数", 1, 20, 3, 1, key="nh-online-attempts")
+            max_rounds = st.number_input(
+                "最多轮数（含首轮，0 表示直至成功）",
+                0,
+                100000,
+                0,
+                1,
+                key="nh-online-rounds",
+            )
+            retry_backoff = st.number_input("重试退避基数秒数", 0.0, 3600.0, 2.0, 0.5, key="nh-online-backoff")
+            request_timeout = st.number_input("单次 HTTP 超时秒数", 1.0, 600.0, 30.0, 1.0, key="nh-online-http-timeout")
+            interval = st.number_input("成功项目间隔秒数", 0.0, 60.0, 0.0, 0.5, key="nh-online-interval")
+            proxy = st.text_input(
+                "HTTP(S) 代理（可留空）",
+                "",
+                help="留空使用 ONLINE_COVER_PROXY 环境配置；填写后仅覆盖本次任务。",
+                key="nh-online-proxy",
+            )
+            no_resume = st.checkbox(
+                "忽略已有断点，从新一轮开始",
+                value=False,
+                help="启用后不恢复上次未完成状态。",
+                key="nh-online-no-resume",
+            )
+            state_file = st.text_input(
+                "断点状态 JSONL（可留空）",
+                "",
+                help="留空时按模式、网址和输出路径在 logs/collection 中生成唯一文件。",
+            )
+            error_log = st.text_input(
+                "失败记录 JSONL（可留空）",
+                "",
+                help="留空时与断点参数一起生成唯一文件。",
+            )
+            confirm = st.checkbox("确认执行完整采集", value=False)
+            command = [
+                PYTHON,
+                "-m",
+                "data_get.collector",
+                "nh-online",
+                "--base-url",
+                base_url,
+                "--start-url",
+                start_url,
+                "--max-pages",
+                str(int(max_pages)),
+                "--output-csv",
+                output_csv,
+                "--image-dir",
+                image_dir,
+                "--workers",
+                str(int(workers)),
+                "--request-attempts",
+                str(int(request_attempts)),
+                "--max-rounds",
+                str(int(max_rounds)),
+                "--retry-backoff",
+                str(float(retry_backoff)),
+                "--timeout",
+                str(float(request_timeout)),
+                "--interval",
+                str(float(interval)),
+                "--state-file",
+                state_file,
+                "--error-log",
+                error_log,
+            ]
+            if proxy.strip():
+                command.extend(["--proxy", proxy.strip()])
+            if no_resume:
+                command.append("--no-resume")
+            submit_subprocess("开始完整采集 NH", "collection-nh-online", command, 0, require_confirm=confirm)
         render_result("collection-nh-online", "脚本输出会显示在这里。")
         return
 
-    if mode == "JM 在线抓信息":
+    if mode == "JM 在线完整采集":
         with st.form("process-jm-online"):
             base_url = st.text_input("站点 Base URL", "https://18comic.vip")
             start_url = st.text_input(
@@ -987,146 +1084,262 @@ def render_collection_tools() -> None:
                 help="作为第 1 页；后续页会自动追加或替换 page 参数。",
             )
             max_pages = st.number_input("抓到多少页截止", 1, 100000, 80, 1)
-            csv_path = st.text_input("保存 CSV 文件名及路径", "JM_info_yuri.csv")
-            output_dir = st.text_input("封面保存目录", "onlineimgtmp")
-            max_workers = st.number_input("并发线程数", 1, 64, 5, 1, key="jm-online-workers")
-            timeout = st.number_input("超时秒数", 10, 86400, 3600, 60, key="jm-online-timeout")
-            confirm = st.checkbox("确认执行采集脚本", value=False)
-            code = module_call_code(
-                "data_get.JM_get_info_online",
-                {
-                    "BASE_URL": base_url,
-                    "START_URL": start_url,
-                    "MAX_PAGES": int(max_pages),
-                    "CSV_PATH": csv_path,
-                    "OUTPUT_DIR": output_dir,
-                    "MAX_WORKERS": int(max_workers),
-                },
-                (
-                    "import os\n"
-                    "os.makedirs(os.path.dirname(mod.CSV_PATH) or '.', exist_ok=True)\n"
-                    "os.makedirs(mod.OUTPUT_DIR, exist_ok=True)\n"
-                    "mod.scrape_18comic()"
-                ),
+            output_csv = st.text_input(
+                "原始信息 CSV",
+                "data/gallery_info_origin/JM_info_yuri.csv",
             )
-            submit_python_code("开始抓取 JM 信息", "collection-jm-online", code, timeout, require_confirm=confirm)
+            image_dir = st.text_input("封面保存目录", "onlineimgtmp")
+            workers = st.number_input("并发线程数", 1, 64, 5, 1, key="jm-online-workers")
+            request_attempts = st.number_input("单次请求尝试次数", 1, 20, 3, 1, key="jm-online-attempts")
+            max_rounds = st.number_input(
+                "最多轮数（含首轮，0 表示直至成功）",
+                0,
+                100000,
+                0,
+                1,
+                key="jm-online-rounds",
+            )
+            retry_backoff = st.number_input("重试退避基数秒数", 0.0, 3600.0, 2.0, 0.5, key="jm-online-backoff")
+            request_timeout = st.number_input("单次 HTTP 超时秒数", 1.0, 600.0, 30.0, 1.0, key="jm-online-http-timeout")
+            interval = st.number_input("成功项目间隔秒数", 0.0, 60.0, 0.0, 0.5, key="jm-online-interval")
+            proxy = st.text_input(
+                "HTTP(S) 代理（可留空）",
+                "",
+                help="留空使用 ONLINE_COVER_PROXY 环境配置；填写后仅覆盖本次任务。",
+                key="jm-online-proxy",
+            )
+            no_resume = st.checkbox(
+                "忽略已有断点，从新一轮开始",
+                value=False,
+                help="启用后不恢复上次未完成状态。",
+                key="jm-online-no-resume",
+            )
+            state_file = st.text_input(
+                "断点状态 JSONL（可留空）",
+                "",
+                help="留空时按模式、网址和输出路径在 logs/collection 中生成唯一文件。",
+            )
+            error_log = st.text_input(
+                "失败记录 JSONL（可留空）",
+                "",
+                help="留空时与断点参数一起生成唯一文件。",
+            )
+            confirm = st.checkbox("确认执行完整采集", value=False)
+            command = [
+                PYTHON,
+                "-m",
+                "data_get.collector",
+                "jm-online",
+                "--base-url",
+                base_url,
+                "--start-url",
+                start_url,
+                "--max-pages",
+                str(int(max_pages)),
+                "--output-csv",
+                output_csv,
+                "--image-dir",
+                image_dir,
+                "--workers",
+                str(int(workers)),
+                "--request-attempts",
+                str(int(request_attempts)),
+                "--max-rounds",
+                str(int(max_rounds)),
+                "--retry-backoff",
+                str(float(retry_backoff)),
+                "--timeout",
+                str(float(request_timeout)),
+                "--interval",
+                str(float(interval)),
+                "--state-file",
+                state_file,
+                "--error-log",
+                error_log,
+            ]
+            if proxy.strip():
+                command.extend(["--proxy", proxy.strip()])
+            if no_resume:
+                command.append("--no-resume")
+            submit_subprocess("开始完整采集 JM", "collection-jm-online", command, 0, require_confirm=confirm)
         render_result("collection-jm-online", "脚本输出会显示在这里。")
         return
 
-    if mode == "NH 本地链接抓信息":
+    if mode == "NH 本地链接完整采集":
         with st.form("process-nh-local-info"):
+            base_url = st.text_input("站点 Base URL", "https://nhentai.net", key="nh-local-info-base-url")
             input_file = st.text_input("本地链接 HTML/TXT", "data/local_data/NH_all.txt")
-            output_csv = st.text_input("保存 CSV 文件名及路径", "gallery_info_local.csv")
-            error_log = st.text_input("错误日志路径", "logs/NH_error_log_local.txt")
-            interval = st.number_input("请求间隔秒数", 0.0, 60.0, 2.0, 0.5)
-            timeout = st.number_input("超时秒数", 10, 86400, 1800, 60, key="nh-local-info-timeout")
-            confirm = st.checkbox("确认执行采集脚本", value=False)
-            code = module_call_code(
-                "data_get.local.NH_get_info_local",
-                {
-                    "INPUT_FILE": input_file,
-                    "OUTPUT_CSV": output_csv,
-                    "ERROR_LOG": error_log,
-                    "REQUEST_INTERVAL_SECONDS": float(interval),
-                },
-                "mod.main()",
+            output_csv = st.text_input(
+                "原始信息 CSV",
+                "data/gallery_info_origin/NH_info_local.csv",
             )
-            submit_python_code("开始解析本地链接", "collection-nh-local-info", code, timeout, require_confirm=confirm)
+            image_dir = st.text_input("缩略图保存目录", "onlineimgtmp", key="nh-local-info-image-dir")
+            workers = st.number_input("并发线程数", 1, 64, 5, 1, key="nh-local-info-workers")
+            request_attempts = st.number_input("单次请求尝试次数", 1, 20, 3, 1, key="nh-local-info-attempts")
+            request_timeout = st.number_input(
+                "单次 HTTP 超时秒数",
+                1.0,
+                600.0,
+                30.0,
+                1.0,
+                key="nh-local-info-http-timeout",
+            )
+            max_rounds = st.number_input(
+                "最多轮数（含首轮，0 表示直至成功）",
+                0,
+                100000,
+                0,
+                1,
+                key="nh-local-info-rounds",
+            )
+            retry_backoff = st.number_input("重试退避基数秒数", 0.0, 3600.0, 2.0, 0.5, key="nh-local-info-backoff")
+            interval = st.number_input("成功项目间隔秒数", 0.0, 60.0, 0.0, 0.5, key="nh-local-info-interval")
+            proxy = st.text_input(
+                "HTTP(S) 代理（可留空）",
+                "",
+                help="留空使用 ONLINE_COVER_PROXY 环境配置；填写后仅覆盖本次任务。",
+                key="nh-local-info-proxy",
+            )
+            no_resume = st.checkbox(
+                "忽略已有断点，从新一轮开始",
+                value=False,
+                help="启用后不恢复上次未完成状态。",
+                key="nh-local-info-no-resume",
+            )
+            state_file = st.text_input(
+                "断点状态 JSONL（可留空）",
+                "",
+                help="留空时按输入和输出路径在 logs/collection 中生成唯一文件。",
+            )
+            error_log = st.text_input(
+                "失败记录 JSONL（可留空）",
+                "",
+                help="留空时与断点参数一起生成唯一文件。",
+            )
+            confirm = st.checkbox("确认执行完整采集", value=False)
+            command = [
+                PYTHON,
+                "-m",
+                "data_get.collector",
+                "nh-local-info",
+                "--base-url",
+                base_url,
+                "--input-file",
+                input_file,
+                "--output-csv",
+                output_csv,
+                "--image-dir",
+                image_dir,
+                "--workers",
+                str(int(workers)),
+                "--request-attempts",
+                str(int(request_attempts)),
+                "--timeout",
+                str(float(request_timeout)),
+                "--max-rounds",
+                str(int(max_rounds)),
+                "--retry-backoff",
+                str(float(retry_backoff)),
+                "--interval",
+                str(float(interval)),
+                "--state-file",
+                state_file,
+                "--error-log",
+                error_log,
+            ]
+            if proxy.strip():
+                command.extend(["--proxy", proxy.strip()])
+            if no_resume:
+                command.append("--no-resume")
+            submit_subprocess("开始完整采集本地链接", "collection-nh-local-info", command, 0, require_confirm=confirm)
         render_result("collection-nh-local-info", "脚本输出会显示在这里。")
         return
 
-    if mode == "NH 本地链接抓图片":
+    if mode == "NH 本地链接抓取分册图片":
         with st.form("process-nh-local-images"):
+            base_url = st.text_input("站点 Base URL", "https://nhentai.net", key="nh-local-images-base-url")
             input_file = st.text_input("本地链接 HTML/TXT", "data/local_data/NH_2.txt")
-            root_dir = st.text_input("图片保存根目录", "output")
-            error_log = st.text_input("错误日志路径", "logs/NH_error_log_images_local.txt")
+            output_dir = st.text_input("图片保存根目录", "output")
             max_page_limit = st.number_input("单本最大页数保护", 1, 10000, 200, 1)
-            interval = st.number_input("请求间隔秒数", 0.0, 60.0, 1.5, 0.5, key="nh-local-img-interval")
-            retries = st.number_input("页面请求重试次数", 1, 20, 3, 1)
-            timeout = st.number_input("超时秒数", 10, 86400, 3600, 60, key="nh-local-img-timeout")
-            confirm = st.checkbox("确认执行采集脚本", value=False)
-            code = module_call_code(
-                "data_get.local.NH_get_images_local",
-                {
-                    "INPUT_FILE": input_file,
-                    "ROOT_DIR": root_dir,
-                    "ERROR_LOG": error_log,
-                    "MAX_PAGE_LIMIT": int(max_page_limit),
-                    "REQUEST_INTERVAL_SECONDS": float(interval),
-                    "PAGE_RETRY_TIMES": int(retries),
-                },
-                "mod.main()",
+            workers = st.number_input("并发线程数", 1, 64, 4, 1, key="nh-local-images-workers")
+            request_attempts = st.number_input("单次请求尝试次数", 1, 20, 3, 1, key="nh-local-images-attempts")
+            request_timeout = st.number_input(
+                "单次 HTTP 超时秒数",
+                1.0,
+                600.0,
+                30.0,
+                1.0,
+                key="nh-local-images-http-timeout",
             )
-            submit_python_code("开始抓取本地链接图片", "collection-nh-local-images", code, timeout, require_confirm=confirm)
+            max_rounds = st.number_input(
+                "最多轮数（含首轮，0 表示直至成功）",
+                0,
+                100000,
+                0,
+                1,
+                key="nh-local-images-rounds",
+            )
+            retry_backoff = st.number_input("重试退避基数秒数", 0.0, 3600.0, 2.0, 0.5, key="nh-local-images-backoff")
+            interval = st.number_input("成功图片间隔秒数", 0.0, 60.0, 0.0, 0.5, key="nh-local-images-interval")
+            proxy = st.text_input(
+                "HTTP(S) 代理（可留空）",
+                "",
+                help="留空使用 ONLINE_COVER_PROXY 环境配置；填写后仅覆盖本次任务。",
+                key="nh-local-images-proxy",
+            )
+            no_resume = st.checkbox(
+                "忽略已有断点，从新一轮开始",
+                value=False,
+                help="启用后不恢复上次未完成状态。",
+                key="nh-local-images-no-resume",
+            )
+            state_file = st.text_input(
+                "断点状态 JSONL（可留空）",
+                "",
+                help="留空时按输入和输出路径在 logs/collection 中生成唯一文件。",
+            )
+            error_log = st.text_input(
+                "失败记录 JSONL（可留空）",
+                "",
+                help="留空时与断点参数一起生成唯一文件。",
+            )
+            confirm = st.checkbox("确认执行完整采集", value=False)
+            command = [
+                PYTHON,
+                "-m",
+                "data_get.collector",
+                "nh-local-images",
+                "--base-url",
+                base_url,
+                "--input-file",
+                input_file,
+                "--output-dir",
+                output_dir,
+                "--max-pages",
+                str(int(max_page_limit)),
+                "--workers",
+                str(int(workers)),
+                "--request-attempts",
+                str(int(request_attempts)),
+                "--timeout",
+                str(float(request_timeout)),
+                "--max-rounds",
+                str(int(max_rounds)),
+                "--retry-backoff",
+                str(float(retry_backoff)),
+                "--interval",
+                str(float(interval)),
+                "--state-file",
+                state_file,
+                "--error-log",
+                error_log,
+            ]
+            if proxy.strip():
+                command.extend(["--proxy", proxy.strip()])
+            if no_resume:
+                command.append("--no-resume")
+            submit_subprocess("开始完整抓取分册图片", "collection-nh-local-images", command, 0, require_confirm=confirm)
         render_result("collection-nh-local-images", "脚本输出会显示在这里。")
-        return
-
-    if mode == "NH 在线失败页重试":
-        with st.form("process-nh-retry"):
-            base_url = st.text_input("站点 Base URL", "https://nhentai.net", key="nh-retry-base-url")
-            start_url = st.text_input(
-                "重试页起始网址",
-                "https://nhentai.net/language/chinese/?sort=date",
-                help="用于根据错误页码重新拼接列表页 URL。",
-                key="nh-retry-start-url",
-            )
-            source_error_log = st.text_input("读取的错误 Log 文件", "logs/NH_error_log_online.txt")
-            retry_error_log = st.text_input("输出的错误报告文件", "logs/NH_error_log_online_fix.txt")
-            output_csv = st.text_input("保存 CSV 文件名及路径", "gallery_info_chinese.csv")
-            image_dir = st.text_input("缩略图保存目录", "onlineimgtmp")
-            max_workers = st.number_input("并发线程数", 1, 64, 10, 1, key="nh-retry-workers")
-            timeout = st.number_input("超时秒数", 10, 86400, 3600, 60, key="nh-retry-timeout")
-            confirm = st.checkbox("确认执行失败页重试", value=False)
-            code = module_call_code(
-                "data_get.NH_get_info_online_fix",
-                {
-                    "BASE_URL": base_url,
-                    "START_URL": start_url,
-                    "SOURCE_ERROR_LOG": source_error_log,
-                    "RETRY_ERROR_LOG": retry_error_log,
-                    "OUTPUT_CSV": output_csv,
-                    "IMG_DIR": image_dir,
-                    "MAX_WORKERS": int(max_workers),
-                },
-                "mod.main()",
-            )
-            submit_python_code("开始 NH 失败页重试", "collection-nh-retry", code, timeout, require_confirm=confirm)
-        render_result("collection-nh-retry", "脚本输出会显示在这里。")
-        return
-
-    if mode == "JM 在线失败页重试":
-        with st.form("process-jm-retry"):
-            base_url = st.text_input("站点 Base URL", "https://18comic.vip", key="jm-retry-base-url")
-            start_url = st.text_input(
-                "重试页起始网址",
-                "https://18comic.vip/search/photos?search_query=%E7%99%BE%E5%90%88",
-                help="用于根据错误页码重新拼接列表页 URL。",
-                key="jm-retry-start-url",
-            )
-            source_error_log = st.text_input("读取的错误 Log 文件", "logs/getjm_errors_20260427_141729.log")
-            retry_error_log = st.text_input("输出的错误日志文件", "logs/getjm_fix_retry.log")
-            failed_pages_report = st.text_input("输出的错误报告 CSV", "logs/failed_pages_retry.csv")
-            csv_path = st.text_input("保存 CSV 文件名及路径", "JM_info_yuri.csv")
-            output_dir = st.text_input("封面保存目录", "onlineimgtmp")
-            max_workers = st.number_input("并发线程数", 1, 64, 5, 1, key="jm-retry-workers")
-            timeout = st.number_input("超时秒数", 10, 86400, 3600, 60, key="jm-retry-timeout")
-            confirm = st.checkbox("确认执行失败页重试", value=False)
-            code = module_call_code(
-                "data_get.JM_get_info_online_fix",
-                {
-                    "BASE_URL": base_url,
-                    "START_URL": start_url,
-                    "SOURCE_ERROR_LOG": source_error_log,
-                    "RETRY_ERROR_LOG": retry_error_log,
-                    "FAILED_PAGES_REPORT_PATH": failed_pages_report,
-                    "CSV_PATH": csv_path,
-                    "OUTPUT_DIR": output_dir,
-                    "MAX_WORKERS": int(max_workers),
-                },
-                "mod.retry_failed_pages()",
-            )
-            submit_python_code("开始 JM 失败页重试", "collection-jm-retry", code, timeout, require_confirm=confirm)
-        render_result("collection-jm-retry", "脚本输出会显示在这里。")
         return
 
     st.info("请选择一个采集流程。")

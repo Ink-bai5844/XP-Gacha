@@ -5,11 +5,14 @@ import io
 import json
 import os
 import shutil
+import sys
 import tempfile
+import threading
 import unittest
 import warnings
 import zipfile
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 import pandas as pd
@@ -28,6 +31,8 @@ from fastapi.testclient import TestClient
 from config import MAX_DISPLAY
 import server.main as server_main
 from server.main import app
+import server.job_tasks as job_tasks
+import server.modules.jobs as jobs_module
 
 
 def build_bundle() -> bytes:
@@ -46,6 +51,156 @@ def build_bundle() -> bytes:
         archive.writestr("dictionaries/TITLE_STOP_WORDS.txt", "'の'\n")
         archive.writestr("dictionaries/TITLE_SEMANTIC_MAP.json", "{}")
     return output.getvalue()
+
+
+class JobTaskAdapterTest(unittest.TestCase):
+    def test_unified_collection_adapter_accepts_legacy_field_aliases(self) -> None:
+        captured: dict[str, object] = {}
+        collector = ModuleType("data_get.collector")
+
+        class FakeConfig:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+        collector.CollectionConfig = FakeConfig
+        collector.run_collection = lambda config: {"completed": True}
+        with patch.dict(sys.modules, {"data_get.collector": collector}):
+            handled = job_tasks.run_collection_task(
+                "collection-jm-online",
+                {
+                    "confirm": True,
+                    "maxPage": 7,
+                    "csvPath": "data/gallery_info_origin/legacy.csv",
+                    "outputDir": "onlineimgtmp",
+                    "retries": 4,
+                    "requestTimeout": 17,
+                    "retryRounds": 2,
+                    "interval": 1.25,
+                    "proxy": "  http://127.0.0.1:7890  ",
+                    "no_resume": "false",
+                    "stateFile": "",
+                },
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(captured["mode"], "jm-online")
+        self.assertEqual(captured["max_pages"], 7)
+        self.assertEqual(captured["request_attempts"], 4)
+        self.assertEqual(captured["timeout"], 17)
+        self.assertEqual(captured["max_rounds"], 2)
+        self.assertEqual(captured["interval"], 1.25)
+        self.assertEqual(captured["proxy"], "http://127.0.0.1:7890")
+        self.assertTrue(captured["resume"])
+        self.assertIsNone(captured["state_file"])
+        self.assertIsNone(captured["error_log"])
+        self.assertEqual(captured["output_csv"], job_tasks.project_path("data/gallery_info_origin/legacy.csv"))
+        self.assertEqual(captured["image_dir"], job_tasks.project_path("onlineimgtmp"))
+
+    def test_collection_and_csv_export_enforce_confirmation_and_safe_pattern(self) -> None:
+        with self.assertRaisesRegex(ValueError, "勾选确认"):
+            job_tasks.run_collection_task("collection-nh-online", {})
+        with self.assertRaisesRegex(ValueError, "勾选确认"):
+            job_tasks.run("export-title-translations", {"pattern": "*_full.csv"})
+        with self.assertRaisesRegex(ValueError, "当前 CSV 目录"):
+            job_tasks.run("export-title-translations", {"pattern": "../*_full.csv", "dryRun": True})
+
+    def test_incomplete_collection_propagates_its_nonzero_exit_code(self) -> None:
+        collector = ModuleType("data_get.collector")
+
+        class FakeConfig:
+            def __init__(self, **_kwargs) -> None:
+                pass
+
+        class FailedSummary:
+            exit_code = 2
+
+            def as_dict(self) -> dict[str, object]:
+                return {"success": False, "exitCode": self.exit_code}
+
+        collector.CollectionConfig = FakeConfig
+        collector.run_collection = lambda config: FailedSummary()
+        with patch.dict(sys.modules, {"data_get.collector": collector}):
+            with self.assertRaises(SystemExit) as raised:
+                job_tasks.run_collection_task("collection-nh-online", {"confirm": True})
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_collection_empty_proxy_and_no_resume_are_normalized(self) -> None:
+        captured: dict[str, object] = {}
+        collector = ModuleType("data_get.collector")
+
+        class FakeConfig:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+        collector.CollectionConfig = FakeConfig
+        collector.run_collection = lambda config: {"completed": True}
+        with patch.dict(sys.modules, {"data_get.collector": collector}):
+            job_tasks.run_collection_task(
+                "collection-nh-online",
+                {"confirm": True, "proxy": "   ", "noResume": True},
+            )
+        self.assertIsNone(captured["proxy"])
+        self.assertFalse(captured["resume"])
+
+
+class JobsModuleRaceTest(unittest.TestCase):
+    def test_cancel_while_popen_is_pending_never_resurrects_queued_job(self) -> None:
+        popen_entered = threading.Event()
+        release_popen = threading.Event()
+        real_thread = threading.Thread
+        threads: list[threading.Thread] = []
+
+        class FakeProcess:
+            pid = 4242
+            stdout: tuple[()] = ()
+            terminated = False
+
+            def poll(self):
+                return None
+
+            def wait(self):
+                self.assert_terminated()
+                return -15
+
+            def assert_terminated(self):
+                if not self.terminated:
+                    raise AssertionError("cancelled queued process was allowed to run")
+
+        process = FakeProcess()
+
+        def create_process(*_args, **_kwargs):
+            popen_entered.set()
+            if not release_popen.wait(2):
+                raise TimeoutError("test did not release Popen")
+            return process
+
+        def create_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+
+        def terminate(candidate) -> None:
+            self.assertIs(candidate, process)
+            process.terminated = True
+
+        module = jobs_module.JobsModule()
+        with (
+            patch.object(jobs_module.subprocess, "Popen", side_effect=create_process),
+            patch.object(jobs_module.threading, "Thread", side_effect=create_thread),
+            patch.object(jobs_module, "_terminate_process_tree", side_effect=terminate) as terminate_mock,
+        ):
+            started = module.start("b64", {})
+            self.assertTrue(popen_entered.wait(2))
+            cancelling = module.cancel(started["id"])
+            self.assertEqual(cancelling["status"], "cancelling")
+            release_popen.set()
+            threads[0].join(2)
+
+        self.assertFalse(threads[0].is_alive())
+        finished = module.get(started["id"])
+        self.assertEqual(finished["status"], "cancelled")
+        self.assertEqual(finished["returnCode"], -15)
+        terminate_mock.assert_called_once_with(process)
 
 
 class APISmokeTest(unittest.TestCase):
@@ -94,6 +249,7 @@ class APISmokeTest(unittest.TestCase):
         self.assertEqual(query.status_code, 200, query.text)
         self.assertEqual(query.json()["total"], 1)
         self.assertEqual(query.json()["items"][0]["id"], "NH100")
+        self.assertEqual(query.json()["items"][0]["titleZh"], "雨夜的信")
 
         no_match = self.client.post(
             "/api/library/query",
@@ -154,7 +310,16 @@ class APISmokeTest(unittest.TestCase):
 
         scripts = self.client.get("/api/scripts")
         self.assertEqual(scripts.status_code, 200)
-        self.assertEqual(len(scripts.json()["scripts"]), 26)
+        script_ids = {item["id"] for item in scripts.json()["scripts"]}
+        self.assertTrue({
+            "collection-nh-online",
+            "collection-jm-online",
+            "collection-nh-local-info",
+            "collection-nh-local-images",
+            "export-title-translations",
+        }.issubset(script_ids))
+        self.assertNotIn("collection-nh-retry", script_ids)
+        self.assertNotIn("collection-jm-retry", script_ids)
 
     def test_health_does_not_request_full_system_status(self) -> None:
         database = {
@@ -193,6 +358,35 @@ class APISmokeTest(unittest.TestCase):
         self.assertLessEqual(len(response.json()["tags"]), 80)
         self.assertLessEqual(len(response.json()["artists"]), 80)
         self.assertLessEqual(len(response.json()["titleWords"]), 80)
+
+    def test_project_one_click_import_includes_title_translation(self) -> None:
+        csv_dir = TEST_ROOT / "data" / "gallery_info"
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([
+            {
+                "ID": "NH300",
+                "链接": "https://nhentai.net/g/300/",
+                "文件名": "Sample C",
+                "标题": "星の旅",
+                "标题译文": "星之旅",
+                "标签": "旅行",
+                "作者": "作者丙",
+                "团队": "",
+                "语言": "中文",
+                "页数": 18,
+                "上传日期": "2026-08-03",
+            }
+        ]).to_csv(csv_dir / "catalog_full.csv", index=False, encoding="utf-8-sig")
+
+        imported = self.client.post(
+            "/api/import/project",
+            json={"mode": "replace", "includeDictionaries": True},
+        )
+        self.assertEqual(imported.status_code, 200, imported.text)
+        self.assertEqual(imported.json()["imported"], 1)
+        gallery = self.client.get("/api/gallery/NH300")
+        self.assertEqual(gallery.status_code, 200, gallery.text)
+        self.assertEqual(gallery.json()["titleZh"], "星之旅")
 
     def test_zip_traversal_is_rejected(self) -> None:
         output = io.BytesIO()

@@ -18,9 +18,43 @@ SCRIPT_IDS = {
     "addname", "add-id", "add-lang", "clean-date", "title-words", "tag-set", "map-add-name",
     "db-sync", "db-rebuild", "db-optimize", "title-translate", "b64", "text-vector", "clip-vector",
     "cache-delete", "prefix-rename", "merge-b64", "clean-title-jsonl", "delete-gallery-rows",
-    "clear-title-translation", "collection-nh-online", "collection-jm-online", "collection-nh-retry",
-    "collection-jm-retry", "collection-nh-local-info", "collection-nh-local-images",
+    "clear-title-translation", "export-title-translations", "collection-nh-online", "collection-jm-online",
+    "collection-nh-local-info", "collection-nh-local-images",
 }
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Best-effort termination for a job process and any descendants."""
+    try:
+        if process.poll() is not None:
+            return
+    except OSError:
+        return
+
+    terminated = False
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            terminated = result.returncode == 0
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            terminated = True
+    except (OSError, subprocess.SubprocessError):
+        terminated = False
+
+    if not terminated:
+        try:
+            process.terminate()
+        except (AttributeError, OSError, subprocess.SubprocessError):
+            try:
+                process.kill()
+            except (AttributeError, OSError, subprocess.SubprocessError):
+                pass
 
 
 @dataclass
@@ -84,16 +118,8 @@ class JobsModule:
                 return job.public()
             job.status = "cancelling"
             job.lines.append("[CANCEL] 已请求中止任务")
-        if process and process.poll() is None:
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            else:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        if process:
+            _terminate_process_tree(process)
         return job.public()
 
     def _run(self, job: Job, parameters: dict) -> None:
@@ -116,10 +142,16 @@ class JobsModule:
                 start_new_session=os.name != "nt",
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
+            cancel_before_running = False
             with self._lock:
                 job.process = process
-                job.status = "running"
-                job.lines.append(f"> {' '.join(command[:4])} <parameters>")
+                if job.status == "cancelling":
+                    cancel_before_running = True
+                else:
+                    job.status = "running"
+                    job.lines.append(f"> {' '.join(command[:4])} <parameters>")
+            if cancel_before_running:
+                _terminate_process_tree(process)
             if process.stdout:
                 for line in process.stdout:
                     with self._lock:
@@ -133,9 +165,12 @@ class JobsModule:
                     job.status = "completed" if return_code == 0 else "failed"
         except Exception as exc:
             with self._lock:
-                job.status = "failed"
-                job.lines.append(f"[ERROR] {exc}")
-                job.return_code = 1
+                if job.status == "cancelling":
+                    job.status = "cancelled"
+                else:
+                    job.status = "failed"
+                    job.lines.append(f"[ERROR] {exc}")
+                    job.return_code = 1
         finally:
             with self._lock:
                 job.finished_at = time.time()

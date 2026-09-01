@@ -230,7 +230,7 @@ Python 源码模式会自动读取项目根目录 `.env`，但不会覆盖进程
 | `/chat` | LLM 助手 | 本地/在线兼容 API、连接配置保存、深度思考与回答双流、当前页随机 RAG、Markdown 对话 |
 | `/history` | 历史记录 | 刷新、逐条/批量删除、确认清空、重新打开；历史偏好图表统一在“偏好图表”页查看 |
 | `/charts` | 偏好图表 | 全局/历史切换，标签、作者、标题词 Top 15 与 Top 150 |
-| `/admin` | 附录 | 一键导入、系统状态、26 个白名单数据任务、输出与中止 |
+| `/admin` | 附录 | 一键导入、系统状态、25 个白名单数据任务、输出与中止 |
 | `/api/docs` | API 文档 | FastAPI 交互式 OpenAPI 文档 |
 
 前端连接不到 API 时会显示 10 条内置虚构样本，用于检查界面布局；这些样本不是实际库存，也不会写入数据库。
@@ -402,9 +402,19 @@ CSV 导入完成后会优化 MySQL 表与全文索引；所有成功导入都会
 
 源码版和便携版都对应项目/发行包根目录的 `data/gallery_info`；Docker 容器中对应 `/app/data/gallery_info`。上传导入使用临时文件，结束后会删除临时副本，请自行保留原始 CSV/ZIP。
 
+`*_full.csv` 的“标题译文”可在“附录 → 维护工具”中从当前数据库按 ID 回填。该工具只查询 `gallery_info`，数据库中的空译文不会擦除 CSV 已有内容；写入前可先做只读预览。终端模式使用：
+
+```powershell
+# 只读预览
+.\.venv\Scripts\python.exe tools\export_title_translations_to_csv.py --dry-run
+
+# 原子更新 data/gallery_info 下的 *_full.csv
+.\.venv\Scripts\python.exe tools\export_title_translations_to_csv.py
+```
+
 ## 附录：数据处理与采集
 
-后端只允许执行 26 个白名单任务，同一时间最多运行一个任务。界面会轮询合并输出，支持手动中止；危险操作要求显式勾选确认。
+后端只允许执行 25 个白名单任务，同一时间最多运行一个任务。界面会轮询合并输出，支持手动中止；危险操作要求显式勾选确认。
 
 | 分区 | 任务 |
 | --- | --- |
@@ -412,8 +422,8 @@ CSV 导入完成后会优化 MySQL 表与全文索引；所有成功导入都会
 | A.2 数据库同步 | 增量同步 CSV、覆盖重建 MySQL 表、优化表结构与全文索引 |
 | A.3 标题 AI 翻译 | LM Studio / 在线兼容 API、批次、并发、范围、重试、JSONL 审查 |
 | A.4 缓存与向量 | Base64 预编码、文本语义向量、CLIP 封面向量构建/统计、缓存清理 |
-| A.5 维护工具 | 图片/缓存 ID 前缀修正、合并 Base64 增量缓存、清理翻译 JSONL failed 条目、按 ID 删除数据库行、按 `error.json` 清空标题译文 |
-| A.6 采集入口 | NH/JM 在线采集、NH/JM 失败页重试、NH 本地链接抓信息、NH 本地链接抓图片 |
+| A.5 维护工具 | 图片/缓存 ID 前缀修正、合并 Base64 增量缓存、从数据库提取标题译文至 CSV、清理翻译 JSONL failed 条目、按 ID 删除数据库行、按 `error.json` 清空标题译文 |
+| A.6 采集入口 | NH/JM 在线完整采集、NH 本地链接抓信息、NH 本地链接抓图片；失败项由当前任务自动逐轮重试 |
 
 系统状态区显示 CSV、线上封面、本地缩略图、Base64、数据库行数，以及四项缓存/向量文件是否存在；模型状态由 `/api/system/status` 返回，但当前附录页面尚未单独展示。
 
@@ -421,6 +431,38 @@ CSV 导入完成后会优化 MySQL 表与全文索引；所有成功导入都会
 > 表单中的“超时秒数”目前主要作为任务参数保留，通用任务管理器尚未按该值自动结束子进程；需要时请使用“中止任务”。标题翻译自己的单次请求超时仍会生效。
 
 在线采集依赖第三方站点的可访问性和页面结构。请遵守目标站点条款、当地法律和合理请求频率。
+
+### 独立运行统一采集器
+
+采集器不依赖 Web 前端。四种流程使用同一套参数、断点和结构化失败记录；在线信息只有在 CSV 元数据与缩略图都存在时才算完成。首轮会扫描指定列表页，后续轮次只处理上一轮未完成的列表页或项目。`--max-rounds 0` 是默认值，表示持续重试到全部完成；按 `Ctrl+C` 会保留已完成 CSV、图片和 JSONL 断点，下次使用同一参数即可继续。
+
+```powershell
+# 查看四种模式的完整参数
+.\.venv\Scripts\python.exe -m data_get.collector nh-online --help
+.\.venv\Scripts\python.exe -m data_get.collector jm-online --help
+.\.venv\Scripts\python.exe -m data_get.collector nh-local-info --help
+.\.venv\Scripts\python.exe -m data_get.collector nh-local-images --help
+
+# NH 在线：原始 CSV 默认写入 data/gallery_info_origin，封面写入 onlineimgtmp
+.\.venv\Scripts\python.exe -m data_get.collector nh-online `
+  --start-url "https://nhentai.net/language/chinese/?sort=date" `
+  --max-pages 100 --max-rounds 0
+
+# JM 在线
+.\.venv\Scripts\python.exe -m data_get.collector jm-online `
+  --start-url "https://18comic.vip/search/photos?search_query=%E7%99%BE%E5%90%88" `
+  --max-pages 80 --max-rounds 0
+
+# 从本地书签 HTML 或逐行 URL 采集信息与缩略图
+.\.venv\Scripts\python.exe -m data_get.collector nh-local-info `
+  --input-file data/local_data/NH_all.txt --max-rounds 0
+
+# 从本地链接采集完整分册图片
+.\.venv\Scripts\python.exe -m data_get.collector nh-local-images `
+  --input-file data/local_data/NH_2.txt --output-dir output --max-rounds 0
+```
+
+默认原始信息表头统一为 `ID,链接,标题,标签,作者,团队,语言,页数,上传日期`，编码为 UTF-8 BOM，并按 ID 更新而不是重复追加。断点和失败项默认写入 `logs/collection/*.jsonl`；缩略图仍写入 `onlineimgtmp`，完整分册图片写入 `output`。需要忽略旧断点重新扫描时加 `--no-resume`。原来的两个专用失败重试脚本已经由这一流程取代。
 
 ## 模型与向量
 
@@ -447,7 +489,7 @@ flowchart LR
     Library --> Runtime[词典・缓存・模型・向量・封面]
     Import --> MySQL
     Import --> Runtime
-    Jobs --> Legacy[既有 data_get / data_processing / tools]
+    Jobs --> Tasks[统一 data_get 采集器 / data_processing / tools]
 ```
 
 FastAPI 在同一个 `8000` 端口提供 API 和编译后的 `web/dist`。后端模块继续复用经过验证的 `data_pipeline.py` 与 `utils_*.py`，数据任务则通过 `python -m server.job_tasks` 在独立子进程中运行。
@@ -470,11 +512,12 @@ XP-Gacha/
 │  ├─ build_portable_release.ps1
 │  └─ build_portable_update.ps1
 ├─ tests/                       API、便携启动器与 PowerShell 检查
-├─ data_get/                    NH/JM 采集器
+├─ data_get/                    统一 NH/JM 采集核心、CLI 与兼容入口
 ├─ data_processing/             CSV、翻译、缓存和向量脚本
 ├─ tools/                       维护脚本与通用更新器
 ├─ dictionaries/                四个标准词典
-├─ data/gallery_info/           项目 CSV
+├─ data/gallery_info_origin/    采集器输出的原始 CSV
+├─ data/gallery_info/           补全文件名与标题译文后的可导入 CSV
 ├─ datacache/                   预处理、历史、导入备份
 ├─ onlineimgtmp/                线上封面
 ├─ localimgtmp/                 本地缩略图
@@ -556,7 +599,8 @@ XP-Gacha/
 
 | 目录 | 内容 |
 | --- | --- |
-| `data/gallery_info` | 可重复导入的原始 CSV |
+| `data/gallery_info_origin` | NH/JM 采集器统一输出的原始 CSV |
+| `data/gallery_info` | 补全文件名和标题译文、可重复导入数据库的 `*_full.csv` |
 | `datacache` | 预处理缓存、历史记录、导入临时目录和词典备份 |
 | `dictionaries` | 标签与标题词典 |
 | `onlineimgtmp` | 在线封面 |

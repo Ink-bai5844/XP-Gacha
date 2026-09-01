@@ -1,152 +1,24 @@
-import csv
-import os
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+"""Deprecated compatibility entry for the former NH failure-log retry tool.
 
-try:
-    from data_get import NH_get_info_online as source_module
-except ModuleNotFoundError:
-    import NH_get_info_online as source_module
+Retrying is now intrinsic to :mod:`data_get.collector`; this module no longer
+reads an error log or owns a second collection implementation.
+"""
 
-CSV_HEADERS = source_module.CSV_HEADERS
-BASE_URL = source_module.BASE_URL
-START_URL = source_module.START_URL
-IMG_DIR = source_module.IMG_DIR
-MAX_WORKERS = source_module.MAX_WORKERS
-csv_lock = source_module.csv_lock
-ensure_csv_has_id_column = source_module.ensure_csv_has_id_column
-get_page_urls = source_module.get_page_urls
-load_existing_ids = source_module.load_existing_ids
-log_lock = source_module.log_lock
-process_single_gallery = source_module.process_single_gallery
+from __future__ import annotations
 
-OUTPUT_CSV = "gallery_info_chinese.csv"
-SOURCE_ERROR_LOG = "logs/NH_error_log_online.txt"
-RETRY_ERROR_LOG = "logs/NH_error_log_online_fix.txt"
-PAGE_PATTERN = re.compile(r"\[页数:\s*(\d+)")
+import sys
+from collections.abc import Iterable
 
 
-def load_error_pages(log_path):
-    """从错误日志中提取失败页码，并按首次出现顺序去重。"""
-    if not os.path.exists(log_path):
-        print(f"未找到错误日志文件: {log_path}")
-        return []
+def main(argv: Iterable[str] | None = None) -> int:
+    try:
+        from data_get.collector import legacy_main
+    except ModuleNotFoundError:
+        from collector import legacy_main
 
-    pages = []
-    seen = set()
-
-    with open(log_path, "r", encoding="utf-8") as f:
-        for line in f:
-            match = PAGE_PATTERN.search(line)
-            if not match:
-                continue
-
-            page = int(match.group(1))
-            if page not in seen:
-                seen.add(page)
-                pages.append(page)
-
-    return pages
-
-
-def append_error_log(log_path, message):
-    """线程安全地写入修复任务的错误日志。"""
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    with log_lock:
-        with open(log_path, "a", encoding="utf-8") as f_err:
-            f_err.write(message.rstrip("\n") + "\n")
-
-
-def main():
-    source_module.BASE_URL = BASE_URL
-    source_module.START_URL = START_URL
-    source_module.IMG_DIR = IMG_DIR
-    source_module.MAX_WORKERS = MAX_WORKERS
-
-    error_pages = load_error_pages(SOURCE_ERROR_LOG)
-    if not error_pages:
-        print("错误日志中没有可重试的页码，程序结束。")
-        return
-
-    os.makedirs(IMG_DIR, exist_ok=True)
-    os.makedirs(os.path.dirname(OUTPUT_CSV) or ".", exist_ok=True)
-    os.makedirs(os.path.dirname(RETRY_ERROR_LOG) or ".", exist_ok=True)
-    ensure_csv_has_id_column(OUTPUT_CSV)
-    processed_ids = load_existing_ids(OUTPUT_CSV)
-    page_preview = ", ".join(str(page) for page in error_pages[:20])
-    if len(error_pages) > 20:
-        page_preview += ", ..."
-
-    print(f"修复模式：将按错误日志中的页码重试，共 {len(error_pages)} 页。")
-    print(f"待重试页码：{page_preview}")
-    print(f"初始化查重：已在本地CSV发现 {len(processed_ids)} 条历史记录。")
-
-    csv_headers = CSV_HEADERS
-    write_header = not os.path.exists(OUTPUT_CSV)
-    total_count = 0
-
-    with open(OUTPUT_CSV, "a", newline="", encoding="utf-8-sig") as f_csv:
-        writer = csv.writer(f_csv)
-        if write_header:
-            with csv_lock:
-                writer.writerow(csv_headers)
-                f_csv.flush()
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for current_index, page in enumerate(error_pages, 1):
-                print(f"\n========== [{current_index}/{len(error_pages)}] 开始重试第 {page} 页 ==========")
-                items = get_page_urls(page)
-
-                if items is None:
-                    error_msg = f"[页数: {page}] 页面不存在或返回 404"
-                    print(f"⚠️ {error_msg}")
-                    append_error_log(RETRY_ERROR_LOG, error_msg)
-                    time.sleep(1)
-                    continue
-
-                if items is False:
-                    error_msg = f"[页数: {page}] 页面列表获取失败"
-                    print(f"❌ {error_msg}")
-                    append_error_log(RETRY_ERROR_LOG, error_msg)
-                    time.sleep(3)
-                    continue
-
-                if not items:
-                    print(f"第 {page} 页数据提取为空，跳过。")
-                    time.sleep(1)
-                    continue
-
-                print(f"第 {page} 页共提取到 {len(items)} 个图库项目。开启 {MAX_WORKERS} 个线程并发处理...")
-
-                futures = []
-                for item_index, item in enumerate(items, 1):
-                    future = executor.submit(
-                        process_single_gallery,
-                        item,
-                        item_index,
-                        len(items),
-                        page,
-                        processed_ids,
-                        writer,
-                        f_csv,
-                        RETRY_ERROR_LOG,
-                    )
-                    futures.append(future)
-
-                for future in as_completed(futures):
-                    total_count += future.result()
-
-                print(f"--- 第 {page} 页重试完成 ---")
-                time.sleep(1)
-
-    print("\n==============================")
-    print(f"失败页重试完成！本次共新抓取 {total_count} 条详情数据。")
-    print(f"如仍有失败记录，请查看 {RETRY_ERROR_LOG}。")
+    print("[弃用] NH 专用失败重试脚本已合并到统一采集器；本次直接恢复 NH 在线采集。", flush=True)
+    return legacy_main("nh-online", list(argv) if argv is not None else sys.argv[1:])
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n收到 Ctrl+C，已手动停止。")
+    raise SystemExit(main())

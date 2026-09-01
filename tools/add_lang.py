@@ -2,7 +2,7 @@ import csv
 from pathlib import Path
 
 
-CSV_PATH = Path("data/gallery_info_no_name/JM_info_gender_bender.csv")
+CSV_PATH = Path("data/gallery_info_origin/JM_info_gender_bender.csv")
 TAG_COLUMN = "标签"
 LANG_COLUMN = "语言"
 LANG_TAGS = {"英文", "日文"}

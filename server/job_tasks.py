@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 import config
@@ -37,6 +38,137 @@ def assign(module, parameters: dict, mapping: dict[str, tuple[str, bool]]) -> No
         if field in parameters:
             value = project_path(parameters[field]) if is_path else parameters[field]
             setattr(module, attribute, value)
+
+
+COLLECTION_MODES = {
+    "collection-nh-online": "nh-online",
+    "collection-jm-online": "jm-online",
+    "collection-nh-local-info": "nh-local-info",
+    "collection-nh-local-images": "nh-local-images",
+}
+
+COLLECTION_DEFAULTS = {
+    "nh-online": {
+        "base_url": "https://nhentai.net",
+        "start_url": "https://nhentai.net/language/chinese/?sort=date",
+        "max_pages": 1,
+        "output_csv": "data/gallery_info_origin/NH_info_chinese.csv",
+        "image_dir": "onlineimgtmp",
+        "workers": 10,
+        "state_file": None,
+        "error_log": None,
+    },
+    "jm-online": {
+        "base_url": "https://18comic.vip",
+        "start_url": "https://18comic.vip/search/photos?search_query=%E7%99%BE%E5%90%88",
+        "max_pages": 80,
+        "output_csv": "data/gallery_info_origin/JM_info_yuri.csv",
+        "image_dir": "onlineimgtmp",
+        "workers": 5,
+        "state_file": None,
+        "error_log": None,
+    },
+    "nh-local-info": {
+        "base_url": "https://nhentai.net",
+        "max_pages": 1,
+        "input_file": "data/local_data/NH_all.txt",
+        "output_csv": "data/gallery_info_origin/NH_info_local.csv",
+        "image_dir": "onlineimgtmp",
+        "workers": 5,
+        "state_file": None,
+        "error_log": None,
+    },
+    "nh-local-images": {
+        "base_url": "https://nhentai.net",
+        "max_pages": 200,
+        "input_file": "data/local_data/NH_2.txt",
+        "output_dir": "output",
+        "workers": 4,
+        "state_file": None,
+        "error_log": None,
+    },
+}
+
+
+def parameter_value(parameters: dict, *names: str, default=None):
+    """Return the first supplied form value while accepting legacy field aliases."""
+    for name in names:
+        if name in parameters and parameters[name] is not None:
+            return parameters[name]
+    return default
+
+
+def parameter_path(parameters: dict, *names: str, default=None) -> Path | None:
+    value = parameter_value(parameters, *names, default=default)
+    if value is None or not str(value).strip():
+        return None
+    return project_path(value)
+
+
+def parameter_bool(parameters: dict, *names: str, default: bool = False) -> bool:
+    value = parameter_value(parameters, *names, default=default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"布尔参数 {names[0]} 的值无效：{value}")
+
+
+def print_summary(summary: object) -> None:
+    if callable(getattr(summary, "as_dict", None)):
+        payload = summary.as_dict()
+    elif is_dataclass(summary):
+        payload = asdict(summary)
+    elif isinstance(summary, dict):
+        payload = summary
+    else:
+        payload = {"result": str(summary)}
+    print(json.dumps(payload, ensure_ascii=False, default=str), flush=True)
+
+
+def run_collection_task(script_id: str, parameters: dict) -> bool:
+    mode = COLLECTION_MODES.get(script_id)
+    if not mode:
+        return False
+    require_confirm(parameters)
+
+    from data_get.collector import CollectionConfig, run_collection
+
+    defaults = COLLECTION_DEFAULTS[mode]
+    image_field_names = ("imageDir", "outputDir", "image_dir") if mode == "jm-online" else ("imageDir", "image_dir")
+    raw_proxy = parameter_value(parameters, "proxy", default=None)
+    proxy = str(raw_proxy).strip() if raw_proxy is not None else ""
+    config = CollectionConfig(
+        mode=mode,
+        base_url=str(parameter_value(parameters, "baseUrl", "base_url", default=defaults.get("base_url", ""))),
+        start_url=str(parameter_value(parameters, "startUrl", "start_url", default=defaults.get("start_url", ""))),
+        max_pages=int(parameter_value(parameters, "maxPages", "maxPage", "max_pages", default=defaults["max_pages"])),
+        output_csv=parameter_path(parameters, "outputCsv", "csvPath", "output_csv", default=defaults.get("output_csv")),
+        image_dir=parameter_path(parameters, *image_field_names, default=defaults.get("image_dir")),
+        input_file=parameter_path(parameters, "inputFile", "input_file", default=defaults.get("input_file")),
+        output_dir=parameter_path(parameters, "outputDir", "rootDir", "output_dir", default=defaults.get("output_dir")),
+        workers=int(parameter_value(parameters, "workers", "maxWorkers", default=defaults["workers"])),
+        request_attempts=int(parameter_value(parameters, "requestAttempts", "retries", "request_attempts", default=3)),
+        max_rounds=int(parameter_value(parameters, "retryRounds", "maxRounds", "max_rounds", default=0)),
+        retry_backoff=float(parameter_value(parameters, "retryBackoff", "retry_backoff", default=2.0)),
+        timeout=float(parameter_value(parameters, "requestTimeout", "request_timeout", default=30.0)),
+        interval=float(parameter_value(parameters, "interval", default=0.0)),
+        state_file=parameter_path(parameters, "stateFile", "state_file", default=defaults.get("state_file")),
+        error_log=parameter_path(parameters, "errorLog", "error_log", default=defaults.get("error_log")),
+        proxy=proxy or None,
+        resume=not parameter_bool(parameters, "noResume", "no_resume", default=False),
+    )
+    summary = run_collection(config)
+    print_summary(summary)
+    exit_code = int(getattr(summary, "exit_code", 0) or 0)
+    if exit_code:
+        raise SystemExit(exit_code)
+    return True
 
 
 def run_module(script_id: str, parameters: dict) -> bool:
@@ -77,36 +209,6 @@ def run_module(script_id: str, parameters: dict) -> bool:
             {"targetDir": ("TARGET_DIR", True), "prefix": ("PREFIX", False)},
             lambda mod: mod.rename_txt_files() if hasattr(mod, "rename_txt_files") else mod.rename_images(),
         ),
-        "collection-nh-online": (
-            "data_get.NH_get_info_online",
-            {"baseUrl": ("BASE_URL", False), "startUrl": ("START_URL", False), "maxPage": ("MAX_PAGE", False), "outputCsv": ("OUTPUT_CSV", True), "imageDir": ("IMG_DIR", True), "errorLog": ("ERROR_LOG", True), "workers": ("MAX_WORKERS", False)},
-            lambda mod: mod.main(max_page=mod.MAX_PAGE, start_url=mod.START_URL, base_url=mod.BASE_URL, output_csv=str(mod.OUTPUT_CSV), image_dir=str(mod.IMG_DIR), error_log=str(mod.ERROR_LOG), max_workers=int(mod.MAX_WORKERS), loop=False),
-        ),
-        "collection-jm-online": (
-            "data_get.JM_get_info_online",
-            {"baseUrl": ("BASE_URL", False), "startUrl": ("START_URL", False), "maxPages": ("MAX_PAGES", False), "csvPath": ("CSV_PATH", True), "outputDir": ("OUTPUT_DIR", True), "workers": ("MAX_WORKERS", False)},
-            lambda mod: mod.scrape_18comic(),
-        ),
-        "collection-nh-retry": (
-            "data_get.NH_get_info_online_fix",
-            {"baseUrl": ("BASE_URL", False), "startUrl": ("START_URL", False), "sourceLog": ("SOURCE_ERROR_LOG", True), "retryLog": ("RETRY_ERROR_LOG", True), "outputCsv": ("OUTPUT_CSV", True), "imageDir": ("IMG_DIR", True), "workers": ("MAX_WORKERS", False)},
-            lambda mod: mod.main(),
-        ),
-        "collection-jm-retry": (
-            "data_get.JM_get_info_online_fix",
-            {"baseUrl": ("BASE_URL", False), "startUrl": ("START_URL", False), "sourceLog": ("SOURCE_ERROR_LOG", True), "retryLog": ("RETRY_ERROR_LOG", True), "failedReport": ("FAILED_PAGES_REPORT_PATH", True), "csvPath": ("CSV_PATH", True), "outputDir": ("OUTPUT_DIR", True), "workers": ("MAX_WORKERS", False)},
-            lambda mod: mod.main(),
-        ),
-        "collection-nh-local-info": (
-            "data_get.local.NH_get_info_local",
-            {"inputFile": ("INPUT_FILE", True), "outputCsv": ("OUTPUT_CSV", True), "errorLog": ("ERROR_LOG", True), "interval": ("REQUEST_INTERVAL_SECONDS", False)},
-            lambda mod: mod.main(),
-        ),
-        "collection-nh-local-images": (
-            "data_get.local.NH_get_images_local",
-            {"inputFile": ("INPUT_FILE", True), "rootDir": ("ROOT_DIR", True), "errorLog": ("ERROR_LOG", True), "maxPages": ("MAX_PAGE_LIMIT", False), "interval": ("REQUEST_INTERVAL_SECONDS", False), "retries": ("PAGE_RETRY_TIMES", False)},
-            lambda mod: mod.main(),
-        ),
     }
     spec = specs.get(script_id)
     if not spec:
@@ -122,6 +224,8 @@ def run_module(script_id: str, parameters: dict) -> bool:
 
 def run(script_id: str, parameters: dict) -> None:
     print(f"[JOB] {script_id} 参数校验完成", flush=True)
+    if run_collection_task(script_id, parameters):
+        return
     if run_module(script_id, parameters):
         return
 
@@ -264,6 +368,20 @@ def run(script_id: str, parameters: dict) -> None:
         if parameters.get("emptyString"):
             command.append("--empty-string")
         subprocess.run(command, cwd=ROOT, check=True)
+        return
+    if script_id == "export-title-translations":
+        csv_dir = project_path(parameters.get("csvDir", "data/gallery_info"))
+        pattern = str(parameters.get("pattern", "*_full.csv")).strip()
+        if not pattern:
+            raise ValueError("文件匹配模式不能为空")
+        if ".." in pattern or "/" in pattern or "\\" in pattern:
+            raise ValueError("文件匹配模式只能是当前 CSV 目录内的文件名模式")
+        dry_run = bool(parameters.get("dryRun"))
+        if not dry_run:
+            require_confirm(parameters)
+        from tools.export_title_translations_to_csv import export_title_translations
+
+        print_summary(export_title_translations(csv_dir=csv_dir, pattern=pattern, dry_run=dry_run))
         return
     raise ValueError(f"脚本 {script_id} 尚未建立安全执行适配器")
 
