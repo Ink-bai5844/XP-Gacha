@@ -15,12 +15,12 @@ def read_project_file(relative_path: str) -> str:
 
 
 class UpdaterDistributionContractTests(unittest.TestCase):
-    def test_release_version_is_0_2_7(self) -> None:
+    def test_release_version_is_0_2_8(self) -> None:
         version_module = read_project_file("server/__init__.py")
         match = re.search(r'^__version__\s*=\s*"([^"]+)"', version_module, re.MULTILINE)
 
         self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), "0.2.7")
+        self.assertEqual(match.group(1), "0.2.8")
 
     def test_common_cmd_dispatches_to_the_powershell_updater(self) -> None:
         command = read_project_file("Update XP-Gacha.cmd")
