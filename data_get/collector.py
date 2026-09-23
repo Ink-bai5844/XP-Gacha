@@ -20,7 +20,8 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -309,6 +310,459 @@ class TaskState:
         return (not self.info_ok and self.terminal_info) or (not self.thumb_ok and self.terminal_thumb)
 
 
+def _task_counts(states: Iterable[TaskState]) -> dict[str, int]:
+    """Return the mutually-exclusive task buckets used by progress clients."""
+
+    complete = missing_info = missing_image = missing_both = pending = terminal = 0
+    for state in states:
+        if state.info_ok and state.thumb_ok:
+            complete += 1
+        elif not state.info_ok and not state.thumb_ok:
+            missing_both += 1
+        elif not state.info_ok:
+            missing_info += 1
+        else:
+            missing_image += 1
+        if state.terminal and not state.complete:
+            terminal += 1
+        elif not state.complete:
+            pending += 1
+    return {
+        "complete": complete,
+        "missingInfo": missing_info,
+        "missingImage": missing_image,
+        "missingBoth": missing_both,
+        "pending": pending,
+        "terminal": terminal,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class ThroughputSnapshot:
+    """Observable state for the current and two most recent throughput windows."""
+
+    current: int
+    window_success: int
+    last_window_success: int | None
+    previous_window_success: int | None
+    window_elapsed_seconds: float
+    trend: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConcurrencyAdjustment:
+    """One observable throughput-controller decision."""
+
+    from_concurrency: int
+    to_concurrency: int
+    previous_window_success: int | None
+    last_window_success: int
+    trend: str
+    reason: str = "adjustment"
+    stable_score: float | None = None
+    baseline_score: float | None = None
+    sample_windows: tuple[int, ...] = ()
+
+
+class AdaptiveConcurrency:
+    """Find a productive request concurrency using stable throughput samples.
+
+    The controller starts at the user supplied upper bound.  Each 30-second
+    window records *only* successful requests; failures merely give the
+    controller an opportunity to notice that the window has elapsed.  The
+    first complete window is discarded as startup warm-up.  At counts of ten
+    or more, each concurrency level needs two similar complete windows for an
+    averaged stable score; low counts and dissimilar pairs take exactly three
+    windows and use their median.  Baseline, probe, and holding phases all use
+    this same finite sampler.
+
+    Once a stable baseline exists, the controller probes one adjacent level at
+    a time.  An improvement continues in the same direction, while an equal or
+    worse result returns to the previous better level and stably re-samples it
+    before probing the other direction.  At a boundary the only available
+    neighbour is probed again after that holding sample.
+
+    This deliberately does not inspect failure counts, exception types, HTTP
+    status codes, timeout ratios, or rate-limit ratios.  ``acquire`` and
+    ``release`` remain a strict request-level gate, so a probe can never exceed
+    ``max_concurrency``.
+    """
+
+    def __init__(
+        self,
+        max_concurrency: int,
+        *,
+        window_seconds: float = 30.0,
+        time_fn: Callable[[], float] = time.monotonic,
+    ):
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.current = self.max_concurrency
+        self.window_seconds = max(1.0, float(window_seconds))
+        self._time_fn = time_fn
+        # Start lazily when the first real request acquires a slot.  Runner
+        # construction can spend a long time indexing existing CSV/images and
+        # replaying checkpoints; that initialization is not crawl throughput.
+        self._window_started_at: float | None = None
+        self._window_success = 0
+        self._last_window_success: int | None = None
+        self._previous_window_success: int | None = None
+        self._trend = "warming_up"
+        self._startup_warmup_pending = True
+        self._score_samples: list[int] = []
+        self._baseline_concurrency: int | None = None
+        self._baseline_success: float | None = None
+        self._probe_direction: int | None = None
+        self._next_probe_direction = -1
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._active_requests = 0
+
+    def _available_direction_locked(self, preferred: int) -> int | None:
+        for direction in (preferred, -preferred):
+            candidate = self.current + direction
+            if 1 <= candidate <= self.max_concurrency:
+                return direction
+        return None
+
+    def _move_locked(
+        self,
+        direction: int,
+        *,
+        previous_window_success: int | None,
+        last_window_success: int,
+        reason: str,
+        stable_score: float,
+        baseline_score: float | None,
+        sample_windows: tuple[int, ...],
+    ) -> ConcurrencyAdjustment:
+        old = self.current
+        self.current += direction
+        self._probe_direction = direction
+        self._trend = "probing_up" if direction > 0 else "probing_down"
+        self._condition.notify_all()
+        return ConcurrencyAdjustment(
+            from_concurrency=old,
+            to_concurrency=self.current,
+            previous_window_success=previous_window_success,
+            last_window_success=last_window_success,
+            trend=self._trend,
+            reason=reason,
+            stable_score=stable_score,
+            baseline_score=baseline_score,
+            sample_windows=sample_windows,
+        )
+
+    def _decision_locked(
+        self,
+        *,
+        previous_window_success: int | None,
+        last_window_success: int,
+        reason: str,
+        stable_score: float | None = None,
+        baseline_score: float | None = None,
+        sample_windows: tuple[int, ...] = (),
+        from_concurrency: int | None = None,
+        to_concurrency: int | None = None,
+    ) -> ConcurrencyAdjustment:
+        return ConcurrencyAdjustment(
+            from_concurrency=self.current if from_concurrency is None else from_concurrency,
+            to_concurrency=self.current if to_concurrency is None else to_concurrency,
+            previous_window_success=previous_window_success,
+            last_window_success=last_window_success,
+            trend=self._trend,
+            reason=reason,
+            stable_score=stable_score,
+            baseline_score=baseline_score,
+            sample_windows=sample_windows,
+        )
+
+    def _apply_stable_score_locked(
+        self,
+        score: float,
+        samples: tuple[int, ...],
+        *,
+        previous_window_success: int | None,
+        last_window_success: int,
+    ) -> ConcurrencyAdjustment:
+        if self._baseline_concurrency is None:
+            # Startup warm-up has already been discarded, so this is the first
+            # stable maximum-concurrency baseline.
+            self._baseline_concurrency = self.current
+            self._baseline_success = score
+            direction = self._available_direction_locked(-1)
+            if direction is None:
+                self._trend = "holding"
+                return self._decision_locked(
+                    previous_window_success=previous_window_success,
+                    last_window_success=last_window_success,
+                    reason="baseline_established",
+                    stable_score=score,
+                    sample_windows=samples,
+                )
+            return self._move_locked(
+                direction,
+                previous_window_success=previous_window_success,
+                last_window_success=last_window_success,
+                reason="baseline_established",
+                stable_score=score,
+                baseline_score=None,
+                sample_windows=samples,
+            )
+
+        if self._probe_direction is not None:
+            direction = self._probe_direction
+            assert self._baseline_success is not None
+            assert self._baseline_concurrency is not None
+            baseline_score = float(self._baseline_success)
+            if score > baseline_score:
+                # This adjacent level was better.  Adopt it as the new
+                # baseline, then keep walking in the same direction while an
+                # adjacent level remains available.
+                self._baseline_concurrency = self.current
+                self._baseline_success = score
+                next_direction = self._available_direction_locked(direction)
+                if next_direction is not None and next_direction == direction:
+                    return self._move_locked(
+                        direction,
+                        previous_window_success=previous_window_success,
+                        last_window_success=last_window_success,
+                        reason="probe_improved",
+                        stable_score=score,
+                        baseline_score=baseline_score,
+                        sample_windows=samples,
+                    )
+                self._probe_direction = None
+                self._next_probe_direction = -direction
+                self._trend = "holding"
+                return self._decision_locked(
+                    previous_window_success=previous_window_success,
+                    last_window_success=last_window_success,
+                    reason="probe_improved_at_boundary",
+                    stable_score=score,
+                    baseline_score=baseline_score,
+                    sample_windows=samples,
+                )
+
+            # Equal or lower stable throughput rejects the probe.  Since every
+            # probe moves exactly one level, returning to the saved baseline is
+            # also an adjacent move.  Holding then takes a fresh stable sample.
+            old = self.current
+            self.current = self._baseline_concurrency
+            self._probe_direction = None
+            self._next_probe_direction = -direction
+            self._trend = "holding"
+            self._condition.notify_all()
+            return ConcurrencyAdjustment(
+                from_concurrency=old,
+                to_concurrency=self.current,
+                previous_window_success=previous_window_success,
+                last_window_success=last_window_success,
+                trend=self._trend,
+                reason="probe_rejected",
+                stable_score=score,
+                baseline_score=baseline_score,
+                sample_windows=samples,
+            )
+
+        # A stable holding sample refreshes the known-good score.  Then probe
+        # the opposite side of the last rejected direction, falling back to the
+        # sole available neighbour at a boundary.
+        previous_baseline_score = (
+            float(self._baseline_success) if self._baseline_success is not None else None
+        )
+        self._baseline_concurrency = self.current
+        self._baseline_success = score
+        direction = self._available_direction_locked(self._next_probe_direction)
+        if direction is None:
+            self._trend = "holding"
+            return self._decision_locked(
+                previous_window_success=previous_window_success,
+                last_window_success=last_window_success,
+                reason="holding_refreshed",
+                stable_score=score,
+                baseline_score=previous_baseline_score,
+                sample_windows=samples,
+            )
+        return self._move_locked(
+            direction,
+            previous_window_success=previous_window_success,
+            last_window_success=last_window_success,
+            reason="holding_refreshed",
+            stable_score=score,
+            baseline_score=previous_baseline_score,
+            sample_windows=samples,
+        )
+
+    def _finish_window_locked(self) -> ConcurrencyAdjustment | None:
+        completed = self._window_success
+        prior_completed = self._last_window_success
+        self._previous_window_success = prior_completed
+        self._last_window_success = completed
+
+        if self._startup_warmup_pending:
+            self._startup_warmup_pending = False
+            self._score_samples.clear()
+            self._trend = "stabilizing"
+            return self._decision_locked(
+                previous_window_success=prior_completed,
+                last_window_success=completed,
+                reason="startup_warmup_discarded",
+                sample_windows=(completed,),
+            )
+
+        self._score_samples.append(completed)
+        samples = tuple(self._score_samples)
+        if len(samples) == 1:
+            return None
+        if len(samples) == 2:
+            larger = max(samples)
+            tolerance = max(2.0, larger * 0.15)
+            # Counts below ten are too coarse for a two-window percentage
+            # comparison: always take the bounded third sample there.
+            if larger < 10 or abs(samples[0] - samples[1]) > tolerance:
+                return self._decision_locked(
+                    previous_window_success=prior_completed,
+                    last_window_success=completed,
+                    reason="third_sample_needed",
+                    sample_windows=samples,
+                )
+            stable_score = sum(samples) / 2.0
+        else:
+            # The first two samples were unstable.  A third complete window is
+            # always decisive, so noisy traffic can never stall adaptation.
+            samples = samples[:3]
+            stable_score = float(sorted(samples)[1])
+
+        self._score_samples.clear()
+        return self._apply_stable_score_locked(
+            stable_score,
+            samples,
+            previous_window_success=prior_completed,
+            last_window_success=completed,
+        )
+
+    def _advance_locked(self, now: float) -> ConcurrencyAdjustment | None:
+        if self._window_started_at is None:
+            self._window_started_at = now
+            return None
+        elapsed = max(0.0, now - self._window_started_at)
+        if elapsed < self.window_seconds:
+            return None
+        adjustment = self._finish_window_locked()
+        self._window_success = 0
+        # Do not synthesize several historical probes after a long period with
+        # no completed request: a concurrency selected now could not have been
+        # active in those already elapsed windows.
+        self._window_started_at = now
+        return adjustment
+
+    def record_success(self) -> ConcurrencyAdjustment | None:
+        return self._record(success=True)
+
+    def record_failure(self) -> ConcurrencyAdjustment | None:
+        """Advance the wall-clock window without counting the failed request."""
+
+        return self._record(success=False)
+
+    def _record(self, *, success: bool) -> ConcurrencyAdjustment | None:
+        now = self._time_fn()
+        with self._lock:
+            adjustment = self._advance_locked(now)
+            if success:
+                # A completion exactly on/after the boundary belongs to the
+                # new window, never to the window that was just evaluated.
+                self._window_success += 1
+            return adjustment
+
+    def acquire(self, stop_event: threading.Event) -> None:
+        """Wait for one slot in the current request-level concurrency limit."""
+
+        with self._condition:
+            while self._active_requests >= self.current:
+                if stop_event.is_set():
+                    raise StopRequested()
+                self._condition.wait(timeout=0.1)
+            if stop_event.is_set():
+                raise StopRequested()
+            if self._window_started_at is None:
+                self._window_started_at = self._time_fn()
+            self._active_requests += 1
+
+    def release(self) -> None:
+        with self._condition:
+            if self._active_requests <= 0:
+                raise RuntimeError("request concurrency slot released without acquire")
+            self._active_requests -= 1
+            self._condition.notify_all()
+
+    def snapshot(self) -> ThroughputSnapshot:
+        now = self._time_fn()
+        with self._lock:
+            elapsed = (
+                max(0.0, now - self._window_started_at)
+                if self._window_started_at is not None
+                else 0.0
+            )
+            return ThroughputSnapshot(
+                current=self.current,
+                window_success=self._window_success,
+                last_window_success=self._last_window_success,
+                previous_window_success=self._previous_window_success,
+                window_elapsed_seconds=min(elapsed, self.window_seconds),
+                trend=self._trend,
+            )
+
+
+def _print_concurrency_adjustment(
+    adjustment: ConcurrencyAdjustment,
+    max_concurrency: int,
+) -> None:
+    samples = "/".join(str(value) for value in adjustment.sample_windows)
+    if adjustment.reason == "startup_warmup_discarded":
+        print(
+            "[采集] 启动预热窗口已忽略："
+            f"并发 {adjustment.from_concurrency}/{max_concurrency}，"
+            f"30秒成功 {adjustment.last_window_success}；开始稳定采样",
+            flush=True,
+        )
+        return
+    if adjustment.reason == "third_sample_needed":
+        print(
+            f"[采集] 并发 {adjustment.from_concurrency}/{max_concurrency} "
+            f"的前两窗成功数 {samples} 不稳定；追加第 3 个 30 秒窗口并取中位数",
+            flush=True,
+        )
+        return
+
+    stable_score = adjustment.stable_score
+    score_text = f"{stable_score:.1f}" if stable_score is not None else "-"
+    baseline_text = (
+        f"，比较基线 {adjustment.baseline_score:.1f}"
+        if adjustment.baseline_score is not None
+        else ""
+    )
+    action_labels = {
+        "baseline_established": "建立稳定基线",
+        "probe_improved": "探测吞吐提高",
+        "probe_improved_at_boundary": "探测吞吐提高并到达边界",
+        "probe_rejected": "探测未提高，回退",
+        "holding_refreshed": "回退档稳定重采样完成",
+    }
+    action = action_labels.get(adjustment.reason, "稳定采样完成")
+    if adjustment.from_concurrency == adjustment.to_concurrency:
+        concurrency_text = f"保持并发 {adjustment.to_concurrency}/{max_concurrency}"
+    else:
+        concurrency_text = (
+            f"并发 {adjustment.from_concurrency}→"
+            f"{adjustment.to_concurrency}/{max_concurrency}"
+        )
+    print(
+        f"[采集] {action}：窗口 {samples}，稳定得分 {score_text}"
+        f"{baseline_text}；{concurrency_text}",
+        flush=True,
+    )
+
+
 @dataclass(slots=True)
 class CollectionSummary:
     mode: str
@@ -547,7 +1001,12 @@ class Checkpoint(JsonlWriter):
 
 
 class CsvStore:
-    """An ID-keyed UTF-8-SIG CSV store with duplicate-safe upserts."""
+    """An ID-keyed UTF-8-SIG CSV store with crash-safe incremental inserts.
+
+    New IDs are appended and flushed immediately.  The expensive atomic full
+    rewrite is reserved for repairing malformed input or applying the unusual
+    case of an update to an existing ID.
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -556,6 +1015,10 @@ class CsvStore:
         self.fieldnames = list(CSV_HEADERS)
         self.rows: dict[str, dict[str, str]] = {}
         self._dirty = False
+        self._append_handle = None
+        self._append_failed = False
+        self._pending_updates = 0
+        self._write_count = 0
         self._load()
 
     def _load(self) -> None:
@@ -564,7 +1027,7 @@ class CsvStore:
             return
         needs_rewrite = False
         with self.path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
+            reader = csv.DictReader(handle, strict=True)
             existing_fields = [name for name in (reader.fieldnames or []) if name]
             missing_required = [name for name in ("ID", "链接", "标题") if name not in existing_fields]
             if missing_required:
@@ -576,7 +1039,11 @@ class CsvStore:
                     required = [row.get("ID"), row.get("链接"), row.get("标题")]
                     # DictReader uses None values/keys for truncated or over-wide
                     # rows.  Such a tail must never count as completed metadata.
-                    if None in row or any(value is None or not str(value).strip() for value in required):
+                    if (
+                        None in row
+                        or any(row.get(name) is None for name in existing_fields)
+                        or any(value is None or not str(value).strip() for value in required)
+                    ):
                         needs_rewrite = True
                         continue
                     gallery_id = str(row["ID"]).strip()
@@ -585,6 +1052,16 @@ class CsvStore:
                     self.rows[gallery_id] = {name: str(row.get(name, "") or "") for name in self.fieldnames}
             except csv.Error:
                 needs_rewrite = True
+        # A valid CSV record written by this store always ends in a newline.
+        # Repair a possibly interrupted append before adding another record so
+        # two records can never be concatenated.
+        try:
+            with self.path.open("rb") as raw:
+                raw.seek(-1, os.SEEK_END)
+                if raw.read(1) not in {b"\n", b"\r"}:
+                    needs_rewrite = True
+        except (OSError, ValueError):
+            needs_rewrite = True
         if needs_rewrite or existing_fields != self.fieldnames:
             self._rewrite_locked()
 
@@ -599,30 +1076,85 @@ class CsvStore:
             merged = {name: (row.get(name, old.get(name, "") if old else "")) for name in self.fieldnames}
             if old == merged:
                 return False
-            self.rows[info.id] = merged
-            self._dirty = True
+            if old is None:
+                if self._append_failed:
+                    # Repair a partial tail from the previous failed append
+                    # before attempting to extend the canonical file again.
+                    self._rewrite_locked()
+                self._append_locked(merged)
+                # has() must only observe the ID after writerow+flush succeed.
+                self.rows[info.id] = merged
+                self._write_count += 1
+            else:
+                # Do not expose duplicate IDs by journalling updates into the
+                # canonical CSV.  They are atomically folded in at commit.
+                self.rows[info.id] = merged
+                self._dirty = True
+                self._pending_updates += 1
             return True
 
     def commit(self) -> None:
-        """Commit all upserts as one atomic CSV replacement.
-
-        A forced process stop can at worst leave an ignored ``.tmp`` file; it
-        can never leave half a CSV row that would look complete on the next run.
-        """
+        """Flush incremental rows and atomically fold in existing-row updates."""
 
         with self._lock:
-            if self._dirty:
+            if self._dirty or self._append_failed:
                 self._rewrite_locked()
+                self._write_count += self._pending_updates
+                self._pending_updates = 0
+            elif self._append_handle is not None:
+                self._append_handle.flush()
+
+    @property
+    def write_count(self) -> int:
+        with self._lock:
+            return self._write_count
+
+    def _append_locked(self, row: dict[str, str]) -> None:
+        if self._append_handle is None:
+            self._append_handle = self.path.open("a", encoding="utf-8", newline="")
+        try:
+            writer = csv.DictWriter(self._append_handle, fieldnames=self.fieldnames)
+            writer.writerow(row)
+            # Flush every accepted gallery before its checkpoint records info_ok.
+            self._append_handle.flush()
+        except BaseException:
+            failed_handle = self._append_handle
+            self._append_handle = None
+            self._append_failed = True
+            try:
+                failed_handle.close()
+            except Exception:
+                pass
+            raise
+
+    def _close_append_locked(self) -> None:
+        if self._append_handle is not None:
+            handle = self._append_handle
+            self._append_handle = None
+            try:
+                handle.flush()
+                os.fsync(handle.fileno())
+            finally:
+                handle.close()
+
+    def close(self) -> None:
+        with self._lock:
+            self.commit()
+            self._close_append_locked()
 
     def _rewrite_locked(self) -> None:
+        self._close_append_locked()
         temp_path = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
         try:
             with temp_path.open("w", encoding="utf-8-sig", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
                 writer.writeheader()
                 writer.writerows(self.rows.values())
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temp_path, self.path)
             self._dirty = False
+            self._append_failed = False
         finally:
             try:
                 temp_path.unlink()
@@ -631,28 +1163,42 @@ class CsvStore:
 
 
 class ThumbnailStore:
-    """A thumbnail index built with one directory scan, never one scan per task."""
+    """A fast filename index whose image validation is deferred until lookup."""
 
     def __init__(self, directory: Path):
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.ids: set[str] = set()
+        self._candidates: dict[str, list[Path]] = {}
+        self._validity: dict[str, bool] = {}
         with os.scandir(self.directory) as entries:
             for entry in entries:
-                if not entry.is_file():
-                    continue
                 suffix = Path(entry.name).suffix.lower()
-                try:
-                    valid = suffix in VALID_IMAGE_SUFFIXES and _validate_image_file(Path(entry.path))
-                except OSError:
-                    valid = False
-                if valid:
-                    self.ids.add(Path(entry.name).stem)
+                if suffix in VALID_IMAGE_SUFFIXES:
+                    self._candidates.setdefault(Path(entry.name).stem, []).append(Path(entry.path))
 
     def has(self, gallery_id: str) -> bool:
         with self._lock:
-            return gallery_id in self.ids
+            cached = self._validity.get(gallery_id)
+            if cached is not None:
+                return cached
+            candidates = tuple(self._candidates.get(gallery_id, ()))
+        valid = any(_validate_image_file(path) for path in candidates)
+        with self._lock:
+            cached = self._validity.get(gallery_id)
+            if cached is not None:
+                return cached
+            self._validity[gallery_id] = valid
+            if valid:
+                self.ids.add(gallery_id)
+            return valid
+
+    def has_candidate(self, gallery_id: str) -> bool:
+        """Cheap resume check that avoids decoding every historical image."""
+
+        with self._lock:
+            return bool(self._candidates.get(gallery_id))
 
     @staticmethod
     def _extension(url: str, content_type: str) -> str:
@@ -683,6 +1229,8 @@ class ThumbnailStore:
             except FileNotFoundError:
                 pass
         with self._lock:
+            self._candidates.setdefault(gallery_id, []).append(target)
+            self._validity[gallery_id] = True
             self.ids.add(gallery_id)
         return target
 
@@ -991,6 +1539,7 @@ class OnlineCollectionRunner:
         *,
         sleep_fn: Callable[[float], None] = time.sleep,
         stop_event: threading.Event | None = None,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
     ):
         if config.output_csv is None or config.image_dir is None:
             raise ValueError(f"{config.mode} 需要 output_csv 和 image_dir")
@@ -998,6 +1547,19 @@ class OnlineCollectionRunner:
         self.adapter = adapter
         self.sleep_fn = sleep_fn
         self.stop_event = stop_event or threading.Event()
+        self.progress_callback = progress_callback
+        self._states_lock = threading.RLock()
+        self._progress_lock = threading.Lock()
+        self._progress_last_emit = float("-inf")
+        self._progress_stage = ""
+        self._progress_callback_failed = False
+        self._round_number = 0
+        self._concurrency_changed = threading.Event()
+        self.concurrency = AdaptiveConcurrency(config.workers)
+        self.states: dict[str, TaskState] = {}
+        self.completed_pages: set[int] = set()
+        self.terminal_pages: set[int] = set()
+        self._emit_progress("initializing", force=True)
         self.csv_store = CsvStore(config.output_csv)
         self.thumbnail_store = ThumbnailStore(config.image_dir)
         self.checkpoint = Checkpoint(config.state_file)
@@ -1014,9 +1576,73 @@ class OnlineCollectionRunner:
         self.states = replayed.tasks
         self.completed_pages = replayed.completed_pages
         self.terminal_pages = replayed.terminal_pages
+        # Old collector versions checkpointed info_ok before their round-end
+        # CSV rewrite.  Reconcile that cheap in-memory lookup so a previously
+        # forced stop cannot make an absent row look complete.  Thumbnail
+        # bytes, however, were written before task_state; defer their expensive
+        # Pillow validation until an incomplete task is actually queued.
         for state in self.states.values():
             state.info_ok = self.csv_store.has(state.item.id)
-            state.thumb_ok = self.thumbnail_store.has(state.item.id)
+            state.thumb_ok = state.thumb_ok and self.thumbnail_store.has_candidate(state.item.id)
+        self._emit_progress("ready", force=True)
+
+    def _state_snapshot(self) -> list[TaskState]:
+        with self._states_lock:
+            return list(self.states.values())
+
+    def _progress_payload(self, stage: str) -> dict[str, object]:
+        states = self._state_snapshot()
+        counts = _task_counts(states)
+        pages_total = self.config.max_pages if self.config.mode in {"nh-online", "jm-online"} else 0
+        pages_completed = len(self.completed_pages | self.terminal_pages)
+        pages_pending = max(0, pages_total - pages_completed)
+        info_complete = sum(state.info_ok for state in states)
+        image_complete = sum(state.thumb_ok for state in states)
+        total_units = pages_total + (2 * len(states))
+        resolved_units = pages_completed + info_complete + image_complete
+        percent = 100.0 * resolved_units / total_units if total_units else 0.0
+        throughput = self.concurrency.snapshot()
+        csv_store = getattr(self, "csv_store", None)
+        return {
+            "mode": self.config.mode,
+            "round": self._round_number,
+            "stage": stage,
+            "pagesCompleted": pages_completed,
+            "pagesTotal": pages_total,
+            "pagesPending": pages_pending,
+            "discovered": len(states),
+            **counts,
+            "currentConcurrency": throughput.current,
+            "maxConcurrency": self.config.workers,
+            "windowSuccess": throughput.window_success,
+            "lastWindowSuccess": throughput.last_window_success,
+            "previousWindowSuccess": throughput.previous_window_success,
+            "windowElapsedSeconds": round(throughput.window_elapsed_seconds, 2),
+            "throughputTrend": throughput.trend,
+            "progressPercent": round(min(100.0, max(0.0, percent)), 2),
+            "csvWrites": csv_store.write_count if csv_store is not None else 0,
+            "updatedAt": _utc_now(),
+        }
+
+    def _emit_progress(self, stage: str, *, force: bool = False) -> None:
+        callback = self.progress_callback
+        if callback is None or self._progress_callback_failed:
+            return
+        now = time.monotonic()
+        with self._progress_lock:
+            stage_changed = stage != self._progress_stage
+            if not force and not stage_changed and now - self._progress_last_emit < 0.75:
+                return
+            self._progress_stage = stage
+            self._progress_last_emit = now
+            payload = self._progress_payload(stage)
+            try:
+                callback(payload)
+            except Exception as exc:
+                # Telemetry must never abort a collection.  Disable a broken
+                # callback after the first failure to avoid flooding stderr.
+                self._progress_callback_failed = True
+                print(f"[采集] 进度回调已禁用: {exc}", file=sys.stderr, flush=True)
 
     def _wait(self, seconds: float) -> None:
         if self.stop_event.is_set():
@@ -1031,20 +1657,43 @@ class OnlineCollectionRunner:
             if self.stop_event.is_set():
                 raise StopRequested()
 
-    def _attempt(self, operation: Callable[[], Any]) -> Any:
+    def _attempt(
+        self,
+        operation: Callable[[], Any],
+        *,
+        validate_result: Callable[[Any], None] | None = None,
+    ) -> Any:
         last_error: Exception | None = None
         for attempt in range(1, self.config.request_attempts + 1):
             if self.stop_event.is_set():
                 raise StopRequested()
+            should_retry = False
+            self.concurrency.acquire(self.stop_event)
             try:
-                return operation()
-            except StopRequested:
-                raise
-            except Exception as exc:
-                last_error = exc
-                if not _retryable(exc) or attempt >= self.config.request_attempts:
-                    break
-                self._wait(_retry_delay(self.config.retry_backoff, attempt - 1, cap=60.0))
+                try:
+                    result = operation()
+                    if validate_result is not None:
+                        validate_result(result)
+                except StopRequested:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    adjustment = self.concurrency.record_failure()
+                    if adjustment is not None:
+                        self._concurrency_changed.set()
+                        _print_concurrency_adjustment(adjustment, self.config.workers)
+                    should_retry = _retryable(exc) and attempt < self.config.request_attempts
+                else:
+                    adjustment = self.concurrency.record_success()
+                    if adjustment is not None:
+                        self._concurrency_changed.set()
+                        _print_concurrency_adjustment(adjustment, self.config.workers)
+                    return result
+            finally:
+                self.concurrency.release()
+            if not should_retry:
+                break
+            self._wait(_retry_delay(self.config.retry_backoff, attempt - 1, cap=60.0))
         assert last_error is not None
         raise last_error
 
@@ -1075,24 +1724,26 @@ class OnlineCollectionRunner:
         )
 
     def _merge_item(self, item: CollectionItem) -> TaskState:
-        state = self.states.get(item.id)
-        if state is None:
-            state = TaskState(
-                item=item,
-                info_ok=self.csv_store.has(item.id),
-                thumb_ok=self.thumbnail_store.has(item.id),
-            )
-            self.states[item.id] = state
-        else:
-            state.item.detail_url = item.detail_url or state.item.detail_url
-            state.item.thumbnail_url = item.thumbnail_url or state.item.thumbnail_url
-            state.item.page = item.page or state.item.page
-            state.info_ok = self.csv_store.has(item.id)
-            state.thumb_ok = self.thumbnail_store.has(item.id)
-        self.checkpoint.task(state)
+        info_exists = self.csv_store.has(item.id)
+        thumb_exists = self.thumbnail_store.has(item.id)
+        with self._states_lock:
+            state = self.states.get(item.id)
+            if state is None:
+                state = TaskState(item=item, info_ok=info_exists, thumb_ok=thumb_exists)
+                self.states[item.id] = state
+            else:
+                state.item.detail_url = item.detail_url or state.item.detail_url
+                state.item.thumbnail_url = item.thumbnail_url or state.item.thumbnail_url
+                state.item.page = item.page or state.item.page
+                # A duplicate list result can arrive while this item is being
+                # processed.  Never regress an in-memory success to the stale
+                # filesystem observation taken just before acquiring the lock.
+                state.info_ok = state.info_ok or info_exists
+                state.thumb_ok = state.thumb_ok or thumb_exists
+            self.checkpoint.task(state)
         return state
 
-    def _discover_page(self, page: int, round_number: int) -> bool:
+    def _discover_page(self, page: int, round_number: int) -> tuple[bool, list[str]]:
         try:
             def discover_nonempty() -> list[CollectionItem]:
                 found = self.adapter.discover_page(page)
@@ -1124,36 +1775,49 @@ class OnlineCollectionRunner:
                 else:
                     self.terminal_pages.add(page)
                     self.checkpoint.append({"event": "page_terminal", "page": page})
-                return True
-            return False
+                return True, []
+            return False, []
+        candidate_ids: list[str] = []
         for item in items:
-            self._merge_item(item)
+            state = self._merge_item(item)
+            with self._states_lock:
+                if not state.complete and not state.terminal:
+                    candidate_ids.append(state.item.id)
         self.completed_pages.add(page)
         self.checkpoint.append({"event": "page_complete", "page": page, "items": len(items)})
         print(f"[采集] 第 {page} 页发现 {len(items)} 项", flush=True)
-        return True
+        return True, candidate_ids
 
     def _process_item(self, state: TaskState, round_number: int) -> TaskState:
-        item = state.item
-        state.info_ok = self.csv_store.has(item.id)
-        state.thumb_ok = self.thumbnail_store.has(item.id)
-        if state.complete or state.terminal:
-            return state
-
-        needs_detail = not state.info_ok or (not state.thumb_ok and not item.thumbnail_url)
+        with self._states_lock:
+            item = state.item
+            gallery_id = item.id
+        info_exists = self.csv_store.has(gallery_id)
+        thumb_exists = self.thumbnail_store.has(gallery_id)
+        with self._states_lock:
+            state.info_ok = state.info_ok or info_exists
+            state.thumb_ok = state.thumb_ok or thumb_exists
+            if state.complete or state.terminal:
+                return state
+            needs_detail = not state.info_ok or (not state.thumb_ok and not item.thumbnail_url)
         if needs_detail:
             try:
                 parsed = self._attempt(lambda: self.adapter.fetch_detail(item))
-                if not state.info_ok:
+                with self._states_lock:
+                    needs_info_write = not state.info_ok
+                if needs_info_write:
                     self.csv_store.upsert(parsed.info)
-                    state.info_ok = True
-                    state.terminal_info = False
-                if parsed.thumbnail_url:
-                    item.thumbnail_url = parsed.thumbnail_url
+                with self._states_lock:
+                    if needs_info_write:
+                        state.info_ok = True
+                        state.terminal_info = False
+                    if parsed.thumbnail_url:
+                        item.thumbnail_url = parsed.thumbnail_url
             except StopRequested:
                 raise
             except Exception as exc:
-                purpose = "detail" if not state.info_ok else "thumbnail_url"
+                with self._states_lock:
+                    purpose = "detail" if not state.info_ok else "thumbnail_url"
                 self._error(
                     round_number=round_number,
                     stage=purpose,
@@ -1162,13 +1826,17 @@ class OnlineCollectionRunner:
                     url=item.detail_url,
                 )
                 if not _retryable(exc):
-                    if not state.info_ok:
-                        state.terminal_info = True
-                    elif not state.thumb_ok:
-                        state.terminal_thumb = True
+                    with self._states_lock:
+                        if not state.info_ok:
+                            state.terminal_info = True
+                        elif not state.thumb_ok:
+                            state.terminal_thumb = True
 
-        if not state.thumb_ok:
-            if not item.thumbnail_url:
+        with self._states_lock:
+            needs_thumbnail = not state.thumb_ok
+            thumbnail_url = item.thumbnail_url
+        if needs_thumbnail:
+            if not thumbnail_url:
                 exc = CollectionRequestError("未解析到缩略图 URL")
                 self._error(
                     round_number=round_number,
@@ -1179,10 +1847,14 @@ class OnlineCollectionRunner:
                 )
             else:
                 try:
-                    payload = self._attempt(lambda: self.adapter.fetch_thumbnail(item.thumbnail_url))
-                    self.thumbnail_store.save(item.id, item.thumbnail_url, payload)
-                    state.thumb_ok = True
-                    state.terminal_thumb = False
+                    payload = self._attempt(
+                        lambda: self.adapter.fetch_thumbnail(thumbnail_url),
+                        validate_result=_validate_image_payload,
+                    )
+                    self.thumbnail_store.save(item.id, thumbnail_url, payload)
+                    with self._states_lock:
+                        state.thumb_ok = True
+                        state.terminal_thumb = False
                 except StopRequested:
                     raise
                 except Exception as exc:
@@ -1191,17 +1863,22 @@ class OnlineCollectionRunner:
                         stage="thumbnail",
                         exc=exc,
                         item=item,
-                        url=item.thumbnail_url,
+                        url=thumbnail_url,
                     )
                     # A list-page CDN URL may expire or rotate.  Force the
                     # next round through fetch_detail() to obtain a fresh URL
                     # before treating the gallery itself as terminal.
-                    item.thumbnail_url = ""
-                    state.terminal_thumb = False
-        self.checkpoint.task(state)
-        status = "完成" if state.complete else "待重试"
+                    with self._states_lock:
+                        item.thumbnail_url = ""
+                        state.terminal_thumb = False
+        with self._states_lock:
+            self.checkpoint.task(state)
+            complete = state.complete
+            info_ok = state.info_ok
+            thumb_ok = state.thumb_ok
+        status = "完成" if complete else "待重试"
         print(
-            f"[采集] {item.id} {status}（信息={'OK' if state.info_ok else 'FAIL'}，缩略图={'OK' if state.thumb_ok else 'FAIL'}）",
+            f"[采集] {item.id} {status}（信息={'OK' if info_ok else 'FAIL'}，缩略图={'OK' if thumb_ok else 'FAIL'}）",
             flush=True,
         )
         if self.config.interval:
@@ -1213,6 +1890,7 @@ class OnlineCollectionRunner:
             raise ValueError("nh-local-info 需要 input_file")
         links = parse_local_links(self.config.input_file)
         if not links and not self.states:
+            self.csv_store.close()
             self.checkpoint.close()
             self.error_writer.close()
             raise ValueError(f"输入文件未解析到任何 NH 图库链接: {self.config.input_file}")
@@ -1220,19 +1898,30 @@ class OnlineCollectionRunner:
             self._merge_item(CollectionItem(_nh_id(url), url, page=0, label=label))
 
     def _summary(self, rounds: int, pending_pages: set[int], interrupted: bool = False) -> CollectionSummary:
-        completed = sum(state.complete for state in self.states.values())
-        terminal = sum(state.terminal and not state.complete for state in self.states.values()) + len(self.terminal_pages)
-        pending = sum(not state.complete and not state.terminal for state in self.states.values())
+        states = self._state_snapshot()
+        counts = _task_counts(states)
         return CollectionSummary(
             mode=self.config.mode,
             rounds=rounds,
-            discovered=len(self.states),
-            completed=completed,
-            pending=pending,
-            terminal=terminal,
+            discovered=len(states),
+            completed=counts["complete"],
+            pending=counts["pending"],
+            terminal=counts["terminal"] + len(self.terminal_pages),
             failed_pages=len(pending_pages),
             interrupted=interrupted,
             output_csv=str(self.config.output_csv),
+        )
+
+    def _compact_checkpoint(self, summary: CollectionSummary, *, run_completed: bool) -> None:
+        states = self._state_snapshot()
+        self.checkpoint.compact(
+            mode=self.config.mode,
+            identity=self.config.identity,
+            tasks=states,
+            completed_pages=self.completed_pages,
+            terminal_pages=self.terminal_pages,
+            run_completed=run_completed,
+            summary=summary.as_dict(),
         )
 
     def run(self) -> CollectionSummary:
@@ -1246,7 +1935,7 @@ class OnlineCollectionRunner:
         )
         pending_ids = {
             gallery_id
-            for gallery_id, state in self.states.items()
+            for gallery_id, state in ((state.item.id, state) for state in self._state_snapshot())
             if not state.complete and not state.terminal
         }
         rounds = 0
@@ -1255,73 +1944,167 @@ class OnlineCollectionRunner:
                 if self.config.max_rounds and rounds >= self.config.max_rounds:
                     break
                 rounds += 1
+                self._round_number = rounds
                 print(
-                    f"[采集] 开始第 {rounds} 轮：失败页 {len(pending_pages)}，待完成项目 {len(pending_ids)}",
+                    f"[采集] 开始第 {rounds} 轮：待处理列表页 {len(pending_pages)}，待完成项目 {len(pending_ids)}",
                     flush=True,
                 )
+                self._emit_progress("round_start", force=True)
                 next_pages: set[int] = set()
-                for page in sorted(pending_pages):
-                    if not self._discover_page(page, rounds):
-                        next_pages.add(page)
+                ready: deque[str] = deque()
+                queued: set[str] = set()
+                processed: set[str] = set()
+                futures: dict[Future[TaskState], str] = {}
+                queue_limit = max(1, self.config.workers * 2)
 
-                candidates = {
-                    gallery_id
-                    for gallery_id, state in self.states.items()
-                    if not state.complete and not state.terminal
-                }
-                if candidates:
-                    executor = ThreadPoolExecutor(max_workers=self.config.workers)
-                    futures = {
-                        executor.submit(self._process_item, self.states[gallery_id], rounds): gallery_id
-                        for gallery_id in sorted(candidates)
-                    }
-                    try:
-                        for future in as_completed(futures):
-                            future.result()
-                    except BaseException:
-                        self.stop_event.set()
-                        for future in futures:
-                            future.cancel()
-                        executor.shutdown(wait=True, cancel_futures=True)
-                        raise
+                def enqueue(gallery_id: str) -> None:
+                    if gallery_id in queued or gallery_id in processed:
+                        return
+                    with self._states_lock:
+                        state = self.states.get(gallery_id)
+                        if state is None or state.complete or state.terminal:
+                            return
+                    ready.append(gallery_id)
+                    queued.add(gallery_id)
+
+                for gallery_id in sorted(pending_ids):
+                    enqueue(gallery_id)
+
+                executor = ThreadPoolExecutor(
+                    max_workers=self.config.workers,
+                    thread_name_prefix=f"{self.config.mode}-item",
+                )
+
+                def schedule_available() -> None:
+                    current = self.concurrency.snapshot().current
+                    while ready and len(futures) < current and not self.stop_event.is_set():
+                        gallery_id = ready.popleft()
+                        with self._states_lock:
+                            state = self.states.get(gallery_id)
+                        if state is None:
+                            queued.discard(gallery_id)
+                            continue
+                        future = executor.submit(self._process_item, state, rounds)
+                        futures[future] = gallery_id
+
+                def collect_completed(*, block: bool, refill: bool = True) -> bool:
+                    if refill:
+                        schedule_available()
+                    if not futures:
+                        if self.stop_event.is_set():
+                            raise StopRequested()
+                        return False
+                    if block:
+                        done, _not_done = wait(tuple(futures), return_when=FIRST_COMPLETED)
                     else:
-                        executor.shutdown(wait=True)
+                        done = {future for future in futures if future.done()}
+                        if not done:
+                            return False
+                    for future in done:
+                        gallery_id = futures.pop(future)
+                        queued.discard(gallery_id)
+                        processed.add(gallery_id)
+                        future.result()
+                    if self._concurrency_changed.is_set():
+                        self._concurrency_changed.clear()
+                        self._emit_progress("streaming", force=True)
+                    else:
+                        self._emit_progress("streaming")
+                    if refill:
+                        schedule_available()
+                    return True
+
+                try:
+                    schedule_available()
+                    for page in sorted(pending_pages):
+                        if self.stop_event.is_set():
+                            raise StopRequested()
+                        # Keep only a small producer-side backlog.  Details and
+                        # thumbnails from earlier pages continue running while
+                        # the next list page is fetched.
+                        while len(ready) > queue_limit:
+                            collect_completed(block=True)
+                        # The list request itself consumes one network slot.
+                        # Drain (without refilling) until there is room so the
+                        # real request concurrency never exceeds --workers or
+                        # the adaptive controller's current value.
+                        while futures and len(futures) >= self.concurrency.snapshot().current:
+                            collect_completed(block=True, refill=False)
+                        succeeded, discovered_ids = self._discover_page(page, rounds)
+                        if not succeeded:
+                            next_pages.add(page)
+                        for gallery_id in discovered_ids:
+                            enqueue(gallery_id)
+                        schedule_available()
+                        collect_completed(block=False)
+                        # Before racing through the remaining list pages, let
+                        # at least one newly discovered item make observable
+                        # progress.  The rest of that page continues in
+                        # parallel with subsequent discovery.
+                        if discovered_ids and not processed and futures:
+                            collect_completed(block=True)
+                        self._emit_progress("streaming")
+                    while ready or futures:
+                        collect_completed(block=True)
+                    if self.stop_event.is_set():
+                        raise StopRequested()
+                except BaseException:
+                    self.stop_event.set()
+                    for future in futures:
+                        future.cancel()
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    raise
+                else:
+                    executor.shutdown(wait=True)
 
                 self.csv_store.commit()
 
                 pending_pages = next_pages
                 pending_ids = {
-                    gallery_id
-                    for gallery_id, state in self.states.items()
+                    state.item.id
+                    for state in self._state_snapshot()
                     if not state.complete and not state.terminal
                 }
                 if not pending_pages and not pending_ids:
                     break
                 if self.config.max_rounds and rounds >= self.config.max_rounds:
                     break
+                # Keep resume initialization bounded even after a very noisy
+                # round.  All workers are joined before this atomic snapshot.
+                paused = self._summary(rounds, pending_pages)
+                self._compact_checkpoint(paused, run_completed=False)
                 delay = _retry_delay(self.config.retry_backoff, rounds - 1)
                 print(f"[采集] 本轮失败项将在 {delay:g} 秒后重试", flush=True)
+                self._emit_progress("retry_wait", force=True)
                 self._wait(delay)
         except (KeyboardInterrupt, StopRequested):
             self.stop_event.set()
-            self.csv_store.commit()
-            self.checkpoint.append({"event": "run_interrupted", "round": rounds})
+            if is_online:
+                pending_pages = (
+                    set(range(1, self.config.max_pages + 1))
+                    - self.completed_pages
+                    - self.terminal_pages
+                )
+            # CSV rows are flushed before the atomic checkpoint snapshot, so a
+            # resumed task can never trust an info_ok record that is not there.
+            self.csv_store.close()
+            summary = self._summary(rounds, pending_pages, interrupted=True)
+            self._compact_checkpoint(summary, run_completed=False)
+            self.error_writer.close()
+            self._emit_progress("interrupted", force=True)
+            return summary
+        except BaseException:
+            self.stop_event.set()
+            self.csv_store.close()
             self.checkpoint.close()
             self.error_writer.close()
-            return self._summary(rounds, pending_pages, interrupted=True)
+            raise
 
-        self.csv_store.commit()
+        self.csv_store.close()
         summary = self._summary(rounds, pending_pages)
-        self.checkpoint.compact(
-            mode=self.config.mode,
-            identity=self.config.identity,
-            tasks=self.states.values(),
-            completed_pages=self.completed_pages,
-            terminal_pages=self.terminal_pages,
-            run_completed=summary.success,
-            summary=summary.as_dict(),
-        )
+        self._compact_checkpoint(summary, run_completed=summary.success)
         self.error_writer.close()
+        self._emit_progress("completed" if summary.success else "stopped", force=True)
         return summary
 
 
@@ -1406,6 +2189,7 @@ class LocalImagesRunner:
         *,
         sleep_fn: Callable[[float], None] = time.sleep,
         stop_event: threading.Event | None = None,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
     ):
         if config.input_file is None or config.output_dir is None:
             raise ValueError("nh-local-images 需要 input_file 和 output_dir")
@@ -1413,6 +2197,17 @@ class LocalImagesRunner:
         self.adapter = adapter
         self.sleep_fn = sleep_fn
         self.stop_event = stop_event or threading.Event()
+        self.progress_callback = progress_callback
+        self._states_lock = threading.RLock()
+        self._progress_lock = threading.Lock()
+        self._progress_last_emit = float("-inf")
+        self._progress_stage = ""
+        self._progress_callback_failed = False
+        self._round_number = 0
+        self.concurrency = AdaptiveConcurrency(config.workers)
+        self._concurrency_changed = threading.Event()
+        self.states: dict[str, TaskState] = {}
+        self._emit_progress("initializing", force=True)
         self.store = FullImageStore(config.output_dir)
         self.checkpoint = Checkpoint(config.state_file)
         self.errors = JsonlWriter(config.error_log, flush_every=1)
@@ -1437,6 +2232,58 @@ class LocalImagesRunner:
         # galleries at their first failed page.
         if any(not state.info_ok and not state.terminal_info for state in self.states.values()):
             self.discovery_complete = False
+        self._emit_progress("ready", force=True)
+
+    def _state_snapshot(self) -> list[TaskState]:
+        with self._states_lock:
+            return list(self.states.values())
+
+    def _progress_payload(self, stage: str) -> dict[str, object]:
+        states = self._state_snapshot()
+        counts = _task_counts(states)
+        pages_completed = counts["complete"] + counts["terminal"]
+        info_complete = sum(state.info_ok for state in states)
+        image_complete = sum(state.thumb_ok for state in states)
+        total_components = 2 * len(states)
+        percent = 100.0 * (info_complete + image_complete) / total_components if total_components else 0.0
+        throughput = self.concurrency.snapshot()
+        return {
+            "mode": self.config.mode,
+            "round": self._round_number,
+            "stage": stage,
+            "pagesCompleted": pages_completed,
+            "pagesTotal": len(states),
+            "pagesPending": counts["pending"],
+            "discovered": len(states),
+            **counts,
+            "currentConcurrency": throughput.current,
+            "maxConcurrency": self.config.workers,
+            "windowSuccess": throughput.window_success,
+            "lastWindowSuccess": throughput.last_window_success,
+            "previousWindowSuccess": throughput.previous_window_success,
+            "windowElapsedSeconds": round(throughput.window_elapsed_seconds, 2),
+            "throughputTrend": throughput.trend,
+            "progressPercent": round(min(100.0, max(0.0, percent)), 2),
+            "csvWrites": 0,
+            "updatedAt": _utc_now(),
+        }
+
+    def _emit_progress(self, stage: str, *, force: bool = False) -> None:
+        callback = self.progress_callback
+        if callback is None or self._progress_callback_failed:
+            return
+        now = time.monotonic()
+        with self._progress_lock:
+            stage_changed = stage != self._progress_stage
+            if not force and not stage_changed and now - self._progress_last_emit < 0.75:
+                return
+            self._progress_stage = stage
+            self._progress_last_emit = now
+            try:
+                callback(self._progress_payload(stage))
+            except Exception as exc:
+                self._progress_callback_failed = True
+                print(f"[采集] 进度回调已禁用: {exc}", file=sys.stderr, flush=True)
 
     def _wait(self, seconds: float) -> None:
         if self.stop_event.is_set():
@@ -1449,20 +2296,43 @@ class LocalImagesRunner:
         else:
             self.sleep_fn(seconds)
 
-    def _attempt(self, operation: Callable[[], Any]) -> Any:
+    def _attempt(
+        self,
+        operation: Callable[[], Any],
+        *,
+        validate_result: Callable[[Any], None] | None = None,
+    ) -> Any:
         last: Exception | None = None
         for attempt in range(self.config.request_attempts):
             if self.stop_event.is_set():
                 raise StopRequested()
+            should_retry = False
+            self.concurrency.acquire(self.stop_event)
             try:
-                return operation()
-            except StopRequested:
-                raise
-            except Exception as exc:
-                last = exc
-                if not _retryable(exc) or attempt + 1 >= self.config.request_attempts:
-                    break
-                self._wait(_retry_delay(self.config.retry_backoff, attempt, cap=60.0))
+                try:
+                    result = operation()
+                    if validate_result is not None:
+                        validate_result(result)
+                except StopRequested:
+                    raise
+                except Exception as exc:
+                    last = exc
+                    adjustment = self.concurrency.record_failure()
+                    if adjustment is not None:
+                        self._concurrency_changed.set()
+                        _print_concurrency_adjustment(adjustment, self.config.workers)
+                    should_retry = _retryable(exc) and attempt + 1 < self.config.request_attempts
+                else:
+                    adjustment = self.concurrency.record_success()
+                    if adjustment is not None:
+                        self._concurrency_changed.set()
+                        _print_concurrency_adjustment(adjustment, self.config.workers)
+                    return result
+            finally:
+                self.concurrency.release()
+            if not should_retry:
+                break
+            self._wait(_retry_delay(self.config.retry_backoff, attempt, cap=60.0))
         assert last is not None
         raise last
 
@@ -1497,7 +2367,10 @@ class LocalImagesRunner:
             return  # Page discovery owns the continuous gallery cursor.
         if state.info_ok and not state.thumb_ok:
             try:
-                payload = self._attempt(lambda: self.adapter.fetch_thumbnail(state.item.thumbnail_url))
+                payload = self._attempt(
+                    lambda: self.adapter.fetch_thumbnail(state.item.thumbnail_url),
+                    validate_result=_validate_image_payload,
+                )
                 self.store.save(folder, state.item.page, state.item.thumbnail_url, payload)
                 state.thumb_ok = True
             except StopRequested:
@@ -1650,32 +2523,81 @@ class LocalImagesRunner:
                 if self.config.max_rounds and rounds >= self.config.max_rounds:
                     break
                 rounds += 1
+                self._round_number = rounds
+                self._emit_progress("round_start", force=True)
                 if not self.discovery_complete:
                     self._discover_round(links, rounds)
+                    self._emit_progress("discovering")
                 image_pending = [
                     state
-                    for state in self.states.values()
+                    for state in self._state_snapshot()
                     if state.info_ok and not state.thumb_ok and not state.terminal
                 ]
                 if image_pending:
-                    with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
-                        futures = [executor.submit(self._process, state, rounds) for state in image_pending]
-                        for future in as_completed(futures):
-                            future.result()
+                    ready: deque[TaskState] = deque(image_pending)
+                    futures: set[Future[None]] = set()
+                    executor = ThreadPoolExecutor(
+                        max_workers=self.config.workers,
+                        thread_name_prefix="nh-local-image",
+                    )
+                    try:
+                        while ready or futures:
+                            current = self.concurrency.snapshot().current
+                            while ready and len(futures) < current and not self.stop_event.is_set():
+                                futures.add(executor.submit(self._process, ready.popleft(), rounds))
+                            if self.stop_event.is_set():
+                                raise StopRequested()
+                            if not futures:
+                                continue
+                            done, _not_done = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                            for future in done:
+                                futures.discard(future)
+                                future.result()
+                            if self._concurrency_changed.is_set():
+                                self._concurrency_changed.clear()
+                                self._emit_progress("downloading", force=True)
+                            else:
+                                self._emit_progress("downloading")
+                        if self.stop_event.is_set():
+                            raise StopRequested()
+                    except BaseException:
+                        self.stop_event.set()
+                        for future in futures:
+                            future.cancel()
+                        executor.shutdown(wait=True, cancel_futures=True)
+                        raise
+                    else:
+                        executor.shutdown(wait=True)
                 retry_pending = any(
-                    not state.complete and not state.terminal for state in self.states.values()
+                    not state.complete and not state.terminal for state in self._state_snapshot()
                 )
                 if self.discovery_complete and not retry_pending:
                     break
                 if self.config.max_rounds and rounds >= self.config.max_rounds:
                     break
+                self._emit_progress("retry_wait", force=True)
                 self._wait(_retry_delay(self.config.retry_backoff, rounds - 1))
         except (KeyboardInterrupt, StopRequested):
             self.stop_event.set()
-            self.checkpoint.append({"event": "run_interrupted", "round": rounds})
+            summary = self._summary(rounds, interrupted=True)
+            self.checkpoint.compact(
+                mode=self.config.mode,
+                identity=self.config.identity,
+                tasks=self._state_snapshot(),
+                limit_galleries=self.limit_galleries,
+                completed_galleries=self.completed_galleries,
+                local_discovery_complete=self.discovery_complete,
+                run_completed=False,
+                summary=summary.as_dict(),
+            )
+            self.errors.close()
+            self._emit_progress("interrupted", force=True)
+            return summary
+        except BaseException:
+            self.stop_event.set()
             self.checkpoint.close()
             self.errors.close()
-            return self._summary(rounds, interrupted=True)
+            raise
         summary = self._summary(rounds)
         self.checkpoint.compact(
             mode=self.config.mode,
@@ -1688,6 +2610,7 @@ class LocalImagesRunner:
             summary=summary.as_dict(),
         )
         self.errors.close()
+        self._emit_progress("completed" if summary.success else "stopped", force=True)
         return summary
 
 
@@ -1697,6 +2620,7 @@ def run_collection(
     adapter: SiteAdapter | Any | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     stop_event: threading.Event | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> CollectionSummary:
     """Run one collection job; no network is used when a fake adapter is injected."""
 
@@ -1710,15 +2634,29 @@ def run_collection(
             adapter = NHAdapter(resolved)
     if resolved.mode == "nh-local-images":
         return LocalImagesRunner(
-            resolved, adapter, sleep_fn=sleep_fn, stop_event=stop_event
+            resolved,
+            adapter,
+            sleep_fn=sleep_fn,
+            stop_event=stop_event,
+            progress_callback=progress_callback,
         ).run()
     return OnlineCollectionRunner(
-        resolved, adapter, sleep_fn=sleep_fn, stop_event=stop_event
+        resolved,
+        adapter,
+        sleep_fn=sleep_fn,
+        stop_event=stop_event,
+        progress_callback=progress_callback,
     ).run()
 
 
 def _add_retry_options(parser: argparse.ArgumentParser, *, default_workers: int) -> None:
-    parser.add_argument("--workers", "--max-workers", type=int, default=default_workers, help="并发线程数")
+    parser.add_argument(
+        "--workers",
+        "--max-workers",
+        type=int,
+        default=default_workers,
+        help="请求并发上限（从上限启动；忽略首个 30 秒预热窗，再按 2～3 个窗口的稳定成功吞吐自动寻优）",
+    )
     parser.add_argument("--request-attempts", type=int, default=3, help="每轮内单次请求尝试次数")
     parser.add_argument(
         "--max-rounds",

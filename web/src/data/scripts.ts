@@ -123,12 +123,14 @@ export const dataSections: ScriptSection[] = [
   },
 ];
 
+const collectionWorkersHelp = "任务从此上限启动；首个完整 30 秒窗口仅预热并丢弃；同档后续两窗中的较大值至少为 10，且相差不超过 15% 或绝对 2 时取平均；两窗都低于 10 或波动较大时采第 3 窗取中位数。只有稳定得分才用于探测相邻档，失败率不参与。";
+
 export const collectionScripts: ScriptDefinition[] = [
   {
     id: "collection-nh-online",
     title: "NH 在线采集",
     action: "开始完整采集",
-    description: "采集 NH 元数据和缩略图；失败项会写入状态文件并自动重试，直至全部成功或用户中止。",
+    description: "流式发现并采集 NH 元数据和缩略图，结果实时写入 CSV；并发会先预热、稳定采样成功吞吐，再自动探测相邻档位，失败项持续重试至成功或用户安全中止。",
     confirmField: "confirm",
     fields: [
       text("baseUrl", "站点 Base URL", "https://nhentai.net"),
@@ -136,7 +138,7 @@ export const collectionScripts: ScriptDefinition[] = [
       number("maxPages", "抓到多少页截止", 1, 1, 100000, 1),
       text("outputCsv", "原始信息 CSV", "data/gallery_info_origin/NH_info_chinese.csv"),
       text("imageDir", "缩略图保存目录", "onlineimgtmp"),
-      number("workers", "并发线程数", 10, 1, 64, 1),
+      number("workers", "并发上限", 10, 1, 64, 1, collectionWorkersHelp),
       number("requestAttempts", "单次请求尝试次数", 3, 1, 20, 1),
       number("requestTimeout", "单次请求超时秒数", 30, 1, 3600, 1),
       number("retryRounds", "最多轮数（含首轮）", 0, 0, 100000, 1, "0 表示持续重试，直到信息和缩略图全部成功或用户中止。"),
@@ -153,7 +155,7 @@ export const collectionScripts: ScriptDefinition[] = [
     id: "collection-jm-online",
     title: "JM 在线采集",
     action: "开始完整采集",
-    description: "采集 JM 元数据和封面；失败项会写入状态文件并自动重试，直至全部成功或用户中止。",
+    description: "流式发现并采集 JM 元数据和封面，结果实时写入 CSV；并发会先预热、稳定采样成功吞吐，再自动探测相邻档位，失败项持续重试至成功或用户安全中止。",
     confirmField: "confirm",
     fields: [
       text("baseUrl", "站点 Base URL", "https://18comic.vip"),
@@ -161,7 +163,7 @@ export const collectionScripts: ScriptDefinition[] = [
       number("maxPages", "抓到多少页截止", 80, 1, 100000, 1),
       text("outputCsv", "原始信息 CSV", "data/gallery_info_origin/JM_info_yuri.csv"),
       text("imageDir", "封面保存目录", "onlineimgtmp"),
-      number("workers", "并发线程数", 5, 1, 64, 1),
+      number("workers", "并发上限", 5, 1, 64, 1, collectionWorkersHelp),
       number("requestAttempts", "单次请求尝试次数", 3, 1, 20, 1),
       number("requestTimeout", "单次请求超时秒数", 30, 1, 3600, 1),
       number("retryRounds", "最多轮数（含首轮）", 0, 0, 100000, 1, "0 表示持续重试，直到信息和封面全部成功或用户中止。"),
@@ -178,14 +180,14 @@ export const collectionScripts: ScriptDefinition[] = [
     id: "collection-nh-local-info",
     title: "NH 本地链接采集信息",
     action: "开始完整采集",
-    description: "从本地 HTML/TXT 链接列表采集元数据与缩略图，并自动重试未完成项。",
+    description: "从本地 HTML/TXT 链接流式采集元数据与缩略图，结果实时写入 CSV；并发会先预热、稳定采样成功吞吐，再自动探测相邻档位。",
     confirmField: "confirm",
     fields: [
       text("baseUrl", "站点 Base URL", "https://nhentai.net"),
       text("inputFile", "本地链接 HTML/TXT", "data/local_data/NH_all.txt"),
       text("outputCsv", "原始信息 CSV", "data/gallery_info_origin/NH_info_local.csv"),
       text("imageDir", "缩略图保存目录", "onlineimgtmp"),
-      number("workers", "并发线程数", 5, 1, 64, 1),
+      number("workers", "并发上限", 5, 1, 64, 1, collectionWorkersHelp),
       number("requestAttempts", "单次请求尝试次数", 3, 1, 20, 1),
       number("requestTimeout", "单次请求超时秒数", 30, 1, 3600, 1),
       number("retryRounds", "最多轮数（含首轮）", 0, 0, 100000, 1, "0 表示持续重试，直到全部成功或用户中止。"),
@@ -202,14 +204,14 @@ export const collectionScripts: ScriptDefinition[] = [
     id: "collection-nh-local-images",
     title: "NH 本地链接采集分册图片",
     action: "开始完整采集",
-    description: "从本地链接列表采集分册图片，并自动重试未完成项目。",
+    description: "从本地链接流式采集分册图片并实时保存进度；并发会先预热、稳定采样成功吞吐，再自动探测相邻档位，并自动重试未完成项目。",
     confirmField: "confirm",
     fields: [
       text("baseUrl", "站点 Base URL", "https://nhentai.net"),
       text("inputFile", "本地链接 HTML/TXT", "data/local_data/NH_2.txt"),
       text("outputDir", "图片保存根目录", "output"),
       number("maxPages", "单本最大页数保护", 200, 1, 10000, 1),
-      number("workers", "并发线程数", 4, 1, 64, 1),
+      number("workers", "并发上限", 4, 1, 64, 1, collectionWorkersHelp),
       number("requestAttempts", "单次请求尝试次数", 3, 1, 20, 1),
       number("requestTimeout", "单次请求超时秒数", 30, 1, 3600, 1),
       number("retryRounds", "最多轮数（含首轮）", 0, 0, 100000, 1, "0 表示持续重试，直到全部成功或用户中止。"),

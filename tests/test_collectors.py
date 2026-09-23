@@ -4,13 +4,17 @@ import csv
 import io
 import json
 import tempfile
+import threading
+import time
 import unittest
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
 from data_get.collector import (
+    AdaptiveConcurrency,
     BinaryPayload,
     Checkpoint,
     CollectionConfig,
@@ -18,12 +22,17 @@ from data_get.collector import (
     CollectionRequestError,
     CsvStore,
     GalleryInfo,
+    LocalImagesRunner,
+    OnlineCollectionRunner,
     ParsedGallery,
+    TaskState,
+    ThumbnailStore,
     build_parser,
     config_from_args,
     parse_local_links,
     run_collection,
     _retry_delay,
+    _task_counts,
 )
 
 
@@ -87,7 +96,8 @@ class OneItemAdapter:
         self.detail_calls += 1
         if self.fail_detail:
             raise TimeoutError("temporary detail timeout")
-        return ParsedGallery(GalleryInfo(item.id, item.detail_url, "title-300"), item.thumbnail_url)
+        thumbnail_url = item.thumbnail_url or "https://img.test/300.png"
+        return ParsedGallery(GalleryInfo(item.id, item.detail_url, "title-300"), thumbnail_url)
 
     def fetch_thumbnail(self, url: str) -> BinaryPayload:
         self.thumbnail_calls += 1
@@ -103,6 +113,11 @@ class FullImageAdapter:
 
     def fetch_thumbnail(self, url: str) -> BinaryPayload:
         return BinaryPayload(valid_png(), "image/png")
+
+
+class InvalidFullImageAdapter(FullImageAdapter):
+    def fetch_thumbnail(self, url: str) -> BinaryPayload:
+        return BinaryPayload(b"<html>rate limited</html>", "text/html")
 
 
 class InterruptingAdapter:
@@ -211,6 +226,136 @@ class RefreshingLocalAdapter:
         return BinaryPayload(valid_png(), "image/png")
 
 
+class StreamingOrderAdapter:
+    def __init__(self):
+        self.events: list[str] = []
+        self.detail_started = threading.Event()
+
+    def discover_page(self, page: int) -> list[CollectionItem]:
+        self.events.append(f"list-{page}")
+        if page == 3 and not self.detail_started.is_set():
+            raise AssertionError("the last list page was fetched before item processing started")
+        return [
+            CollectionItem(
+                f"NH{page}",
+                f"https://example.test/g/{page}/",
+                f"https://img.test/{page}.png",
+                page,
+            )
+        ]
+
+    def fetch_detail(self, item: CollectionItem) -> ParsedGallery:
+        self.events.append(f"detail-{item.id}")
+        self.detail_started.set()
+        return ParsedGallery(GalleryInfo(item.id, item.detail_url, item.id), item.thumbnail_url)
+
+    def fetch_thumbnail(self, url: str) -> BinaryPayload:
+        return BinaryPayload(valid_png(), "image/png")
+
+
+class BlockingThumbnailAdapter:
+    def __init__(self):
+        self.thumbnail_started = threading.Event()
+        self.release_thumbnail = threading.Event()
+
+    def discover_page(self, page: int) -> list[CollectionItem]:
+        return [CollectionItem("NH901", "https://example.test/g/901/", page=page)]
+
+    def fetch_detail(self, item: CollectionItem) -> ParsedGallery:
+        return ParsedGallery(
+            GalleryInfo(item.id, item.detail_url, "persisted before thumbnail"),
+            "https://img.test/901.png",
+        )
+
+    def fetch_thumbnail(self, url: str) -> BinaryPayload:
+        self.thumbnail_started.set()
+        if not self.release_thumbnail.wait(5):
+            raise TimeoutError("test did not release thumbnail")
+        return BinaryPayload(valid_png(), "image/png")
+
+
+class ConcurrencyProbeAdapter:
+    def __init__(self):
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+
+    def discover_page(self, page: int) -> list[CollectionItem]:
+        return [
+            CollectionItem(f"NH{index}", f"https://example.test/g/{index}/", page=page)
+            for index in range(20, 28)
+        ]
+
+    def fetch_detail(self, item: CollectionItem) -> ParsedGallery:
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.005)
+            return ParsedGallery(
+                GalleryInfo(item.id, item.detail_url, item.id),
+                f"https://img.test/{item.id}.png",
+            )
+        finally:
+            with self.lock:
+                self.active -= 1
+
+    def fetch_thumbnail(self, url: str) -> BinaryPayload:
+        return BinaryPayload(valid_png(), "image/png")
+
+
+class TotalRequestConcurrencyProbeAdapter:
+    """Count list, detail and image calls against one network ceiling."""
+
+    def __init__(self):
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+
+    def _start(self) -> None:
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+
+    def _finish(self) -> None:
+        with self.lock:
+            self.active -= 1
+
+    def discover_page(self, page: int) -> list[CollectionItem]:
+        self._start()
+        try:
+            time.sleep(0.01)
+            return [
+                CollectionItem(
+                    f"NH{page}{index:02d}",
+                    f"https://example.test/g/{page}{index:02d}/",
+                    page=page,
+                )
+                for index in range(8)
+            ]
+        finally:
+            self._finish()
+
+    def fetch_detail(self, item: CollectionItem) -> ParsedGallery:
+        self._start()
+        try:
+            time.sleep(0.04)
+            return ParsedGallery(
+                GalleryInfo(item.id, item.detail_url, item.id),
+                f"https://img.test/{item.id}.png",
+            )
+        finally:
+            self._finish()
+
+    def fetch_thumbnail(self, url: str) -> BinaryPayload:
+        self._start()
+        try:
+            time.sleep(0.01)
+            return BinaryPayload(valid_png(), "image/png")
+        finally:
+            self._finish()
+
+
 class CollectorTests(unittest.TestCase):
     def make_config(self, root: Path, **overrides) -> CollectionConfig:
         values = {
@@ -248,6 +393,424 @@ class CollectorTests(unittest.TestCase):
         }
         values.update(overrides)
         return CollectionConfig(**values)
+
+    def test_online_discovery_and_item_processing_are_streamed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            adapter = StreamingOrderAdapter()
+            summary = run_collection(
+                self.make_config(root, max_pages=3, workers=2, max_rounds=1),
+                adapter=adapter,
+                sleep_fn=lambda _seconds: None,
+            )
+
+            self.assertTrue(summary.success)
+            self.assertLess(adapter.events.index("detail-NH1"), adapter.events.index("list-3"))
+
+    def test_new_csv_row_is_flushed_before_the_round_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            adapter = BlockingThumbnailAdapter()
+            result: list[object] = []
+
+            def collect() -> None:
+                try:
+                    result.append(
+                        run_collection(
+                            self.make_config(root, max_rounds=1),
+                            adapter=adapter,
+                            sleep_fn=lambda _seconds: None,
+                        )
+                    )
+                except BaseException as exc:  # surfaced in the main test thread
+                    result.append(exc)
+
+            thread = threading.Thread(target=collect)
+            thread.start()
+            try:
+                self.assertTrue(adapter.thumbnail_started.wait(5))
+                csv_path = root / "origin" / "NH_info_test.csv"
+                with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertEqual([row["ID"] for row in rows], ["NH901"])
+                self.assertTrue(thread.is_alive(), "round unexpectedly finished before the CSV observation")
+            finally:
+                adapter.release_thumbnail.set()
+                thread.join(5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(result), 1)
+            if isinstance(result[0], BaseException):
+                raise result[0]
+            self.assertTrue(result[0].success)
+
+    def test_cooperative_stop_flushes_csv_and_compacts_resumable_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = self.make_config(root, max_rounds=1)
+            adapter = BlockingThumbnailAdapter()
+            stop_event = threading.Event()
+            result: list[object] = []
+
+            def collect() -> None:
+                try:
+                    result.append(
+                        run_collection(
+                            config,
+                            adapter=adapter,
+                            sleep_fn=lambda _seconds: None,
+                            stop_event=stop_event,
+                        )
+                    )
+                except BaseException as exc:
+                    result.append(exc)
+
+            thread = threading.Thread(target=collect)
+            thread.start()
+            try:
+                self.assertTrue(adapter.thumbnail_started.wait(5))
+                stop_event.set()
+            finally:
+                adapter.release_thumbnail.set()
+                thread.join(5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(result), 1)
+            if isinstance(result[0], BaseException):
+                raise result[0]
+            self.assertTrue(result[0].interrupted)
+            csv_path = config.resolved().output_csv
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                self.assertEqual([row["ID"] for row in csv.DictReader(handle)], ["NH901"])
+            replayed = Checkpoint(config.resolved().state_file).replay(config.resolved().identity)
+            self.assertIn("NH901", replayed.tasks)
+            self.assertFalse(replayed.run_completed)
+
+    def test_thumbnail_store_defers_validation_until_has(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            image_dir = Path(temp)
+            candidate = image_dir / "NH77.png"
+            candidate.write_bytes(valid_png())
+            with patch("data_get.collector._validate_image_file", return_value=True) as validate:
+                store = ThumbnailStore(image_dir)
+                validate.assert_not_called()
+                self.assertTrue(store.has("NH77"))
+                validate.assert_called_once_with(candidate)
+                self.assertTrue(store.has("NH77"))
+                validate.assert_called_once()
+
+    @staticmethod
+    def _finish_adaptive_window(
+        controller: AdaptiveConcurrency,
+        now: list[float],
+        successes: int,
+        *,
+        failures: int = 0,
+    ):
+        # Ensure even an all-zero warm-up window starts at this boundary.
+        controller.record_failure()
+        for _index in range(successes):
+            controller.record_success()
+        for _index in range(failures):
+            controller.record_failure()
+        now[0] += 30.0
+        return controller.record_failure()
+
+    def test_adaptive_discards_warmup_then_builds_two_window_stable_baseline(self) -> None:
+        now = [0.0]
+        controller = AdaptiveConcurrency(4, window_seconds=30, time_fn=lambda: now[0])
+
+        warmup = self._finish_adaptive_window(controller, now, 500)
+        self.assertEqual(warmup.reason, "startup_warmup_discarded")
+        self.assertEqual(warmup.sample_windows, (500,))
+        self.assertEqual((warmup.from_concurrency, warmup.to_concurrency), (4, 4))
+        self.assertEqual(controller.snapshot().trend, "stabilizing")
+
+        # The discarded spike cannot become the baseline.  One real sample is
+        # insufficient; only the second similar complete window is decisive.
+        self.assertIsNone(self._finish_adaptive_window(controller, now, 10))
+        self.assertEqual(controller.snapshot().current, 4)
+        baseline = self._finish_adaptive_window(controller, now, 11)
+        self.assertEqual(baseline.reason, "baseline_established")
+        self.assertEqual(baseline.sample_windows, (10, 11))
+        self.assertEqual(baseline.stable_score, 10.5)
+        self.assertEqual((baseline.from_concurrency, baseline.to_concurrency), (4, 3))
+        snapshot = controller.snapshot()
+        self.assertEqual((snapshot.previous_window_success, snapshot.last_window_success), (10, 11))
+        self.assertEqual(snapshot.trend, "probing_down")
+
+    def test_adaptive_unstable_pair_uses_bounded_third_window_median(self) -> None:
+        now = [0.0]
+        controller = AdaptiveConcurrency(4, window_seconds=30, time_fn=lambda: now[0])
+        self._finish_adaptive_window(controller, now, 999)
+
+        self.assertIsNone(self._finish_adaptive_window(controller, now, 100))
+        third_needed = self._finish_adaptive_window(controller, now, 50)
+        self.assertEqual(third_needed.reason, "third_sample_needed")
+        self.assertEqual(third_needed.sample_windows, (100, 50))
+        self.assertEqual(controller.snapshot().current, 4)
+
+        baseline = self._finish_adaptive_window(controller, now, 90)
+        self.assertEqual(baseline.reason, "baseline_established")
+        self.assertEqual(baseline.sample_windows, (100, 50, 90))
+        self.assertEqual(baseline.stable_score, 90.0)
+        self.assertEqual((baseline.from_concurrency, baseline.to_concurrency), (4, 3))
+
+    def test_adaptive_probe_and_holding_compare_only_stable_scores(self) -> None:
+        now = [0.0]
+        controller = AdaptiveConcurrency(4, window_seconds=30, time_fn=lambda: now[0])
+        self._finish_adaptive_window(controller, now, 1)
+        self._finish_adaptive_window(controller, now, 20)
+        baseline = self._finish_adaptive_window(controller, now, 21)
+        self.assertEqual(baseline.stable_score, 20.5)
+        self.assertEqual(controller.snapshot().current, 3)
+
+        # A single strong probe window must not move concurrency.
+        self.assertIsNone(self._finish_adaptive_window(controller, now, 25))
+        self.assertEqual(controller.snapshot().current, 3)
+        improved = self._finish_adaptive_window(controller, now, 24)
+        self.assertEqual(improved.reason, "probe_improved")
+        self.assertEqual(improved.stable_score, 24.5)
+        self.assertEqual(improved.baseline_score, 20.5)
+        self.assertEqual((improved.from_concurrency, improved.to_concurrency), (3, 2))
+
+        self.assertIsNone(self._finish_adaptive_window(controller, now, 10))
+        rejected = self._finish_adaptive_window(controller, now, 10)
+        self.assertEqual(rejected.reason, "probe_rejected")
+        self.assertEqual(rejected.stable_score, 10.0)
+        self.assertEqual(rejected.baseline_score, 24.5)
+        self.assertEqual((rejected.from_concurrency, rejected.to_concurrency), (2, 3))
+        self.assertEqual(controller.snapshot().trend, "holding")
+
+        # The restored holding level also needs a complete stable pair before
+        # refreshing the baseline and probing in the opposite direction.
+        self.assertIsNone(self._finish_adaptive_window(controller, now, 30))
+        self.assertEqual(controller.snapshot().current, 3)
+        refreshed = self._finish_adaptive_window(controller, now, 31)
+        self.assertEqual(refreshed.reason, "holding_refreshed")
+        self.assertEqual(refreshed.stable_score, 30.5)
+        self.assertEqual((refreshed.from_concurrency, refreshed.to_concurrency), (3, 4))
+
+    def test_adaptive_failures_do_not_change_scores_and_bounds_hold(self) -> None:
+        now = [0.0]
+        quiet = AdaptiveConcurrency(2, window_seconds=30, time_fn=lambda: now[0])
+        noisy = AdaptiveConcurrency(2, window_seconds=30, time_fn=lambda: now[0])
+
+        def finish_both(successes: int):
+            quiet_result = self._finish_adaptive_window(quiet, now, successes)
+            # Rewind only the shared fake clock while preparing the matching
+            # noisy window; failure volume must not affect its score.
+            now[0] -= 30.0
+            noisy_result = self._finish_adaptive_window(noisy, now, successes, failures=1_000)
+            return quiet_result, noisy_result
+
+        for successes in (50, 12, 12):
+            quiet_result, noisy_result = finish_both(successes)
+            self.assertEqual(quiet_result, noisy_result)
+            self.assertEqual(quiet.snapshot(), noisy.snapshot())
+
+        self.assertEqual(quiet.snapshot().current, 1)
+        self.assertLessEqual(quiet.snapshot().current, quiet.max_concurrency)
+
+        # At the floor, a better stable probe is adopted without moving below
+        # one.  Low counts always take exactly a third window before deciding.
+        self.assertEqual(finish_both(5), (None, None))
+        third_needed_quiet, third_needed_noisy = finish_both(5)
+        self.assertEqual(third_needed_quiet.reason, "third_sample_needed")
+        self.assertEqual(third_needed_quiet, third_needed_noisy)
+        boundary_quiet, boundary_noisy = finish_both(5)
+        self.assertEqual(boundary_quiet.reason, "probe_rejected")
+        self.assertEqual(boundary_quiet, boundary_noisy)
+        self.assertEqual(boundary_quiet.sample_windows, (5, 5, 5))
+        self.assertEqual(quiet.snapshot().current, 2)
+        self.assertGreaterEqual(quiet.snapshot().current, 1)
+        self.assertLessEqual(quiet.snapshot().current, quiet.max_concurrency)
+
+    def test_adaptive_success_on_boundary_belongs_to_new_window(self) -> None:
+        now = [0.0]
+        controller = AdaptiveConcurrency(2, window_seconds=30, time_fn=lambda: now[0])
+        controller.record_success()
+        now[0] = 30.0
+        controller.record_success()
+        snapshot = controller.snapshot()
+        self.assertEqual(snapshot.last_window_success, 1)
+        self.assertEqual(snapshot.window_success, 1)
+
+    def test_adaptive_window_excludes_runner_initialization_time(self) -> None:
+        now = [0.0]
+        controller = AdaptiveConcurrency(4, window_seconds=30, time_fn=lambda: now[0])
+
+        # Simulate expensive CSV/image indexing and checkpoint replay before
+        # the first request starts.  Merely observing the controller must not
+        # turn that idle initialization into a zero-throughput window.
+        now[0] = 120.0
+        snapshot = controller.snapshot()
+        self.assertEqual(snapshot.current, 4)
+        self.assertEqual(snapshot.window_elapsed_seconds, 0.0)
+        self.assertIsNone(snapshot.last_window_success)
+
+        stop_event = threading.Event()
+        controller.acquire(stop_event)
+        now[0] = 149.999
+        self.assertIsNone(controller.record_success())
+        controller.release()
+        self.assertEqual(controller.snapshot().current, 4)
+
+        now[0] = 150.0
+        controller.acquire(stop_event)
+        adjustment = controller.record_failure()
+        controller.release()
+        self.assertIsNotNone(adjustment)
+        self.assertEqual(adjustment.reason, "startup_warmup_discarded")
+        self.assertEqual((adjustment.from_concurrency, adjustment.to_concurrency), (4, 4))
+        self.assertEqual(controller.snapshot().current, 4)
+        self.assertEqual(controller.snapshot().last_window_success, 1)
+
+    def test_http_200_invalid_images_do_not_count_as_successful_throughput(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            online = OnlineCollectionRunner(
+                self.make_config(
+                    root,
+                    max_rounds=1,
+                    request_attempts=2,
+                ).resolved(),
+                FlakyAdapter(invalid_image=True),
+                sleep_fn=lambda _seconds: None,
+            )
+            online_summary = online.run()
+
+            self.assertFalse(online_summary.success)
+            # One valid list response plus two valid parsed detail responses.
+            # The HTTP-200 HTML thumbnail bodies must contribute zero.
+            self.assertEqual(online.concurrency.snapshot().window_success, 3)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            local = LocalImagesRunner(
+                self.make_local_images_config(
+                    root,
+                    max_rounds=1,
+                    request_attempts=2,
+                ).resolved(),
+                InvalidFullImageAdapter(),
+                sleep_fn=lambda _seconds: None,
+            )
+            local_summary = local.run()
+
+            self.assertFalse(local_summary.success)
+            # Page 1 resolves an image URL and page 2 confirms the end.  The
+            # invalid HTTP-200 image body itself must not be counted.
+            self.assertEqual(local.concurrency.snapshot().window_success, 2)
+
+    def test_all_collection_runners_publish_throughput_progress_contract(self) -> None:
+        expected = {
+            "windowSuccess",
+            "lastWindowSuccess",
+            "previousWindowSuccess",
+            "windowElapsedSeconds",
+            "throughputTrend",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for mode in ("nh-online", "jm-online"):
+                updates: list[dict[str, object]] = []
+                summary = run_collection(
+                    self.make_config(
+                        root / mode,
+                        mode=mode,
+                        state_file=root / f"{mode}.state.jsonl",
+                        error_log=root / f"{mode}.errors.jsonl",
+                    ),
+                    adapter=OneItemAdapter(),
+                    sleep_fn=lambda _seconds: None,
+                    progress_callback=updates.append,
+                )
+                self.assertTrue(summary.success)
+                self.assertTrue(updates)
+                self.assertTrue(expected.issubset(updates[-1]))
+                self.assertNotIn("windowFailures", updates[-1])
+                self.assertNotIn("failureRatio", updates[-1])
+
+            local_info_root = root / "local-info"
+            local_info_root.mkdir()
+            local_info_input = local_info_root / "links.txt"
+            local_info_input.write_text("https://nhentai.net/g/300/\n", encoding="utf-8")
+            local_info_updates: list[dict[str, object]] = []
+            local_info_summary = run_collection(
+                self.make_config(
+                    local_info_root,
+                    mode="nh-local-info",
+                    input_file=local_info_input,
+                ),
+                adapter=OneItemAdapter(),
+                sleep_fn=lambda _seconds: None,
+                progress_callback=local_info_updates.append,
+            )
+            self.assertTrue(local_info_summary.success)
+            self.assertTrue(expected.issubset(local_info_updates[-1]))
+            self.assertNotIn("windowFailures", local_info_updates[-1])
+            self.assertNotIn("failureRatio", local_info_updates[-1])
+
+            local_updates: list[dict[str, object]] = []
+            local_root = root / "local-images"
+            local_root.mkdir()
+            local_summary = run_collection(
+                self.make_local_images_config(local_root),
+                adapter=FullImageAdapter(),
+                sleep_fn=lambda _seconds: None,
+                progress_callback=local_updates.append,
+            )
+            self.assertTrue(local_summary.success)
+            self.assertTrue(expected.issubset(local_updates[-1]))
+            self.assertNotIn("windowFailures", local_updates[-1])
+            self.assertNotIn("failureRatio", local_updates[-1])
+
+    def test_scheduler_obeys_the_adaptive_current_concurrency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = self.make_config(root, workers=4, max_rounds=1).resolved()
+            adapter = ConcurrencyProbeAdapter()
+            runner = OnlineCollectionRunner(config, adapter, sleep_fn=lambda _seconds: None)
+            self.assertEqual(runner.concurrency.snapshot().current, 4)
+            runner.concurrency.current = 1
+
+            summary = runner.run()
+
+            self.assertTrue(summary.success)
+            self.assertEqual(adapter.max_active, 1)
+
+    def test_workers_cap_includes_list_detail_and_thumbnail_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            adapter = TotalRequestConcurrencyProbeAdapter()
+            summary = run_collection(
+                self.make_config(root, workers=2, max_pages=2, max_rounds=1),
+                adapter=adapter,
+                sleep_fn=lambda _seconds: None,
+            )
+
+            self.assertTrue(summary.success)
+            self.assertEqual(adapter.max_active, 2)
+
+    def test_progress_task_buckets_are_mutually_exclusive(self) -> None:
+        states = [
+            TaskState(CollectionItem("complete", ""), info_ok=True, thumb_ok=True),
+            TaskState(CollectionItem("missing-info", ""), info_ok=False, thumb_ok=True),
+            TaskState(CollectionItem("missing-image", ""), info_ok=True, thumb_ok=False),
+            TaskState(CollectionItem("missing-both", ""), info_ok=False, thumb_ok=False),
+        ]
+        self.assertEqual(
+            _task_counts(states),
+            {
+                "complete": 1,
+                "missingInfo": 1,
+                "missingImage": 1,
+                "missingBoth": 1,
+                "pending": 3,
+                "terminal": 0,
+            },
+        )
 
     def test_only_failed_stages_are_retried_until_info_and_thumbnail_exist(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -308,6 +871,90 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(resumed_adapter.discover_calls, 0)
             self.assertEqual(resumed_adapter.detail_calls, 1)
             self.assertEqual(resumed_adapter.thumbnail_calls, 0)
+
+    def test_resume_reconciles_old_info_ok_checkpoint_with_missing_csv_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = self.make_config(root, max_rounds=1)
+            resolved = config.resolved()
+            events = [
+                {"event": "run_start", "mode": "nh-online", "identity": resolved.identity},
+                {"event": "page_complete", "page": 1},
+                {
+                    "event": "task_state",
+                    "item": {
+                        "id": "NH300",
+                        "detail_url": "https://example.test/g/300/",
+                        "thumbnail_url": "https://img.test/300.png",
+                        "page": 1,
+                        "label": "",
+                    },
+                    "info_ok": True,
+                    "thumb_ok": True,
+                    "terminal_info": False,
+                    "terminal_thumb": False,
+                },
+                {"event": "run_paused", "summary": {}},
+            ]
+            resolved.state_file.parent.mkdir(parents=True, exist_ok=True)
+            resolved.state_file.write_text(
+                "".join(json.dumps(event) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            resolved.image_dir.mkdir(parents=True, exist_ok=True)
+            (resolved.image_dir / "NH300.png").write_bytes(valid_png())
+
+            adapter = OneItemAdapter(forbid_discovery=True)
+            summary = run_collection(config, adapter=adapter, sleep_fn=lambda _seconds: None)
+
+            self.assertTrue(summary.success)
+            self.assertEqual(adapter.detail_calls, 1)
+            self.assertEqual(adapter.thumbnail_calls, 0)
+            with resolved.output_csv.open("r", encoding="utf-8-sig", newline="") as handle:
+                self.assertEqual([row["ID"] for row in csv.DictReader(handle)], ["NH300"])
+
+    def test_resume_reconciles_checkpoint_thumbnail_with_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = self.make_config(root, max_rounds=1)
+            resolved = config.resolved()
+            csv_store = CsvStore(resolved.output_csv)
+            csv_store.upsert(
+                GalleryInfo("NH300", "https://example.test/g/300/", "existing")
+            )
+            csv_store.close()
+            events = [
+                {"event": "run_start", "mode": "nh-online", "identity": resolved.identity},
+                {"event": "page_complete", "page": 1},
+                {
+                    "event": "task_state",
+                    "item": {
+                        "id": "NH300",
+                        "detail_url": "https://example.test/g/300/",
+                        "thumbnail_url": "https://img.test/300.png",
+                        "page": 1,
+                        "label": "",
+                    },
+                    "info_ok": True,
+                    "thumb_ok": True,
+                    "terminal_info": False,
+                    "terminal_thumb": False,
+                },
+                {"event": "run_paused", "summary": {}},
+            ]
+            resolved.state_file.parent.mkdir(parents=True, exist_ok=True)
+            resolved.state_file.write_text(
+                "".join(json.dumps(event) + "\n" for event in events),
+                encoding="utf-8",
+            )
+
+            adapter = OneItemAdapter(forbid_discovery=True)
+            summary = run_collection(config, adapter=adapter, sleep_fn=lambda _seconds: None)
+
+            self.assertTrue(summary.success)
+            self.assertEqual(adapter.detail_calls, 0)
+            self.assertEqual(adapter.thumbnail_calls, 1)
+            self.assertTrue((resolved.image_dir / "NH300.png").is_file())
 
     def test_html_or_invalid_image_is_not_marked_complete(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
