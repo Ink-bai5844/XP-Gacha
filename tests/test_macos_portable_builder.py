@@ -9,7 +9,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 
@@ -66,12 +66,14 @@ class RuntimeArchiveTests(unittest.TestCase):
                 link_member("python/bin/libpython.dylib", "../lib/libpython.dylib"),
             ])
             destination = root / "runtime" / "python"
-            builder.extract_runtime(archive, destination, "python")
+            modes = builder.extract_runtime(archive, destination, "python")
 
             self.assertEqual((destination / "bin/python3").read_bytes(), b"#!/bin/sh\n")
             self.assertEqual(os.readlink(destination / "bin/python3"), "python3.13")
             self.assertEqual(os.readlink(destination / "bin/libpython.dylib"), "../lib/libpython.dylib")
-            self.assertTrue((destination / "bin/python3.13").stat().st_mode & stat.S_IXUSR)
+            self.assertEqual(modes[PurePosixPath("bin/python3.13")], 0o755)
+            if os.name != "nt":
+                self.assertTrue((destination / "bin/python3.13").stat().st_mode & stat.S_IXUSR)
             self.assertFalse((destination / "python").exists())
 
     def test_unsafe_runtime_members_are_rejected_without_writing_outside_destination(self) -> None:
@@ -106,6 +108,7 @@ class RuntimeArchiveTests(unittest.TestCase):
             root = Path(temporary)
             directory = tarfile.TarInfo("python/bin")
             directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
             archive = root / "repeated-directories.tar.gz"
             make_tar(archive, [
                 (directory, b""),
@@ -181,7 +184,7 @@ class ApplicationCopyTests(unittest.TestCase):
             # Even accidentally tracked data exports and bytecode must stay out.
             tracked.extend(relative for relative in private_files if relative != "server/untracked_debug.py")
             with mock.patch.object(builder, "tracked_files", return_value=tuple(tracked)):
-                builder.copy_application(project, release)
+                modes = builder.copy_application(project, release)
 
             for relative in (
                 "server/main.py", "data_processing/addname.py", "UI-imgs/logo.png",
@@ -194,7 +197,9 @@ class ApplicationCopyTests(unittest.TestCase):
                 with self.subTest(excluded=relative):
                     self.assertFalse((release / relative).exists())
             self.assertFalse((release / ".DS_Store").exists())
-            self.assertTrue((release / "Start XP-Gacha.command").stat().st_mode & stat.S_IXUSR)
+            self.assertEqual(modes[PurePosixPath("Start XP-Gacha.command")], 0o755)
+            if os.name != "nt":
+                self.assertTrue((release / "Start XP-Gacha.command").stat().st_mode & stat.S_IXUSR)
 
     def test_release_copy_fails_without_a_reliable_tracked_file_list(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -286,7 +291,11 @@ class ReleaseArtifactTests(unittest.TestCase):
             executable.chmod(0o755)
             (executable.parent / "python3").symlink_to("python3.13")
             archive = root / "XP-Gacha.tar.gz"
-            builder.create_archive(release, archive)
+            builder.create_archive(
+                release,
+                archive,
+                {PurePosixPath("runtime/python/bin/python3.13"): 0o755},
+            )
 
             with tarfile.open(archive, "r:gz") as bundled:
                 members = {member.name: member for member in bundled.getmembers()}
@@ -386,11 +395,11 @@ class BuildPreflightTests(unittest.TestCase):
 
                 self.assertTrue(popen.call_args.kwargs["start_new_session"])
                 expected = [
-                    mock.call.killpg(12345, builder.signal.SIGTERM),
+                    mock.call.killpg(12345, builder.PROCESS_GROUP_TERM_SIGNAL),
                     mock.call.wait(timeout=60),
                 ]
                 if timed_out:
-                    expected.extend([mock.call.killpg(12345, builder.signal.SIGKILL), mock.call.wait()])
+                    expected.extend([mock.call.killpg(12345, builder.PROCESS_GROUP_KILL_SIGNAL), mock.call.wait()])
                 self.assertEqual(events.mock_calls, expected)
 
     def test_only_non_root_native_apple_silicon_on_supported_macos_can_build(self) -> None:

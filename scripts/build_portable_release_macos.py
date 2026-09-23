@@ -37,6 +37,12 @@ DATA_DIRECTORIES = (
 )
 COMMANDS = ("Start XP-Gacha.command", "Stop XP-Gacha.command", "Check XP-Gacha.command", "Open XP-Gacha Folder.command")
 
+# This builder only executes on macOS, but its preflight logic is unit-tested on
+# other hosts.  Keep the POSIX signal numbers available there without mutating
+# the platform ``signal`` module; on macOS these resolve to the native enums.
+PROCESS_GROUP_TERM_SIGNAL = getattr(signal, "SIGTERM", 15)
+PROCESS_GROUP_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
+
 
 def log(message: str) -> None:
     print(f"[macos-build] {message}", flush=True)
@@ -88,11 +94,11 @@ def run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None, cap
             # In particular, let the verification supervisor stop MySQL before
             # TemporaryDirectory removes its data and configuration files.
             if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, PROCESS_GROUP_TERM_SIGNAL)
                 try:
                     process.wait(timeout=60)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    os.killpg(process.pid, PROCESS_GROUP_KILL_SIGNAL)
                     process.wait()
             raise
         if process.returncode:
@@ -105,7 +111,7 @@ def tracked_files(project_root: Path) -> list[str]:
     return [name for name in output.decode("utf-8").split("\0") if name]
 
 
-def copy_application(project_root: Path, release_root: Path) -> None:
+def copy_application(project_root: Path, release_root: Path) -> dict[PurePosixPath, int]:
     release_root.mkdir(parents=True, exist_ok=True)
     # Data-producing code directories also contain local exports. Copy only
     # Git-visible program assets (including new, unignored source files), never
@@ -151,9 +157,26 @@ def copy_application(project_root: Path, release_root: Path) -> None:
         shutil.copy2(project_root / "portable" / "macos" / name, release_root / name)
     for name in COMMANDS:
         (release_root / name).chmod(0o755)
+    # Keep the intended modes separately as well.  Windows and some removable
+    # filesystems accept chmod() but cannot represent POSIX execute bits; the
+    # final tar writer uses this table instead of silently producing commands
+    # that Finder cannot launch after extraction.
+    return {PurePosixPath(name): 0o755 for name in COMMANDS}
 
 
-def extract_runtime(archive: Path, destination: Path, expected_root: str) -> None:
+def _archive_path(value: str, *, description: str) -> PurePosixPath:
+    """Parse an archive path without inheriting semantics from the host OS."""
+    if not value or "\0" in value or "\\" in value:
+        raise ValueError(f"Invalid {description}: {value!r}")
+    path = PurePosixPath(value)
+    # A drive prefix is not absolute to PurePosixPath, but becomes absolute or
+    # drive-relative if later handed to Windows filesystem APIs.
+    if path.is_absolute() or re.match(r"^[A-Za-z]:", value):
+        raise ValueError(f"Absolute {description}: {value}")
+    return path
+
+
+def extract_runtime(archive: Path, destination: Path, expected_root: str) -> dict[PurePosixPath, int]:
     """Extract only a single verified tree, preserving internal runtime links."""
     if destination.exists():
         raise ValueError(f"Runtime destination already exists: {destination}")
@@ -161,8 +184,8 @@ def extract_runtime(archive: Path, destination: Path, expected_root: str) -> Non
         members = source.getmembers()
         entries: dict[str, tarfile.TarInfo] = {}
         for member in members:
-            path = PurePosixPath(member.name)
-            if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != expected_root:
+            path = _archive_path(member.name, description="archive path")
+            if ".." in path.parts or not path.parts or path.parts[0] != expected_root:
                 raise ValueError(f"Unsafe archive path: {member.name}")
             name = str(path)
             # Oracle's archive repeats directory headers while assembling its
@@ -173,8 +196,7 @@ def extract_runtime(archive: Path, destination: Path, expected_root: str) -> Non
             if name in entries or not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
                 raise ValueError(f"Unsupported or duplicate archive entry: {name}")
             if member.issym() or member.islnk():
-                if PurePosixPath(member.linkname).is_absolute():
-                    raise ValueError(f"Absolute archive link: {name}")
+                _archive_path(member.linkname, description="archive link")
                 target = posixpath.normpath(posixpath.join(str(path.parent), member.linkname) if member.issym() else member.linkname)
                 if target != expected_root and not target.startswith(expected_root + "/"):
                     raise ValueError(f"Archive link escapes runtime: {name}")
@@ -185,16 +207,24 @@ def extract_runtime(archive: Path, destination: Path, expected_root: str) -> Non
             for parent in PurePosixPath(name).parents:
                 if str(parent) in entries and not entries[str(parent)].isdir():
                     raise ValueError(f"Archive entry nested under a file or link: {name}")
+        modes: dict[PurePosixPath, int] = {}
         destination.mkdir(parents=True)
         for member in members:
-            target = destination.joinpath(*PurePosixPath(member.name).parts[1:])
+            member_path = PurePosixPath(member.name)
+            relative = PurePosixPath(*member_path.parts[1:])
+            target = destination.joinpath(*relative.parts)
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
+                modes[relative] = member.mode & 0o777
             elif member.isfile():
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with source.extractfile(member) as input_stream, target.open("wb") as output:
+                input_stream = source.extractfile(member)
+                if input_stream is None:
+                    raise tarfile.ExtractError(f"Unable to read archive member: {member.name}")
+                with input_stream, target.open("wb") as output:
                     shutil.copyfileobj(input_stream, output)
                 target.chmod(member.mode & 0o777)
+                modes[relative] = member.mode & 0o777
         for member in members:
             target = destination.joinpath(*PurePosixPath(member.name).parts[1:])
             if member.issym():
@@ -206,6 +236,13 @@ def extract_runtime(archive: Path, destination: Path, expected_root: str) -> Non
                     raise ValueError(f"Unsupported hard link target: {member.linkname}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.link(link, target)
+        # Directory permissions are applied last so a read-only runtime
+        # directory cannot prevent extraction of its own children.
+        for relative, mode in sorted(modes.items(), key=lambda item: len(item[0].parts), reverse=True):
+            target = destination.joinpath(*relative.parts)
+            if target.is_dir() and not target.is_symlink():
+                target.chmod(mode)
+        return modes
 
 
 def download_runtime(spec: dict, cache_root: Path, supplied: Path | None = None) -> Path:
@@ -256,15 +293,31 @@ def write_checksums(root: Path) -> None:
     (root / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def create_archive(root: Path, archive_path: Path) -> None:
+def create_archive(
+    root: Path,
+    archive_path: Path,
+    mode_overrides: dict[PurePosixPath, int] | None = None,
+) -> None:
     if archive_path.exists():
         raise FileExistsError(f"Refusing to overwrite release: {archive_path}")
     for path in root.rglob("*"):
         if path.is_symlink() and not path.resolve().is_relative_to(root.resolve()):
             raise ValueError(f"Release symlink escapes package: {path}")
+    normalized_modes: dict[PurePosixPath, int] = {}
+    for relative, mode in (mode_overrides or {}).items():
+        relative = PurePosixPath(relative)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"Invalid archive mode path: {relative}")
+        normalized_modes[relative] = mode & 0o777
+
     def portable_metadata(member: tarfile.TarInfo) -> tarfile.TarInfo:
         member.uid = member.gid = 0
         member.uname = member.gname = ""
+        member_path = PurePosixPath(member.name)
+        if member_path.parts and member_path.parts[0] == root.name:
+            relative = PurePosixPath(*member_path.parts[1:])
+            if relative in normalized_modes:
+                member.mode = normalized_modes[relative]
         return member
     with tarfile.open(archive_path, "x:gz", dereference=False) as archive:
         archive.add(root, arcname=root.name, filter=portable_metadata)
@@ -370,9 +423,11 @@ def build(args: argparse.Namespace) -> Path:
     with tempfile.TemporaryDirectory(prefix=".xp-gacha-macos-build-", dir=output_root) as temporary:
         stage = Path(temporary)
         root = stage / name
-        copy_application(PROJECT_ROOT, root)
+        mode_overrides = copy_application(PROJECT_ROOT, root)
         for key in ("python", "mysql"):
-            extract_runtime(archives[key], root / "runtime" / key, manifest[key]["root"])
+            runtime_modes = extract_runtime(archives[key], root / "runtime" / key, manifest[key]["root"])
+            for relative, mode in runtime_modes.items():
+                mode_overrides[PurePosixPath("runtime") / key / relative] = mode
         reset_runtime_data(root)
         log("Installing dependencies into bundled Python")
         install_dependencies(root, manifest["python"]["version"])
@@ -395,7 +450,7 @@ def build(args: argparse.Namespace) -> Path:
         (relocated / "BUILD-INFO.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         write_checksums(relocated)
         staged_archive = stage / archive.name
-        create_archive(relocated, staged_archive)
+        create_archive(relocated, staged_archive, mode_overrides)
         archive_hash = sha256_file(staged_archive)
         staged_checksum = stage / (archive.name + ".sha256")
         staged_checksum.write_text(f"{archive_hash}  {archive.name}\n", encoding="utf-8")
