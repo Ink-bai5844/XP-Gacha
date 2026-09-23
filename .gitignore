@@ -35,3 +35,6 @@
 /.portable-cache
 /datacache/imports
 /PROMPT
+
+# macOS Finder metadata
+.DS_Store
