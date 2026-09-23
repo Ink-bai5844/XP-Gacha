@@ -10,6 +10,7 @@ import os
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -26,19 +27,20 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = PACKAGE_ROOT
 RUNTIME_ROOT = PACKAGE_ROOT / "runtime"
 PYTHON_HOME = RUNTIME_ROOT / "python"
-PYTHON_EXE = PYTHON_HOME / "python.exe"
+IS_MACOS = sys.platform == "darwin"
+PYTHON_EXE = PYTHON_HOME / "bin" / "python3" if IS_MACOS else PYTHON_HOME / "python.exe"
 MYSQL_HOME = RUNTIME_ROOT / "mysql"
 MYSQL_BIN = MYSQL_HOME / "bin"
-MYSQLD_EXE = MYSQL_BIN / "mysqld.exe"
-MYSQL_EXE = MYSQL_BIN / "mysql.exe"
-MYSQLADMIN_EXE = MYSQL_BIN / "mysqladmin.exe"
+MYSQLD_EXE = MYSQL_BIN / ("mysqld" if IS_MACOS else "mysqld.exe")
+MYSQL_EXE = MYSQL_BIN / ("mysql" if IS_MACOS else "mysql.exe")
+MYSQLADMIN_EXE = MYSQL_BIN / ("mysqladmin" if IS_MACOS else "mysqladmin.exe")
 
 CONFIG_ROOT = PACKAGE_ROOT / "config"
 RUN_ROOT = PACKAGE_ROOT / "run"
 LOG_ROOT = PACKAGE_ROOT / "logs"
 TMP_ROOT = PACKAGE_ROOT / "tmp"
 MYSQL_DATA_ROOT = PACKAGE_ROOT / "mysql" / "data"
-MYSQL_CONFIG_FILE = CONFIG_ROOT / "mysql.ini"
+MYSQL_CONFIG_FILE = CONFIG_ROOT / ("my.cnf" if IS_MACOS else "mysql.ini")
 PORTABLE_CONFIG_FILE = CONFIG_ROOT / "portable.json"
 INITIALIZATION_MARKER_FILE = CONFIG_ROOT / ".config-mysql-initialization-pending.json"
 STATE_FILE = RUN_ROOT / "state.json"
@@ -83,6 +85,8 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if IS_MACOS:
+        temporary.chmod(0o600)
     os.replace(temporary, path)
 
 
@@ -163,7 +167,8 @@ def parse_port(value: str | int | None, fallback: int) -> int:
 
 def port_is_free(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        if os.name == "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         try:
             sock.bind(("127.0.0.1", port))
             return True
@@ -295,8 +300,68 @@ def open_browser(url: str) -> None:
         log(f"请手动打开 {url}")
 
 
+def subprocess_options(*, new_group: bool = False) -> dict[str, Any]:
+    if os.name == "nt":
+        return {"creationflags": CREATE_NEW_PROCESS_GROUP if new_group else CREATE_NO_WINDOW}
+    return {"start_new_session": True} if new_group else {}
+
+
+class DarwinProcessInfo(ctypes.Structure):
+    # struct proc_bsdinfo from the macOS SDK's sys/proc_info.h.
+    _fields_ = [
+        (name, ctypes.c_uint32)
+        for name in (
+            "flags", "status", "xstatus", "pid", "ppid", "uid", "gid",
+            "ruid", "rgid", "svuid", "svgid", "rfu_1",
+        )
+    ] + [
+        ("comm", ctypes.c_char * 16),
+        ("name", ctypes.c_char * 32),
+    ] + [
+        (name, ctypes.c_uint32)
+        for name in ("nfiles", "pgid", "jobc", "e_tdev", "e_tpgid")
+    ] + [
+        ("nice", ctypes.c_int32),
+        ("start_seconds", ctypes.c_uint64),
+        ("start_microseconds", ctypes.c_uint64),
+    ]
+
+
+def darwin_process_identity(pid: int) -> dict[str, Any] | None:
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        library.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        library.proc_pidinfo.restype = ctypes.c_int
+        library.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        library.proc_pidpath.restype = ctypes.c_int
+        before, after = DarwinProcessInfo(), DarwinProcessInfo()
+        size = ctypes.sizeof(before)
+        if library.proc_pidinfo(pid, 3, 0, ctypes.byref(before), size) != size:
+            return None
+        buffer = ctypes.create_string_buffer(4096)
+        if library.proc_pidpath(pid, buffer, len(buffer)) <= 0:
+            return None
+        if library.proc_pidinfo(pid, 3, 0, ctypes.byref(after), size) != size:
+            return None
+        created = before.start_seconds * 1_000_000 + before.start_microseconds
+        if not created or created != after.start_seconds * 1_000_000 + after.start_microseconds:
+            return None
+        return {
+            "pid": pid,
+            "path": str(Path(os.fsdecode(buffer.value)).resolve()),
+            "created": created,
+            "parentPid": int(after.ppid),
+        }
+    except (OSError, ValueError):
+        return None
+
+
 def process_identity(pid: int) -> dict[str, Any] | None:
-    if os.name != "nt" or pid <= 0:
+    if pid <= 0:
+        return None
+    if IS_MACOS:
+        return darwin_process_identity(pid)
+    if os.name != "nt":
         return None
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
@@ -342,11 +407,94 @@ def process_matches(record: dict[str, Any] | None) -> bool:
     return same_path and int(actual["created"]) == expected_created
 
 
-def terminate_verified_tree(record: dict[str, Any] | None) -> bool:
+def bundled_python_descendants(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Capture descendants before their API parent exits and they are reparented."""
+    if not IS_MACOS or not process_matches(record):
+        return []
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,ppid="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        log("无法枚举后台任务进程，请检查是否仍有数据任务运行。")
+        return []
+    if result.returncode != 0 or not process_matches(record):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        try:
+            pid, parent_pid = (int(value) for value in line.split())
+        except ValueError:
+            continue
+        children.setdefault(parent_pid, []).append(pid)
+    expected_python = str(PYTHON_EXE.resolve())
+    pending = [(record, 0)]
+    visited = {int(record["pid"])}
+    selected: list[tuple[int, dict[str, Any]]] = []
+    while pending:
+        parent, depth = pending.pop()
+        if not process_matches(parent):
+            continue
+        for pid in children.get(int(parent["pid"]), []):
+            if pid in visited:
+                continue
+            visited.add(pid)
+            child = process_identity(pid)
+            # Verify the live parent relationship and creation order as well as
+            # the PID snapshot, so PID reuse cannot select an unrelated process.
+            if not child or child.get("parentPid") != parent["pid"] or int(child["created"]) < int(parent["created"]):
+                continue
+            pending.append((child, depth + 1))
+            if child["path"] == expected_python and path_inside(child["path"], PACKAGE_ROOT):
+                selected.append((depth + 1, child))
+    return [child for _, child in sorted(selected, key=lambda item: item[0], reverse=True)]
+
+
+def stop_bundled_python_descendants(record: dict[str, Any] | None) -> None:
+    if not record:
+        return
+    for child in bundled_python_descendants(record):
+        terminate_verified_tree(child, include_descendants=False)
+
+
+def terminate_verified_tree(record: dict[str, Any] | None, *, include_descendants: bool = True) -> bool:
     if not process_matches(record):
         return False
     if not path_inside(str(record.get("path", "")), PACKAGE_ROOT):
         return False
+    if IS_MACOS:
+        pid = int(record["pid"])
+        if pid == os.getpid():
+            return False
+        if include_descendants:
+            stop_bundled_python_descendants(record)
+        try:
+            group_leader = os.getpgid(pid) == pid
+            # Recheck after reading the process group, before delivering a signal.
+            if not process_matches(record):
+                return False
+            if group_leader:
+                os.killpg(pid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 30
+            while process_matches(record) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if process_matches(record):
+                if group_leader and os.getpgid(pid) == pid:
+                    os.killpg(pid, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            return True
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
     result = subprocess.run(
         ["taskkill", "/PID", str(record["pid"]), "/T", "/F"],
         stdout=subprocess.DEVNULL,
@@ -362,8 +510,20 @@ class SingleInstanceMutex:
         self.handle: int | None = None
         digest = hashlib.sha256(str(PACKAGE_ROOT).lower().encode("utf-8")).hexdigest()[:20]
         self.name = f"Local\\XP_Gacha_Portable_{digest}"
+        self.descriptor: int | None = None
 
     def acquire(self) -> bool:
+        if IS_MACOS:
+            import fcntl
+
+            RUN_ROOT.mkdir(parents=True, exist_ok=True)
+            self.descriptor = os.open(RUN_ROOT / "launcher.lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                self.close()
+                return False
         if os.name != "nt":
             return True
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -375,6 +535,9 @@ class SingleInstanceMutex:
         return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
 
     def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
         if self.handle and os.name == "nt":
             ctypes.windll.kernel32.CloseHandle(self.handle)
             self.handle = None
@@ -599,7 +762,13 @@ def load_or_create_config(settings: dict[str, str]) -> dict[str, Any]:
 
 def base_environment(settings: dict[str, str], app_port: int, mysql_port: int, config: dict[str, Any]) -> dict[str, str]:
     env = os.environ.copy()
-    local_path = os.pathsep.join([str(PYTHON_HOME), str(PYTHON_HOME / "Scripts"), str(MYSQL_BIN)])
+    if IS_MACOS:
+        # Finder/Terminal may inherit a Homebrew, Conda or virtualenv Python.
+        for key in list(env):
+            if key.startswith(("PYTHON", "DYLD_")) or key in {"__PYVENV_LAUNCHER__", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "MYSQL_HOME", "MYSQL_UNIX_PORT", "MYSQL_PWD"}:
+                env.pop(key, None)
+    python_paths = [PYTHON_HOME / "bin"] if IS_MACOS else [PYTHON_HOME, PYTHON_HOME / "Scripts"]
+    local_path = os.pathsep.join(str(path) for path in [*python_paths, MYSQL_BIN])
     env["PATH"] = local_path + os.pathsep + env.get("PATH", "")
     env.update(
         PYTHONUTF8="1",
@@ -682,10 +851,27 @@ def base_environment(settings: dict[str, str], app_port: int, mysql_port: int, c
 
 
 def quote_mysql_ini(path: Path) -> str:
-    return f'"{path.resolve().as_posix()}"'
+    value = path.resolve().as_posix().replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+    return f'"{value}"'
+
+
+def mysql_socket_directory() -> Path:
+    # macOS sockaddr_un limits socket paths to 104 bytes. A package can reside
+    # under a much longer path, so keep only the socket in a private short dir.
+    digest = hashlib.sha256(str(PACKAGE_ROOT.resolve()).encode("utf-8")).hexdigest()[:16]
+    directory = Path("/tmp") / f"xpg-{os.getuid()}-{digest}"
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise RuntimeError(f"MySQL socket 目录必须归当前用户所有且权限为 0700：{directory}")
+    return directory
 
 
 def write_mysql_config(mysql_port: int) -> None:
+    socket_lines = [f"socket={quote_mysql_ini(mysql_socket_directory() / 'mysql.sock')}"] if IS_MACOS else []
     content = "\n".join(
         [
             "[client]",
@@ -695,6 +881,7 @@ def write_mysql_config(mysql_port: int) -> None:
             "default-character-set=utf8mb4",
             "",
             "[mysqld]",
+            *socket_lines,
             f"basedir={quote_mysql_ini(MYSQL_HOME)}",
             f"datadir={quote_mysql_ini(MYSQL_DATA_ROOT)}",
             f"tmpdir={quote_mysql_ini(TMP_ROOT)}",
@@ -752,8 +939,9 @@ def initialize_mysql(env: dict[str, str]) -> None:
         "--initialize-insecure",
         f"--basedir={MYSQL_HOME}",
         f"--datadir={MYSQL_DATA_ROOT}",
-        "--console",
     ]
+    if os.name == "nt":
+        command.append("--console")
     with init_log.open("wb") as output:
         try:
             completed = subprocess.run(
@@ -763,7 +951,7 @@ def initialize_mysql(env: dict[str, str]) -> None:
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 timeout=300,
-                creationflags=CREATE_NO_WINDOW,
+                **subprocess_options(),
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
@@ -780,22 +968,27 @@ def start_mysql(env: dict[str, str], mysql_port: int, job: WindowsJob) -> tuple[
     command = [
         str(MYSQLD_EXE),
         f"--defaults-file={MYSQL_CONFIG_FILE}",
-        "--console",
-        "--no-monitor",
     ]
-    process = subprocess.Popen(
-        command,
-        cwd=MYSQL_HOME,
-        env=env,
-        stdout=mysql_log_handle,
-        stderr=subprocess.STDOUT,
-        creationflags=CREATE_NEW_PROCESS_GROUP,
-    )
-    job.assign(process)
-    if not wait_for_tcp(mysql_port, process, MYSQL_START_TIMEOUT_SECONDS):
-        detail = tail_file(LOG_ROOT / "mysql-error.log") or tail_file(LOG_ROOT / "mysql-console.log")
+    if os.name == "nt":
+        command.extend(["--console", "--no-monitor"])
+    process = None
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=MYSQL_HOME,
+            env=env,
+            stdout=mysql_log_handle,
+            stderr=subprocess.STDOUT,
+            **subprocess_options(new_group=True),
+        )
+        job.assign(process)
+        if not wait_for_tcp(mysql_port, process, MYSQL_START_TIMEOUT_SECONDS):
+            detail = tail_file(LOG_ROOT / "mysql-error.log") or tail_file(LOG_ROOT / "mysql-console.log")
+            raise RuntimeError(f"MySQL 启动失败（退出码 {process.poll()}）。\n{detail}")
+    except BaseException:
+        stop_process_gracefully(process)
         mysql_log_handle.close()
-        raise RuntimeError(f"MySQL 启动失败（退出码 {process.poll()}）。\n{detail}")
+        raise
     return process, mysql_log_handle
 
 
@@ -837,7 +1030,7 @@ def provision_mysql(config: dict[str, Any], mysql_port: int, env: dict[str, str]
                 encoding="utf-8",
                 errors="replace",
                 timeout=15,
-                creationflags=CREATE_NO_WINDOW,
+                **subprocess_options(),
                 check=False,
             )
             if completed.returncode == 0:
@@ -863,14 +1056,18 @@ def start_app(env: dict[str, str], app_port: int, job: WindowsJob) -> tuple[subp
         str(app_port),
         "--no-access-log",
     ]
-    process = subprocess.Popen(
-        command,
-        cwd=PACKAGE_ROOT,
-        env=env,
-        stdout=app_log_handle,
-        stderr=subprocess.STDOUT,
-        creationflags=CREATE_NEW_PROCESS_GROUP,
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=PACKAGE_ROOT,
+            env=env,
+            stdout=app_log_handle,
+            stderr=subprocess.STDOUT,
+            **subprocess_options(new_group=True),
+        )
+    except BaseException:
+        app_log_handle.close()
+        raise
     job.assign(process)
     return process, app_log_handle
 
@@ -918,7 +1115,7 @@ def mysql_admin_shutdown(config: dict[str, Any], mysql_port: int, env: dict[str,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         timeout=15,
-        creationflags=CREATE_NO_WINDOW,
+        **subprocess_options(),
         check=False,
     )
     return completed.returncode == 0
@@ -926,6 +1123,29 @@ def mysql_admin_shutdown(config: dict[str, Any], mysql_port: int, env: dict[str,
 
 def stop_process_gracefully(process: subprocess.Popen[bytes] | None, timeout: float = 12) -> None:
     if process is None or process.poll() is not None:
+        return
+    if IS_MACOS:
+        stop_bundled_python_descendants(process_identity(process.pid))
+        # These are live Popen children created in their own session. poll()
+        # reaps exited children, preventing a stale child PID from being reused.
+        try:
+            if os.getpgid(process.pid) == process.pid:
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if process.poll() is None:
+                try:
+                    if os.getpgid(process.pid) == process.pid:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                    process.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        except OSError:
+            pass
         return
     try:
         if os.name == "nt":
@@ -979,9 +1199,34 @@ def build_state(
     }
 
 
+def validate_platform() -> None:
+    if os.name != "nt" and not IS_MACOS:
+        raise RuntimeError("便携发行包仅支持 Windows 和 macOS。")
+    if IS_MACOS and os.geteuid() == 0:
+        raise RuntimeError("请使用普通 macOS 用户启动，不能使用 root 或 sudo 运行便携包。")
+
+
+def validate_mysql_binaries() -> None:
+    for executable in (MYSQLD_EXE, MYSQL_EXE, MYSQLADMIN_EXE):
+        try:
+            result = subprocess.run(
+                [str(executable), "--no-defaults", "--version"],
+                cwd=PACKAGE_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+                **subprocess_options(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"MySQL 运行时无法执行 {executable.name}：{exc}") from exc
+        if result.returncode != 0:
+            raise RuntimeError(f"MySQL 运行时无法执行 {executable.name}：{result.stdout.strip()}")
+
+
 def run_start(no_browser: bool = False, verify: bool = False) -> int:
-    if os.name != "nt":
-        raise RuntimeError("此发行包仅支持 Windows x64。")
+    validate_platform()
     ensure_update_not_in_progress()
     ensure_package_layout()
     mutex = SingleInstanceMutex()
@@ -997,22 +1242,38 @@ def run_start(no_browser: bool = False, verify: bool = False) -> int:
 
     job = WindowsJob()
     atexit.register(job.close)
-    settings = parse_settings_file(SETTINGS_FILE)
-    begin_config_mysql_initialization()
-    config = load_or_create_config(settings)
-    mysql_port = choose_free_port(parse_port(config.get("preferredDatabasePort"), DEFAULT_MYSQL_PORT))
-    app_port = choose_free_port(
-        parse_port(config.get("preferredAppPort"), DEFAULT_APP_PORT), avoid={mysql_port}
-    )
-    env = base_environment(settings, app_port, mysql_port, config)
-    STOP_REQUEST_FILE.unlink(missing_ok=True)
+    previous_handlers: dict[int, Any] = {}
+    stopping = False
+
+    def request_shutdown(signum: int, frame: Any) -> None:
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            raise KeyboardInterrupt
 
     mysql_process: subprocess.Popen[bytes] | None = None
     app_process: subprocess.Popen[bytes] | None = None
     mysql_log_handle = None
     app_log_handle = None
+    config: dict[str, Any] = {}
+    env: dict[str, str] = {}
+    mysql_port = DEFAULT_MYSQL_PORT
     exit_code = 0
     try:
+        if IS_MACOS:
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                previous_handlers[signum] = signal.signal(signum, request_shutdown)
+        settings = parse_settings_file(SETTINGS_FILE)
+        begin_config_mysql_initialization()
+        config = load_or_create_config(settings)
+        mysql_port = choose_free_port(parse_port(config.get("preferredDatabasePort"), DEFAULT_MYSQL_PORT))
+        app_port = choose_free_port(
+            parse_port(config.get("preferredAppPort"), DEFAULT_APP_PORT), avoid={mysql_port}
+        )
+        env = base_environment(settings, app_port, mysql_port, config)
+        STOP_REQUEST_FILE.unlink(missing_ok=True)
+        if verify:
+            validate_mysql_binaries()
         initialize_mysql(env)
         complete_config_mysql_initialization()
         log(f"正在启动包内 MySQL：127.0.0.1:{mysql_port}")
@@ -1040,7 +1301,8 @@ def run_start(no_browser: bool = False, verify: bool = False) -> int:
             log("便携版首启自检通过。")
             return 0
 
-        log("保持此窗口开启即可使用；按 Ctrl+C 或双击 Stop XP-Gacha.cmd 可停止。")
+        stop_entry = "Stop XP-Gacha.command" if IS_MACOS else "Stop XP-Gacha.cmd"
+        log(f"保持此窗口开启即可使用；按 Ctrl+C 或双击 {stop_entry} 可停止。")
         while True:
             if STOP_REQUEST_FILE.exists():
                 log("收到停止请求。")
@@ -1056,13 +1318,19 @@ def run_start(no_browser: bool = False, verify: bool = False) -> int:
                 )
             time.sleep(0.5)
     except KeyboardInterrupt:
+        if verify:
+            exit_code = 130
         log("正在停止……")
     finally:
-        STATE_FILE.unlink(missing_ok=True)
+        stopping = True
         STOP_REQUEST_FILE.unlink(missing_ok=True)
         stop_process_gracefully(app_process)
         if mysql_process is not None and mysql_process.poll() is None:
-            if not mysql_admin_shutdown(config, mysql_port, env):
+            try:
+                shutdown_sent = mysql_admin_shutdown(config, mysql_port, env)
+            except (OSError, subprocess.SubprocessError):
+                shutdown_sent = False
+            if not shutdown_sent:
                 stop_process_gracefully(mysql_process)
             else:
                 try:
@@ -1074,7 +1342,11 @@ def run_start(no_browser: bool = False, verify: bool = False) -> int:
         if mysql_log_handle:
             mysql_log_handle.close()
         job.close()
+        atexit.unregister(job.close)
+        STATE_FILE.unlink(missing_ok=True)
         mutex.close()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         log("XP-Gacha 已停止。")
     return exit_code
 
@@ -1103,17 +1375,21 @@ def run_stop() -> int:
     settings = parse_settings_file(SETTINGS_FILE)
     mysql_port = parse_port(state.get("databasePort"), DEFAULT_MYSQL_PORT)
     app_port = parse_port(state.get("appPort"), DEFAULT_APP_PORT)
-    if config.get("rootPassword"):
+    database_record = state.get("database")
+    database_verified = isinstance(database_record, dict) and process_matches(database_record) and path_inside(str(database_record.get("path", "")), PACKAGE_ROOT)
+    if config.get("rootPassword") and (not IS_MACOS or database_verified):
         try:
             env = base_environment(settings, app_port, mysql_port, config)
             mysql_admin_shutdown(config, mysql_port, env)
         except Exception:
             pass
     terminated = terminate_verified_tree(state.get("launcher"))
-    if not terminated:
+    if IS_MACOS or not terminated:
         terminate_verified_tree(state.get("app"))
         terminate_verified_tree(state.get("database"))
     time.sleep(1)
+    if IS_MACOS and any(process_matches(state.get(name)) for name in ("launcher", "app", "database")):
+        raise RuntimeError("当前发行包仍有进程未退出，已保留状态文件；请查看日志后重试停止。")
     STATE_FILE.unlink(missing_ok=True)
     STOP_REQUEST_FILE.unlink(missing_ok=True)
     log("已清理当前发行包的残留进程。")
@@ -1134,10 +1410,35 @@ def run_status() -> int:
     return 2
 
 
+def prepare_doctor_environment() -> None:
+    """Use package paths without creating credentials or initializing MySQL."""
+    config = read_json(PORTABLE_CONFIG_FILE) or {}
+    config.setdefault("databaseName", "xp_gacha")
+    config.setdefault("databaseUser", "xp_gacha")
+    config.setdefault("databasePassword", "doctor-unused")
+    settings = parse_settings_file(SETTINGS_FILE)
+    app_port = parse_port(settings.get("XP_GACHA_PORT"), parse_port(config.get("preferredAppPort"), DEFAULT_APP_PORT))
+    mysql_port = parse_port(settings.get("MYSQL_PORT"), parse_port(config.get("preferredDatabasePort"), DEFAULT_MYSQL_PORT))
+    env = base_environment(settings, app_port, mysql_port, config)
+    os.environ.clear()
+    os.environ.update(env)
+
+
 def run_doctor() -> int:
     problems: list[str] = []
     try:
+        validate_platform()
+        if IS_MACOS:
+            prepare_doctor_environment()
+    except Exception as exc:
+        log(f"自检失败：{exc}")
+        return 1
+    try:
         ensure_package_layout()
+    except Exception as exc:
+        problems.append(str(exc))
+    try:
+        validate_mysql_binaries()
     except Exception as exc:
         problems.append(str(exc))
     if sys.maxsize <= 2**32:
@@ -1189,12 +1490,12 @@ def run_doctor() -> int:
         for problem in problems:
             print(f"  - {problem}")
         return 1
-    log(f"自检通过：Python {sys.version.split()[0]} x64、MySQL 与前端文件均完整。")
+    log(f"自检通过：Python {sys.version.split()[0]} 64 位、MySQL 与前端文件均完整。")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="XP-Gacha portable Windows supervisor")
+    parser = argparse.ArgumentParser(description="XP-Gacha portable Windows/macOS supervisor")
     subparsers = parser.add_subparsers(dest="command", required=True)
     start = subparsers.add_parser("start", help="start MySQL and XP-Gacha")
     start.add_argument("--no-browser", action="store_true")

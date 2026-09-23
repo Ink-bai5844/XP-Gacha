@@ -1,0 +1,24 @@
+{
+  "architecture": "arm64",
+  "minimumMacOS": "15.0",
+  "python": {
+    "version": "3.12.14",
+    "release": "20260901",
+    "archive": "cpython-3.12.14+20260901-aarch64-apple-darwin-install_only_stripped.tar.gz",
+    "root": "python",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-aarch64-apple-darwin-install_only_stripped.tar.gz",
+    "algorithm": "sha256",
+    "checksum": "81a359f1cfadd4da11766534c5913791cea55f26e1bb902cacd2a531bb1e4b2b",
+    "source": "https://github.com/astral-sh/python-build-standalone/releases/tag/20260901"
+  },
+  "mysql": {
+    "version": "8.4.11",
+    "archive": "mysql-8.4.11-macos15-arm64.tar.gz",
+    "root": "mysql-8.4.11-macos15-arm64",
+    "url": "https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-8.4.11-macos15-arm64.tar.gz",
+    "algorithm": "sha256",
+    "checksum": "b96e00493bc3499b9ffd7f08d65c5d64933af0383a8287d9873b64f94c2d6009",
+    "upstreamMd5": "6e89113f04f2af85d0a164573493db3a",
+    "source": "https://dev.mysql.com/downloads/mysql/8.4.html"
+  }
+}

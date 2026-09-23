@@ -11,7 +11,7 @@ XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据�
 | 数据库 | MySQL 8.4、`utf8mb4`；全文索引优先使用 `ngram`，失败时回退普通 `FULLTEXT` |
 | 推荐计算 | Pandas、NumPy、SciPy 稀疏矩阵 |
 | AI 能力 | Qwen3 Embedding、CLIP、LM Studio / OpenAI 兼容 API |
-| 部署方式 | Windows 便携包、Docker Compose、源码运行 |
+| 部署方式 | Windows / macOS 便携包、Docker Compose、源码运行 |
 | 默认主访问地址 | `http://127.0.0.1:8000` |
 | 默认 API 文档 | `http://127.0.0.1:8000/api/docs` |
 
@@ -23,6 +23,7 @@ XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据�
 | 使用场景 | 推荐方式 | 需要预装 |
 | --- | --- | --- |
 | Windows 用户直接使用 | Windows 11 x64 便携版 | 无 |
+| Apple Silicon Mac 用户直接使用 | macOS 15+ arm64 便携版 | 无 |
 | 本机或服务器统一部署 | Docker Compose | Docker Desktop / Docker Engine |
 | 修改前后端和调试 | 源码开发 | Python、Node.js、pnpm、MySQL |
 | 对照旧界面 | Legacy Streamlit | 源码开发环境 |
@@ -86,6 +87,19 @@ XP-Gacha 是一个面向个人漫画馆藏的检索、评分、推荐与数据�
 `portable-settings.env` 可能包含 API 密钥，不要公开。一键增量更新不会覆盖它；改用完整 ZIP 手动迁移时需要单独逐项合并。
 
 `config/portable.json` 保存随机生成的 MySQL 账户和密码。它必须与根目录 `mysql` 成套备份和迁移；不要单独删除、重建或分享该文件。
+
+## macOS 一键便携版
+
+macOS 包面向 **macOS 15 或更新版本的原生 Apple Silicon（arm64）**，明确拒绝 Intel Mac 与 Rosetta 运行模式。它内置 Python standalone 3.12.14、MySQL Community Server 8.4.11、Python 依赖及 React 构建产物，运行时无需安装 Python、Node.js、MySQL、Homebrew 或 Docker。模型、向量和业务数据需要另行准备。
+
+1. 下载完整 `XP-Gacha-v<version>-portable-macos-arm64.tar.gz` 和同名 `.sha256`，核对下载校验值。
+2. 用 macOS 归档实用工具完整解压，或运行 `tar -xzf "XP-Gacha-v<version>-portable-macos-arm64.tar.gz"`。解压工具需要保留可执行权限及符号链接，目录应在本地且可写。
+3. 双击 `Start XP-Gacha.command`，等待初始化数据库并打开网页。保持启动终端开启；停止时按 `Ctrl+C`，或双击 `Stop XP-Gacha.command`。
+4. 用 `Check XP-Gacha.command` 检查运行文件和 Python 依赖，用 `Open XP-Gacha Folder.command` 在 Finder 中打开包目录。
+
+本包尚未进行 Apple 签名或公证。首次运行遇到系统拦截时，确认来源和校验值后，在“系统设置 → 隐私与安全性”中对相应文件允许打开；包内 Python、MySQL 可能分别触发系统确认。不要关闭 Gatekeeper 或批量移除隔离属性。终端应用不能启用“使用 Rosetta 打开”。
+
+端口、`portable-settings.env`、首次数据导入和根目录数据布局沿用上文便携版说明。macOS 当前没有自动增量更新入口，升级需要在新目录解压完整包、停机备份并迁移数据；跨平台或 MySQL 版本变化时使用数据库逻辑导出与导入。更多说明见 [macOS 便携包使用说明](portable/macos/README_macOS.md)。是否通过整包启动与重启验证，以该产物的 `BUILD-INFO.json` 为准。
 
 ## Docker Compose
 
@@ -301,7 +315,7 @@ Python 源码模式会自动读取项目根目录 `.env`，但不会覆盖进程
 - 经过 `STOP_TAGS.txt` 过滤和 `SEMANTIC_MAP.json` 映射后的解析标签；
 - 标题特征词、评分、相关度、文件名、路径和来源。
 
-网络来源统一经过 `/api/track/{id}` 记录历史后重定向。Windows 本地运行或便携版可以调用文件管理器打开漫画目录；Docker 默认关闭该能力，因为容器不能替用户打开宿主机目录。
+网络来源统一经过 `/api/track/{id}` 记录历史后重定向。Windows 和 macOS 本地运行或便携版可以调用文件管理器打开漫画目录；Docker 默认关闭该能力，因为容器不能替用户打开宿主机目录。
 
 封面读取优先级为：
 
@@ -322,7 +336,7 @@ Python 源码模式会自动读取项目根目录 `.env`，但不会覆盖进程
 
 - 支持本地 LM Studio 和线上 OpenAI 兼容 API。
 - 在本地/线上模式之间切换后，可直接填写对应的 API URL、模型名和 API Key 并保存；URL 应填写 OpenAI 兼容根地址，服务会追加 `/chat/completions`。
-- 保存目标随运行方式自动选择：源码写项目根目录 `.env`，Docker 写宿主项目根目录 `.env`，Windows 便携版写包根目录 `portable-settings.env`。
+- 保存目标随运行方式自动选择：源码写项目根目录 `.env`，Docker 写宿主项目根目录 `.env`，Windows / macOS 便携版写包根目录 `portable-settings.env`。
 - 保存后下一次对话立即使用新配置，不需要重启服务；留空 Key 会保留原值，也可以显式清除。
 - 已保存的 Key 不会由后端明文回传，界面只显示“已配置/未配置”状态。本机配置接口仅接受通过 `127.0.0.1`、`localhost` 或 `::1` 访问的本机页面请求。
 - 可调 Temperature、最大 Tokens 和随机注入条目数量，并可逐轮开启或关闭深度思考模式。
@@ -505,7 +519,7 @@ XP-Gacha/
 │  ├─ main.py
 │  ├─ job_tasks.py
 │  └─ modules/
-├─ portable/                    Windows 便携启动器与模板
+├─ portable/                    Windows / macOS 便携启动器与模板
 ├─ scripts/
 │  ├─ start.ps1 / start.sh
 │  ├─ stop.ps1
@@ -543,7 +557,7 @@ XP-Gacha/
 | `XP_GACHA_HOST` | `127.0.0.1` | Uvicorn 监听地址；只有在已经增加统一鉴权、限流和网络防护后才应改为 `0.0.0.0` |
 | `XP_GACHA_PORT` | `8000` | Web/API 端口 |
 | `XP_GACHA_FRONTEND_DIST` | `web/dist` | React 构建产物 |
-| `XP_GACHA_ALLOW_OPEN_LOCAL` | `true` | 是否允许 Windows 服务端打开本地目录；Docker 强制为 `false` |
+| `XP_GACHA_ALLOW_OPEN_LOCAL` | `true` | 是否允许 Windows / macOS 服务端打开本地目录；Docker 强制为 `false` |
 | `XP_GACHA_IMPORT_MAX_MB` | `1024` | 导入上传上限 |
 | `DATABASE_URL` | 空 | 完整 SQLAlchemy URL，优先级最高 |
 | `MYSQL_HOST` | `127.0.0.1` | 数据库主机 |
@@ -782,6 +796,46 @@ v0.2.3 之后在两个根目录并列布局版本之间升级时，仍要先停�
 6. 运行默认的完整便携包构建；构建器会拒绝脏工作区、未通过首启验证或 tag/`sourceCommit` 不一致的自动更新资产；
 7. 核对 `BUILD-INFO.json`、完整 ZIP 与增量 ZIP 的 `.sha256`、更新清单和 `sourceDirty`，再把完整 ZIP/校验值以及三项 `-update` assets 发布到第 5 步的 Release tag。
 
+## 构建 macOS 便携发行版
+
+构建机需要原生 Apple Silicon、macOS 15+、Python 3.11+、Git 检出目录、Node.js 22+、pnpm 11、网络连接和数 GB 可用空间。构建时指定 `--skip-frontend-build` 并已有最新 `web/dist` 时，无需 Node.js 或 pnpm。运行完整产物只需要符合要求的 macOS 系统。
+
+在项目目录执行：
+
+```bash
+./scripts/build_portable_release_macos.sh
+```
+
+版本取自 `server/__init__.py`，默认输出根目录为相对于项目根目录的 `../XP-Gacha-Releases`：
+
+```text
+../XP-Gacha-Releases/
+├─ XP-Gacha-v<version>-portable-macos-arm64/
+├─ XP-Gacha-v<version>-portable-macos-arm64.tar.gz
+└─ XP-Gacha-v<version>-portable-macos-arm64.tar.gz.sha256
+```
+
+构建器下载并校验固定版本的 Python standalone 3.12.14 与 MySQL 8.4.11，将运行时及 Python 依赖装入发行目录、构建前端，然后执行依赖自检、空数据库首次启动和保留凭据的再次启动验证。验证后会清理构建生成的数据库、配置、日志与缓存，生成 `BUILD-INFO.json`、`requirements-lock.txt`、逐文件校验值、保留可执行权限和符号链接的 `.tar.gz` 及压缩包 `.sha256`。默认词典随包提供，漫画、现有数据库、模型、向量与个人设置不会打包。
+
+常用参数：
+
+```bash
+# 指定输出根目录；路径可以包含空格和中文
+./scripts/build_portable_release_macos.sh --output-root "../macOS 发行包"
+
+# 复用已经确认最新的前端构建
+./scripts/build_portable_release_macos.sh --skip-frontend-build
+
+# 使用已下载的官方运行时压缩包；仍按固定 SHA-256 校验
+./scripts/build_portable_release_macos.sh \
+  --python-archive "/path/to/python-install_only.tar.gz" \
+  --mysql-archive "/path/to/mysql-macos-arm64.tar.gz"
+```
+
+下载源和固定校验值记录在 `portable/macos/runtime-manifest.json`。构建器拒绝覆盖已存在的同名发行目录或产物，没有强制覆盖参数；重试时使用新的输出根目录，避免触碰已有用户数据。`--skip-verification` 仅用于构建调试，跳过完整启动验证的状态会写入构建信息，不能据此宣称产物通过真机验证。正式发布前应在目标 Mac 上执行默认完整构建，并在包含空格和中文的路径中解压、首次启动、停止和再次启动确认。
+
+macOS 构建不生成 Windows 增量更新清单，也不提供 macOS 自动增量更新入口。发布完整 `.tar.gz` 与同名 `.sha256` 即可供首次安装；本脚本不执行 Apple 签名、公证或上传发布。
+
 ## API 概览
 
 完整请求模型和在线调试请查看 `/api/docs`。
@@ -923,7 +977,7 @@ logs/app.log
 
 - 不附带漫画目录、CSV、业务数据库、历史、封面、模型或向量；便携包只携带程序默认词典。
 - 没有登录鉴权，不适合直接公网部署。
-- 本地目录打开仅适用于 Windows 桌面运行；Docker 中默认关闭。
+- 本地目录打开适用于 Windows 和 macOS 桌面运行；Docker 中默认关闭。
 - LLM 助手依赖 LM Studio 或用户自己的兼容 API。
 - 语义/封面检索依赖用户提供模型和索引。
 - 在线封面和采集依赖网络及第三方站点状态。

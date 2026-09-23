@@ -10,8 +10,9 @@ sqlalchemy
 pymysql
 pillow
 janome
-sentence-transformers
-transformers
+# CLIP get_image_features must return a Tensor, as expected by the current code.
+sentence-transformers>=3,<6
+transformers>=4.51,<5
 torch
 requests
 curl-cffi

@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 
 from server import __version__
+from server.local_folders import open_local_folder
 from server.modules.charts import ChartsModule
 from server.modules.history import HistoryModule
 from server.modules.imports import ImportModule
@@ -254,9 +255,8 @@ def register_api_routes(app: FastAPI) -> None:
         if str(target) == "本地目录不存在" or not target.exists():
             raise HTTPException(404, "本地目录不存在")
         history.record(item["id"], "local_folder")
-        if settings.allow_open_local and os.name == "nt":
-            os.startfile(str(target))
-        return {"opened": settings.allow_open_local and os.name == "nt", "path": str(target)}
+        opened = open_local_folder(target, allowed=settings.allow_open_local)
+        return {"opened": opened, "path": str(target)}
 
     @app.get("/api/track/{item_id}")
     def track_network(item_id: str) -> RedirectResponse:
