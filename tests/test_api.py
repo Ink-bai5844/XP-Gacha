@@ -63,7 +63,7 @@ class JobTaskAdapterTest(unittest.TestCase):
                 captured.update(kwargs)
 
         collector.CollectionConfig = FakeConfig
-        collector.run_collection = lambda config: {"completed": True}
+        collector.run_collection = lambda config, **_kwargs: {"completed": True}
         with patch.dict(sys.modules, {"data_get.collector": collector}):
             handled = job_tasks.run_collection_task(
                 "collection-jm-online",
@@ -118,7 +118,7 @@ class JobTaskAdapterTest(unittest.TestCase):
                 return {"success": False, "exitCode": self.exit_code}
 
         collector.CollectionConfig = FakeConfig
-        collector.run_collection = lambda config: FailedSummary()
+        collector.run_collection = lambda config, **_kwargs: FailedSummary()
         with patch.dict(sys.modules, {"data_get.collector": collector}):
             with self.assertRaises(SystemExit) as raised:
                 job_tasks.run_collection_task("collection-nh-online", {"confirm": True})
@@ -133,7 +133,7 @@ class JobTaskAdapterTest(unittest.TestCase):
                 captured.update(kwargs)
 
         collector.CollectionConfig = FakeConfig
-        collector.run_collection = lambda config: {"completed": True}
+        collector.run_collection = lambda config, **_kwargs: {"completed": True}
         with patch.dict(sys.modules, {"data_get.collector": collector}):
             job_tasks.run_collection_task(
                 "collection-nh-online",
@@ -144,6 +144,32 @@ class JobTaskAdapterTest(unittest.TestCase):
 
 
 class JobsModuleRaceTest(unittest.TestCase):
+    def test_job_log_keeps_latest_500_lines_with_absolute_cursor(self) -> None:
+        job = jobs_module.Job(id="bounded-log", script_id="b64")
+        for index in range(505):
+            job.append_line(f"line-{index}")
+
+        full_tail = job.public()
+        self.assertEqual(full_tail["lineCount"], 505)
+        self.assertEqual(len(full_tail["lines"]), 500)
+        self.assertEqual(full_tail["lines"][0], "line-5")
+        self.assertEqual(job.public(after=504)["lines"], ["line-504"])
+
+    def test_cancel_response_honors_incremental_log_cursor(self) -> None:
+        module = jobs_module.JobsModule()
+        job = jobs_module.Job(
+            id="finished-job",
+            script_id="b64",
+            status="completed",
+            lines=["old", "new"],
+        )
+        module._jobs[job.id] = job
+
+        result = module.cancel(job.id, after=1)
+
+        self.assertEqual(result["lines"], ["new"])
+        self.assertEqual(result["lineCount"], 2)
+
     def test_cancel_while_popen_is_pending_never_resurrects_queued_job(self) -> None:
         popen_entered = threading.Event()
         release_popen = threading.Event()
@@ -201,6 +227,246 @@ class JobsModuleRaceTest(unittest.TestCase):
         self.assertEqual(finished["status"], "cancelled")
         self.assertEqual(finished["returnCode"], -15)
         terminate_mock.assert_called_once_with(process)
+
+    def test_collection_cancel_uses_sentinel_and_waits_for_clean_exit(self) -> None:
+        popen_entered = threading.Event()
+        release_popen = threading.Event()
+        real_thread = threading.Thread
+        threads: list[threading.Thread] = []
+        popen_env: dict[str, str] = {}
+
+        class FakeProcess:
+            pid = 4243
+            stdout: tuple[()] = ()
+
+            def poll(self):
+                return None
+
+            def wait(self):
+                return 130
+
+        process = FakeProcess()
+
+        def create_process(*_args, **kwargs):
+            popen_env.update(kwargs["env"])
+            popen_entered.set()
+            if not release_popen.wait(2):
+                raise TimeoutError("test did not release Popen")
+            return process
+
+        def create_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+
+        with tempfile.TemporaryDirectory(prefix="xp-gacha-job-control-") as temp_dir:
+            module = jobs_module.JobsModule()
+            with (
+                patch.object(jobs_module, "JOB_CONTROL_DIR", Path(temp_dir)),
+                patch.object(jobs_module.subprocess, "Popen", side_effect=create_process),
+                patch.object(jobs_module.threading, "Thread", side_effect=create_thread),
+                patch.object(jobs_module, "_terminate_process_tree") as terminate_mock,
+            ):
+                started = module.start("collection-nh-online", {"confirm": True})
+                self.assertTrue(popen_entered.wait(2))
+                cancelling = module.cancel(started["id"])
+                self.assertEqual(cancelling["status"], "cancelling")
+                signal_path = Path(temp_dir) / f"{started['id']}.cancel"
+                self.assertTrue(signal_path.is_file())
+                release_popen.set()
+                threads[0].join(2)
+
+            self.assertFalse(threads[0].is_alive())
+            self.assertFalse(signal_path.exists())
+            self.assertEqual(popen_env["XP_GACHA_JOB_CANCEL_FILE"], str(signal_path))
+            terminate_mock.assert_not_called()
+
+        finished = module.get(started["id"])
+        self.assertEqual(finished["status"], "cancelled")
+        self.assertEqual(finished["returnCode"], 130)
+
+    def test_collection_cancel_does_not_hide_a_writeback_failure(self) -> None:
+        class FakeProcess:
+            pid = 4246
+            stdout: tuple[()] = ()
+
+            def wait(self):
+                return 1
+
+        with tempfile.TemporaryDirectory(prefix="xp-gacha-failed-safe-stop-") as temp_dir:
+            signal_path = Path(temp_dir) / "failed.cancel"
+            signal_path.touch()
+            module = jobs_module.JobsModule()
+            job = jobs_module.Job(
+                id="failed-safe-stop",
+                script_id="collection-nh-online",
+                status="cancelling",
+                cancel_file=signal_path,
+            )
+            module._jobs[job.id] = job
+            with (
+                patch.object(jobs_module.subprocess, "Popen", return_value=FakeProcess()),
+                patch.object(jobs_module, "_terminate_process_tree") as terminate_mock,
+            ):
+                module._run(job, {"confirm": True})
+
+        self.assertEqual(job.status, "failed")
+        self.assertEqual(job.return_code, 1)
+        self.assertFalse(signal_path.exists())
+        self.assertTrue(any("可能未完整写回" in line for line in job.lines))
+        terminate_mock.assert_not_called()
+
+    def test_collection_progress_is_public_but_not_copied_to_log(self) -> None:
+        payload = {
+            "round": 2,
+            "stage": "items",
+            "complete": 7,
+            "missingInfo": 1,
+            "progressPercent": 87.5,
+        }
+
+        class FakeProcess:
+            pid = 4244
+            stdout = iter(
+                [
+                    "ordinary output\n",
+                    jobs_module.COLLECTOR_PROGRESS_PREFIX + json.dumps(payload) + "\n",
+                ]
+            )
+
+            def wait(self):
+                return 0
+
+        module = jobs_module.JobsModule()
+        job = jobs_module.Job(id="progress-job", script_id="collection-nh-online")
+        with patch.object(jobs_module.subprocess, "Popen", return_value=FakeProcess()):
+            module._run(job, {"confirm": True})
+
+        self.assertEqual(job.status, "completed")
+        self.assertEqual(job.progress, payload)
+        self.assertEqual(job.public()["progress"], payload)
+        self.assertIn("ordinary output", job.lines)
+        self.assertFalse(any(line.startswith(jobs_module.COLLECTOR_PROGRESS_PREFIX) for line in job.lines))
+
+    def test_force_option_is_explicit_escape_hatch_for_stuck_collection(self) -> None:
+        process = object()
+        job = jobs_module.Job(
+            id="stuck-job",
+            script_id="collection-jm-online",
+            status="cancelling",
+            process=process,
+            cancel_file=Path("stuck-job.cancel"),
+        )
+        module = jobs_module.JobsModule()
+        module._jobs[job.id] = job
+
+        with patch.object(jobs_module, "_terminate_process_tree") as terminate_mock:
+            result = module.cancel(job.id, force=True)
+
+        self.assertEqual(result["status"], "cancelling")
+        self.assertTrue(job.force_cancel_requested)
+        terminate_mock.assert_called_once_with(process)
+
+    def test_terminal_status_and_signal_cleanup_exclude_late_cancel(self) -> None:
+        cleanup_entered = threading.Event()
+        release_cleanup = threading.Event()
+        cancel_finished = threading.Event()
+
+        class FakeProcess:
+            pid = 4245
+            stdout: tuple[()] = ()
+
+            def wait(self):
+                return 0
+
+        def cleanup(_path) -> None:
+            cleanup_entered.set()
+            if not release_cleanup.wait(2):
+                raise TimeoutError("test did not release cleanup")
+
+        module = jobs_module.JobsModule()
+        job = jobs_module.Job(
+            id="late-cancel-job",
+            script_id="collection-nh-online",
+            cancel_file=Path("late-cancel-job.cancel"),
+        )
+        module._jobs[job.id] = job
+
+        def cancel() -> None:
+            module.cancel(job.id)
+            cancel_finished.set()
+
+        with (
+            patch.object(jobs_module.subprocess, "Popen", return_value=FakeProcess()),
+            patch.object(jobs_module, "_cleanup_collection_cancel", side_effect=cleanup),
+            patch.object(jobs_module, "_request_collection_cancel") as request_mock,
+        ):
+            runner = threading.Thread(target=module._run, args=(job, {"confirm": True}))
+            runner.start()
+            self.assertTrue(cleanup_entered.wait(2))
+            canceller = threading.Thread(target=cancel)
+            canceller.start()
+            self.assertFalse(cancel_finished.wait(0.05))
+            release_cleanup.set()
+            runner.join(2)
+            canceller.join(2)
+
+        self.assertFalse(runner.is_alive())
+        self.assertFalse(canceller.is_alive())
+        self.assertEqual(job.status, "completed")
+        request_mock.assert_not_called()
+
+
+class JobTaskCancellationTest(unittest.TestCase):
+    def test_collection_task_monitors_cancel_file_and_emits_progress(self) -> None:
+        collector = ModuleType("data_get.collector")
+        captured: dict[str, object] = {}
+
+        class FakeConfig:
+            def __init__(self, **_kwargs) -> None:
+                pass
+
+        class CompletedSummary:
+            exit_code = 0
+
+            def as_dict(self) -> dict[str, object]:
+                return {"success": True}
+
+        def run_collection(config, *, stop_event, progress_callback):
+            captured["config"] = config
+            captured["stop_event"] = stop_event
+            progress_callback({"round": 1, "stage": "stopping", "complete": 3})
+            cancel_file.touch()
+            self.assertTrue(stop_event.wait(1), "cancel sentinel was not mirrored to stop_event")
+            return CompletedSummary()
+
+        collector.CollectionConfig = FakeConfig
+        collector.run_collection = run_collection
+        with tempfile.TemporaryDirectory(prefix="xp-gacha-cancel-monitor-") as temp_dir:
+            cancel_file = Path(temp_dir) / "job.cancel"
+            output = io.StringIO()
+            with (
+                patch.dict(sys.modules, {"data_get.collector": collector}),
+                patch.dict(os.environ, {job_tasks.COLLECTION_CANCEL_FILE_ENV: str(cancel_file)}),
+                patch.object(job_tasks, "COLLECTION_CANCEL_POLL_SECONDS", 0.01),
+                patch("sys.stdout", output),
+            ):
+                handled = job_tasks.run_collection_task(
+                    "collection-nh-online", {"confirm": True}
+                )
+            self.assertFalse(cancel_file.exists())
+
+        self.assertTrue(handled)
+        self.assertIsInstance(captured["stop_event"], threading.Event)
+        progress_lines = [
+            line for line in output.getvalue().splitlines()
+            if line.startswith(job_tasks.COLLECTOR_PROGRESS_PREFIX)
+        ]
+        self.assertEqual(len(progress_lines), 1)
+        self.assertEqual(
+            json.loads(progress_lines[0][len(job_tasks.COLLECTOR_PROGRESS_PREFIX):])["stage"],
+            "stopping",
+        )
 
 
 class APISmokeTest(unittest.TestCase):

@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
@@ -18,6 +19,9 @@ from server.modules.imports import import_dataframe, read_csv_files
 
 
 ROOT = Path(__file__).resolve().parents[1]
+COLLECTION_CANCEL_FILE_ENV = "XP_GACHA_JOB_CANCEL_FILE"
+COLLECTOR_PROGRESS_PREFIX = "[COLLECTOR_PROGRESS] "
+COLLECTION_CANCEL_POLL_SECONDS = 0.1
 
 
 def project_path(value: object) -> Path:
@@ -131,6 +135,58 @@ def print_summary(summary: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, default=str), flush=True)
 
 
+def print_collection_progress(progress: dict[str, object]) -> None:
+    """Emit one machine-readable line for the parent job manager."""
+    print(
+        COLLECTOR_PROGRESS_PREFIX
+        + json.dumps(progress, ensure_ascii=False, default=str, separators=(",", ":")),
+        flush=True,
+    )
+
+
+def start_collection_cancel_monitor(
+    stop_event: threading.Event,
+) -> tuple[threading.Event | None, threading.Thread | None]:
+    """Mirror a per-process sentinel file into the collector's stop event."""
+    raw_path = os.environ.get(COLLECTION_CANCEL_FILE_ENV, "").strip()
+    if not raw_path:
+        return None, None
+    cancel_file = Path(raw_path)
+    monitor_stop = threading.Event()
+
+    def acknowledge() -> None:
+        stop_event.set()
+        try:
+            cancel_file.unlink(missing_ok=True)
+        except OSError:
+            # The parent job manager also retries cleanup when the child exits.
+            pass
+
+    if cancel_file.is_file():
+        acknowledge()
+        return monitor_stop, None
+
+    def watch() -> None:
+        while not monitor_stop.wait(COLLECTION_CANCEL_POLL_SECONDS):
+            if cancel_file.is_file():
+                acknowledge()
+                return
+
+    monitor = threading.Thread(target=watch, name="collector-cancel-monitor", daemon=True)
+    monitor.start()
+    return monitor_stop, monitor
+
+
+def stop_collection_cancel_monitor(
+    monitor_stop: threading.Event | None,
+    monitor: threading.Thread | None,
+) -> None:
+    if monitor_stop is not None:
+        monitor_stop.set()
+    if monitor is not None:
+        monitor.join(timeout=max(1.0, COLLECTION_CANCEL_POLL_SECONDS * 2))
+
+
 def run_collection_task(script_id: str, parameters: dict) -> bool:
     mode = COLLECTION_MODES.get(script_id)
     if not mode:
@@ -163,7 +219,16 @@ def run_collection_task(script_id: str, parameters: dict) -> bool:
         proxy=proxy or None,
         resume=not parameter_bool(parameters, "noResume", "no_resume", default=False),
     )
-    summary = run_collection(config)
+    stop_event = threading.Event()
+    monitor_stop, monitor = start_collection_cancel_monitor(stop_event)
+    try:
+        summary = run_collection(
+            config,
+            stop_event=stop_event,
+            progress_callback=print_collection_progress,
+        )
+    finally:
+        stop_collection_cancel_monitor(monitor_stop, monitor)
     print_summary(summary)
     exit_code = int(getattr(summary, "exit_code", 0) or 0)
     if exit_code:

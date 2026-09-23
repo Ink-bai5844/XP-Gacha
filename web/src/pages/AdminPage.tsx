@@ -1,7 +1,16 @@
-import { ArrowLeft, Database, FileArchive, Play, RefreshCw, Square, Terminal, Upload } from "lucide-react";
+import { Activity, ArrowLeft, Database, FileArchive, Gauge, Play, RefreshCw, Save, Terminal, Upload } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { cancelJob, getJob, getSystemStatus, importBundle, importProject, startJob } from "../api/client";
+import {
+  cancelJob,
+  getJob,
+  getSystemStatus,
+  importBundle,
+  importProject,
+  startJob,
+  type JobProgress,
+  type JobResponse,
+} from "../api/client";
 import {
   collectionScripts,
   dataSections,
@@ -12,14 +21,9 @@ import {
 } from "../data/scripts";
 import { useAppState } from "../state/AppState";
 
-type Job = {
-  id: string;
-  scriptId: string;
-  title: string;
-  status: "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
-  lines: string[];
-  lineCount: number;
-};
+const TERMINAL_LINE_LIMIT = 500;
+
+type Job = JobResponse & { title: string };
 
 type SystemStatus = Awaited<ReturnType<typeof getSystemStatus>>;
 
@@ -116,13 +120,164 @@ function ScriptPanel({ script, values, setValues, activeJob, run }: {
   );
 }
 
+function finiteNumber(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatCount(value: number | null | undefined) {
+  const number = finiteNumber(value);
+  return number === null ? "—" : Math.max(0, Math.round(number)).toLocaleString("zh-CN");
+}
+
+function formatTimestamp(value: JobProgress["updatedAt"]) {
+  if (value === null || value === undefined || value === "") return "—";
+  const timestamp = typeof value === "number" && value < 1_000_000_000_000 ? value * 1000 : value;
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime())
+    ? String(value)
+    : date.toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function progressStage(stage: string | null | undefined) {
+  if (!stage) return "等待采集器状态";
+  const labels: Record<string, string> = {
+    initializing: "初始化",
+    ready: "初始化完成",
+    round_start: "开始本轮采集",
+    discovery: "发现列表页",
+    discovering: "发现列表页",
+    streaming: "流式发现与采集",
+    collecting: "采集详情与图片",
+    processing: "采集详情与图片",
+    downloading: "下载分册图片",
+    retry: "重试缺失项",
+    retrying: "重试缺失项",
+    retry_wait: "等待下一轮重试",
+    saving: "写入 CSV 与断点",
+    stopping: "安全保存并停止",
+    stopped: "已安全停止",
+    completed: "采集完成",
+    interrupted: "已安全停止",
+    failed: "采集失败",
+  };
+  return labels[stage.toLowerCase()] ?? stage;
+}
+
+function capTerminalLines(lines: string[]) {
+  return lines.length > TERMINAL_LINE_LIMIT ? lines.slice(-TERMINAL_LINE_LIMIT) : lines;
+}
+
+function CollectionProgressPanel({ job }: { job: Job | null }) {
+  if (!job?.scriptId.startsWith("collection-")) return null;
+  const progress = job.progress ?? {};
+  const hasProgress = Object.values(progress).some((value) => value !== null && value !== undefined);
+  const rawPercent = finiteNumber(progress?.progressPercent);
+  const percent = rawPercent === null ? null : Math.min(100, Math.max(0, rawPercent));
+  const lastWindowSuccess = finiteNumber(progress?.lastWindowSuccess);
+  const previousWindowSuccess = finiteNumber(progress?.previousWindowSuccess);
+  const windowElapsed = finiteNumber(progress?.windowElapsedSeconds);
+  const concurrency = finiteNumber(progress?.currentConcurrency);
+  const maxConcurrency = finiteNumber(progress?.maxConcurrency);
+  const active = ["queued", "running", "cancelling"].includes(job.status);
+  const trendLabels: Record<string, string> = {
+    warming_up: "启动预热中（首个完整窗口不计分）",
+    stabilizing: "正在采样稳定吞吐",
+    probing_down: "正在测试更低并发的成功吞吐",
+    probing_up: "正在测试更高并发的成功吞吐",
+    holding: "保持当前高效档位继续观察",
+  };
+  const throughputTrend = progress?.throughputTrend
+    ? (trendLabels[progress.throughputTrend] ?? progress.throughputTrend)
+    : "等待吞吐量窗口样本";
+  const throughputLevel = lastWindowSuccess === null || previousWindowSuccess === null
+    ? "unknown"
+    : lastWindowSuccess > previousWindowSuccess
+      ? "low"
+      : lastWindowSuccess < previousWindowSuccess
+        ? "high"
+        : "stable";
+  const metrics = [
+    ["完全成功", progress?.complete, "complete"],
+    ["缺信息", progress?.missingInfo, "missing"],
+    ["缺图片", progress?.missingImage, "missing"],
+    ["信息和图片全缺", progress?.missingBoth, "missing"],
+    ["待处理", progress?.pending, "pending"],
+    ["不可重试", progress?.terminal, "terminal"],
+  ] as const;
+
+  return (
+    <section className="collection-progress" aria-live="polite" aria-busy={active && !hasProgress}>
+      <header className="collection-progress-heading">
+        <span><Activity size={15} />实时采集进度</span>
+        <div>
+          <b>{progressStage(progress?.stage)}</b>
+          <small className="mono">{progress?.mode || job.scriptId.replace("collection-", "")} · 第 {formatCount(progress?.round)} 轮</small>
+        </div>
+        <strong className="mono">{percent === null ? "—" : `${percent.toFixed(1)}%`}</strong>
+      </header>
+
+      <div className="collection-progress-track" role="progressbar" aria-label="采集总进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined}>
+        <span style={{ width: `${percent ?? 0}%` }} />
+      </div>
+
+      {!hasProgress ? (
+        <p className="collection-progress-empty">任务已创建，正在等待采集器上报第一份进度数据……</p>
+      ) : (
+        <>
+          <div className="collection-progress-metrics">
+            {metrics.map(([label, value, tone]) => (
+              <article className={`collection-progress-metric collection-progress-metric-${tone}`} key={label}>
+                <span>{label}</span><strong className="mono">{formatCount(value)}</strong>
+              </article>
+            ))}
+          </div>
+
+          <div className="collection-progress-details">
+            <article>
+              <span>列表页</span>
+              <strong className="mono">{formatCount(progress.pagesCompleted)} / {formatCount(progress.pagesTotal)}</strong>
+              <small className="mono">剩余 {formatCount(progress.pagesPending)} 页</small>
+            </article>
+            <article>
+              <span>已发现项目</span>
+              <strong className="mono">{formatCount(progress.discovered)}</strong>
+              <small className="mono">CSV 实时写入 {formatCount(progress.csvWrites)} 次</small>
+            </article>
+            <article>
+              <span><Gauge size={13} />动态并发</span>
+              <strong className="mono">{formatCount(progress.currentConcurrency)} / {formatCount(progress.maxConcurrency)}</strong>
+              <small>当前 / 输入上限</small>
+            </article>
+            <article className={`collection-window-health collection-window-health-${throughputLevel}`}>
+              <span>最近 30 秒成功吞吐</span>
+              <strong className="mono">当前 {formatCount(progress.windowSuccess)} · 上轮 {formatCount(progress.lastWindowSuccess)}</strong>
+              <small>前轮 {formatCount(progress.previousWindowSuccess)} · 窗口 {windowElapsed === null ? "—" : `${Math.min(30, Math.max(0, windowElapsed)).toFixed(1)} / 30 秒`} · {throughputTrend}</small>
+            </article>
+          </div>
+        </>
+      )}
+
+      <footer className="collection-progress-footer mono">
+        <span>状态：{job.status.toUpperCase()}</span>
+        <span>最近更新：{formatTimestamp(progress?.updatedAt)}</span>
+      </footer>
+    </section>
+  );
+}
+
 function AppendixTerminal({ job, cancel }: { job: Job | null; cancel: () => void }) {
+  const truncatedLines = job ? Math.max(0, job.lineCount - job.lines.length) : 0;
+  const canCancel = job ? ["queued", "running", "cancelling"].includes(job.status) : false;
+  const cancelling = job?.status === "cancelling";
+  const collectionJob = job?.scriptId.startsWith("collection-") ?? false;
   return (
     <section className="appendix-terminal" aria-live="polite">
-      <header><span><Terminal size={14} />脚本输出</span><b className="mono">{job ? `${job.title} / ${job.status.toUpperCase()}` : "IDLE"}</b>{job && ["queued", "running"].includes(job.status) && <button type="button" onClick={cancel}><Square size={12} />中止任务</button>}</header>
+      <header><span><Terminal size={14} />脚本输出</span><b className="mono">{job ? `${job.title} / ${job.status.toUpperCase()}` : "IDLE"}</b>{canCancel && <button type="button" onClick={cancel} disabled={cancelling} aria-busy={cancelling}><Save size={12} />{cancelling ? (collectionJob ? "正在安全保存并停止…" : "正在中止…") : (collectionJob ? "安全保存并停止" : "中止任务")}</button>}</header>
+      {truncatedLines > 0 && <p className="terminal-truncation mono">前 {truncatedLines.toLocaleString("zh-CN")} 行已截断，仅显示最新 {TERMINAL_LINE_LIMIT} 行（服务端累计 {job?.lineCount.toLocaleString("zh-CN")} 行）。</p>}
       <pre>{job ? job.lines.join("\n") : "PS D:\\Code\\Python\\XP-Gacha> 等待执行任务……"}</pre>
       {job?.status === "completed" && <p className="terminal-result">任务完成。</p>}
-      {job?.status === "cancelled" && <p className="terminal-result">任务已由用户中止。</p>}
+      {job?.status === "cancelling" && <p className="terminal-result">{collectionJob ? "正在写回 CSV 与断点并等待采集器退出，请勿关闭窗口。" : "正在中止任务……"}</p>}
+      {job?.status === "cancelled" && <p className="terminal-result">{collectionJob ? "任务已安全保存并停止。" : "任务已中止。"}</p>}
       {job?.status === "failed" && <p className="terminal-result">任务执行失败，请检查上方输出。</p>}
     </section>
   );
@@ -233,12 +388,10 @@ export function AdminPage() {
         if (watchToken !== jobWatchTokenRef.current) return;
         jobCursorRef.current = current.lineCount;
         setJob((existing) => ({
-          id: current.id,
-          scriptId: current.scriptId,
+          ...current,
           title,
-          status: current.status,
-          lines: existing?.id === current.id ? [...existing.lines, ...current.lines] : current.lines,
-          lineCount: current.lineCount,
+          lines: capTerminalLines(existing?.id === current.id ? [...existing.lines, ...current.lines] : current.lines),
+          progress: current.progress ?? (existing?.id === current.id ? existing.progress : null),
         }));
         if (["completed", "failed", "cancelled"].includes(current.status)) {
           finished = true;
@@ -267,7 +420,7 @@ export function AdminPage() {
     if (backendStatus !== "online") { flash("后端离线，无法执行真实任务"); return; }
     void startJob(script.id, values[script.id] as Record<string, unknown>).then((started) => {
       jobCursorRef.current = started.lineCount;
-      setJob({ id: started.id, scriptId: script.id, title: script.title, status: started.status, lines: started.lines, lineCount: started.lineCount });
+      setJob({ ...started, title: script.title, lines: capTerminalLines(started.lines) });
       watchJob(started.id, script.title);
     }).catch((error: Error) => flash(`启动失败：${error.message}`));
   };
@@ -278,11 +431,18 @@ export function AdminPage() {
     jobWatchTokenRef.current += 1;
     if (timerRef.current) window.clearTimeout(timerRef.current);
     timerRef.current = null;
-    void cancelJob(cancellingJob.id).then((current) => {
+    setJob((existing) => existing?.id === cancellingJob.id ? { ...existing, status: "cancelling" } : existing);
+    void cancelJob(cancellingJob.id, jobCursorRef.current).then((current) => {
       jobCursorRef.current = current.lineCount;
-      setJob((existing) => existing ? { ...existing, status: current.status, lines: current.lines, lineCount: current.lineCount } : existing);
+      setJob((existing) => existing ? {
+        ...current,
+        title: existing.title,
+        lines: capTerminalLines(existing.id === current.id ? [...existing.lines, ...current.lines] : current.lines),
+        progress: current.progress ?? existing.progress,
+      } : existing);
       if (["queued", "running", "cancelling"].includes(current.status)) watchJob(current.id, cancellingJob.title);
     }).catch((error: Error) => {
+      setJob((existing) => existing?.id === cancellingJob.id ? { ...existing, status: cancellingJob.status } : existing);
       flash(error.message);
       watchJob(cancellingJob.id, cancellingJob.title);
     });
@@ -365,6 +525,7 @@ export function AdminPage() {
         </tbody></table>
       </section>
 
+      <CollectionProgressPanel job={job} />
       <AppendixTerminal job={job} cancel={cancel} />
 
       <nav id="appendix-workbench" className="appendix-tabs" aria-label="数据处理分区">

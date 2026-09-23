@@ -240,13 +240,42 @@ export function importProject(mode: "upsert" | "replace") {
   });
 }
 
+export type JobStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
+
+export type JobProgress = {
+  mode?: string | null;
+  round?: number | null;
+  stage?: string | null;
+  pagesCompleted?: number | null;
+  pagesTotal?: number | null;
+  pagesPending?: number | null;
+  discovered?: number | null;
+  complete?: number | null;
+  missingInfo?: number | null;
+  missingImage?: number | null;
+  missingBoth?: number | null;
+  pending?: number | null;
+  terminal?: number | null;
+  currentConcurrency?: number | null;
+  maxConcurrency?: number | null;
+  windowSuccess?: number | null;
+  lastWindowSuccess?: number | null;
+  previousWindowSuccess?: number | null;
+  windowElapsedSeconds?: number | null;
+  throughputTrend?: string | null;
+  progressPercent?: number | null;
+  csvWrites?: number | null;
+  updatedAt?: string | number | null;
+};
+
 export type JobResponse = {
   id: string;
   scriptId: string;
-  status: "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
+  status: JobStatus;
   lines: string[];
   lineCount: number;
   returnCode: number | null;
+  progress?: JobProgress | null;
 };
 
 export function startJob(scriptId: string, parameters: Record<string, unknown>) {
@@ -260,8 +289,8 @@ export function getJob(jobId: string, after = 0) {
   return apiFetch<JobResponse>(`/api/jobs/${jobId}?after=${after}`);
 }
 
-export function cancelJob(jobId: string) {
-  return apiFetch<JobResponse>(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+export function cancelJob(jobId: string, after = 0) {
+  return apiFetch<JobResponse>(`/api/jobs/${jobId}/cancel?after=${after}`, { method: "POST" });
 }
 
 export type ChatStreamEvent = {

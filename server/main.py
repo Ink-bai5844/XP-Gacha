@@ -360,9 +360,9 @@ def register_api_routes(app: FastAPI) -> None:
             raise HTTPException(404, "任务不存在") from exc
 
     @app.post("/api/jobs/{job_id}/cancel")
-    def cancel_job(job_id: str) -> dict:
+    def cancel_job(job_id: str, after: int = 0) -> dict:
         try:
-            return jobs.cancel(job_id)
+            return jobs.cancel(job_id, after=max(0, after))
         except KeyError as exc:
             raise HTTPException(404, "任务不存在") from exc
 
