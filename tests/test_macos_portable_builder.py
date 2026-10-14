@@ -150,8 +150,8 @@ class ApplicationCopyTests(unittest.TestCase):
             "data_get/collector.py",
             "data_processing/addname.py", "tools/clean_cache.py", "Integration/app.py",
             "UI-imgs/logo.png", "web/dist/index.html", "web/dist/assets/app.js",
-            "dictionaries/STOP_TAGS.txt", "dictionaries/SEMANTIC_MAP.json",
-            "dictionaries/TITLE_STOP_WORDS.txt", "dictionaries/TITLE_SEMANTIC_MAP.json",
+            "dictionaries/STOP_TAGS_empty.txt", "dictionaries/SEMANTIC_MAP_empty.json",
+            "dictionaries/TITLE_STOP_WORDS_empty.txt", "dictionaries/TITLE_SEMANTIC_MAP_empty.json",
             "portable/portable_launcher.py", "portable/portable-settings.env",
             "portable/THIRD_PARTY_NOTICES.md", "portable/macos/Start XP-Gacha.command",
             "portable/macos/Stop XP-Gacha.command", "portable/macos/Check XP-Gacha.command",
@@ -162,6 +162,8 @@ class ApplicationCopyTests(unittest.TestCase):
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(f"fixture: {relative}\n", encoding="utf-8")
+        for name in builder.DICTIONARY_TEMPLATES.values():
+            (root / "dictionaries" / name).write_text("{}\n" if name.endswith(".json") else "", encoding="utf-8")
         return sorted(files)
 
     def test_release_includes_application_and_templates_but_excludes_private_data(self) -> None:
@@ -175,6 +177,7 @@ class ApplicationCopyTests(unittest.TestCase):
                 "data_processing/export.csv", "data_get/failed.jsonl",
                 "server/__pycache__/main.cpython-313.pyc", "server/.env",
                 "server/untracked_debug.py", "dictionaries/personal.json",
+                *(f"dictionaries/{name}" for name in builder.DICTIONARIES),
                 "portable/macos/.DS_Store",
             }
             for relative in private_files:
@@ -195,11 +198,57 @@ class ApplicationCopyTests(unittest.TestCase):
                     self.assertTrue((release / relative).is_file())
             for relative in private_files:
                 with self.subTest(excluded=relative):
-                    self.assertFalse((release / relative).exists())
+                    if relative.startswith("dictionaries/") and Path(relative).name in builder.DICTIONARIES:
+                        self.assertNotIn(b"PRIVATE DATA", (release / relative).read_bytes())
+                    else:
+                        self.assertFalse((release / relative).exists())
+            self.assertEqual({path.name for path in (release / "dictionaries").iterdir()}, builder.DICTIONARIES)
+            for name in builder.DICTIONARIES:
+                self.assertEqual((release / "dictionaries" / name).read_bytes(), b"{}\n" if name.endswith(".json") else b"")
             self.assertFalse((release / ".DS_Store").exists())
             self.assertEqual(modes[PurePosixPath("Start XP-Gacha.command")], 0o755)
             if os.name != "nt":
                 self.assertTrue((release / "Start XP-Gacha.command").stat().st_mode & stat.S_IXUSR)
+
+    def test_source_clone_with_only_empty_templates_can_be_packaged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project, release = root / "project", root / "release"
+            tracked = self.make_project(project)
+            self.assertTrue(all(not (project / "dictionaries" / name).exists() for name in builder.DICTIONARIES))
+            with mock.patch.object(builder, "tracked_files", return_value=tuple(tracked)):
+                builder.copy_application(project, release)
+            self.assertEqual({path.name for path in (release / "dictionaries").iterdir()}, builder.DICTIONARIES)
+
+    def test_missing_template_never_falls_back_to_a_private_dictionary(self) -> None:
+        for name, template in builder.DICTIONARY_TEMPLATES.items():
+            with self.subTest(template=template), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                tracked = self.make_project(project)
+                (project / "dictionaries" / template).unlink()
+                (project / "dictionaries" / name).write_text("PRIVATE DATA", encoding="utf-8")
+                with mock.patch.object(builder, "tracked_files", return_value=tuple(tracked)):
+                    with self.assertRaisesRegex(ValueError, "Required empty dictionary template"):
+                        builder.copy_application(project, root / "release")
+                self.assertFalse((root / "release/dictionaries").exists())
+
+    def test_nonempty_or_invalid_dictionary_templates_are_rejected(self) -> None:
+        invalid = {
+            "SEMANTIC_MAP_empty.json": ('{"private": "preference"}', "[]", "null", "not JSON"),
+            "TITLE_SEMANTIC_MAP_empty.json": ('{"private": "preference"}',),
+            "STOP_TAGS_empty.txt": ("PRIVATE PREFERENCE",),
+            "TITLE_STOP_WORDS_empty.txt": ("PRIVATE PREFERENCE",),
+        }
+        for template, values in invalid.items():
+            for value in values:
+                with self.subTest(template=template, value=value), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    self.make_project(root / "project")
+                    (root / "project/dictionaries" / template).write_text(value, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "Empty dictionary template must contain"):
+                        builder.copy_empty_dictionary_templates(root / "project", root / "release/dictionaries")
+                    self.assertFalse((root / "release/dictionaries").exists())
 
     def test_release_copy_fails_without_a_reliable_tracked_file_list(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -31,6 +31,9 @@ ROOT_FILES = {
 }
 PROGRAM_DIRECTORIES = {"server", "data_get", "data_processing", "tools", "Integration", "UI-imgs"}
 DICTIONARIES = {"STOP_TAGS.txt", "SEMANTIC_MAP.json", "TITLE_STOP_WORDS.txt", "TITLE_SEMANTIC_MAP.json"}
+DICTIONARY_TEMPLATES = {
+    name: f"{Path(name).stem}_empty{Path(name).suffix}" for name in DICTIONARIES
+}
 DATA_DIRECTORIES = (
     "data", "datacache", "b64_cache", "b64_tmp", "localimgtmp", "onlineimgtmp",
     "library", "manga_vectors", "models", "mysql", "config", "run", "logs", "tmp", "updates",
@@ -111,6 +114,33 @@ def tracked_files(project_root: Path) -> list[str]:
     return [name for name in output.decode("utf-8").split("\0") if name]
 
 
+def copy_empty_dictionary_templates(project_root: Path, destination: Path) -> None:
+    """Publish only validated empty templates, never local runtime dictionaries."""
+    contents: dict[str, bytes] = {}
+    for name, template in sorted(DICTIONARY_TEMPLATES.items()):
+        source = project_root / "dictionaries" / template
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"Required empty dictionary template is missing or is a symlink: dictionaries/{template}")
+        text = source.read_text(encoding="utf-8-sig")
+        if name.endswith(".json"):
+            try:
+                value = json.loads(text)
+            except ValueError as error:
+                raise ValueError(f"Empty dictionary template must contain only an empty JSON object: {template}") from error
+            if not isinstance(value, dict) or value:
+                raise ValueError(f"Empty dictionary template must contain only an empty JSON object: {template}")
+            contents[name] = b"{}\n"
+        else:
+            if text.strip():
+                raise ValueError(f"Empty dictionary template must contain only whitespace: {template}")
+            contents[name] = b""
+    # Validate every template before writing; the local normal-name files are
+    # deliberately never read, even if a template is missing.
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, content in contents.items():
+        (destination / name).write_bytes(content)
+
+
 def copy_application(project_root: Path, release_root: Path) -> dict[PurePosixPath, int]:
     release_root.mkdir(parents=True, exist_ok=True)
     # Data-producing code directories also contain local exports. Copy only
@@ -142,10 +172,7 @@ def copy_application(project_root: Path, release_root: Path) -> dict[PurePosixPa
         if source.is_symlink():
             raise ValueError(f"Frontend build must not contain symlinks: {source}")
     shutil.copytree(dist, release_root / "web" / "dist", ignore=shutil.ignore_patterns(".DS_Store"))
-    dictionary_root = release_root / "dictionaries"
-    dictionary_root.mkdir()
-    for name in DICTIONARIES:
-        shutil.copy2(project_root / "dictionaries" / name, dictionary_root / name)
+    copy_empty_dictionary_templates(project_root, release_root / "dictionaries")
     for name in ("portable_launcher.py", "portable-settings.env"):
         if name == "portable-settings.env":
             for line in (project_root / "portable" / name).read_text(encoding="utf-8-sig").splitlines():

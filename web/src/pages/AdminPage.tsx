@@ -13,6 +13,7 @@ import {
 } from "../api/client";
 import {
   collectionScripts,
+  collectionStrategyLabels,
   dataSections,
   initialScriptValues,
   type ScriptDefinition,
@@ -34,6 +35,7 @@ function FieldControl({ field, value, values, onChange }: {
   onChange: (value: ScriptFieldValue) => void;
 }) {
   const lmDisabled = Boolean(values.lmStudio) && ["apiUrl", "model", "concurrency"].includes(field.id);
+  if (field.id === "requestRateLimit" && !["动态频率逐发", "paced"].includes(String(values.concurrencyStrategy))) return null;
   if (field.type === "checkbox") {
     return (
       <label className="admin-check">
@@ -178,12 +180,19 @@ function CollectionProgressPanel({ job }: { job: Job | null }) {
   const windowElapsed = finiteNumber(progress?.windowElapsedSeconds);
   const concurrency = finiteNumber(progress?.currentConcurrency);
   const maxConcurrency = finiteNumber(progress?.maxConcurrency);
+  const requestPacing = progress.requestPacing === true;
+  const requestRate = finiteNumber(progress.requestRate);
+  const requestRateLimit = finiteNumber(progress.requestRateLimit);
+  const proxyPool = progress.proxyPool;
+  const strategyLabel = progress.concurrencyStrategy
+    ? (collectionStrategyLabels[progress.concurrencyStrategy] ?? progress.concurrencyStrategy)
+    : "等待策略信息";
   const active = ["queued", "running", "cancelling"].includes(job.status);
   const trendLabels: Record<string, string> = {
     warming_up: "启动预热中（首个完整窗口不计分）",
     stabilizing: "正在采样稳定吞吐",
-    probing_down: "正在测试更低并发的成功吞吐",
-    probing_up: "正在测试更高并发的成功吞吐",
+    probing_down: requestPacing ? "正在测试更低发起频率的成功吞吐" : "正在测试更低并发的成功吞吐",
+    probing_up: requestPacing ? "正在测试更高发起频率的成功吞吐" : "正在测试更高并发的成功吞吐",
     holding: "保持当前高效档位继续观察",
   };
   const throughputTrend = progress?.throughputTrend
@@ -232,6 +241,12 @@ function CollectionProgressPanel({ job }: { job: Job | null }) {
             ))}
           </div>
 
+          {(progress.informationComplete != null || progress.informationSiteMissing != null) && (
+            <p className="collection-progress-empty">
+              “完全成功”表示信息已处理且图片齐备，包含已确认站点缺项并跳过的项目；限流、连接失败或解析异常仍会重试，不会当作站点缺项跳过。
+            </p>
+          )}
+
           <div className="collection-progress-details">
             <article>
               <span>列表页</span>
@@ -242,18 +257,81 @@ function CollectionProgressPanel({ job }: { job: Job | null }) {
               <span>已发现项目</span>
               <strong className="mono">{formatCount(progress.discovered)}</strong>
               <small className="mono">CSV 实时写入 {formatCount(progress.csvWrites)} 次</small>
+              {(progress.informationCompleted != null || progress.imagesCompleted != null) && (
+                <small className="mono">信息已处理 {formatCount(progress.informationCompleted)} · 图片完成 {formatCount(progress.imagesCompleted)}</small>
+              )}
             </article>
+            {(progress.informationComplete != null || progress.informationSiteMissing != null) && (
+              <article>
+                <span>信息字段检查</span>
+                <strong className="mono">{formatCount(progress.informationComplete)} / {formatCount(progress.informationSiteMissing)}</strong>
+                <small>字段齐全 / 站点缺项已跳过</small>
+                <small>缺项记录重新检查可信详情页后，才会标记为站点缺项。</small>
+              </article>
+            )}
             <article>
-              <span><Gauge size={13} />动态并发</span>
-              <strong className="mono">{formatCount(progress.currentConcurrency)} / {formatCount(progress.maxConcurrency)}</strong>
-              <small>当前 / 输入上限</small>
+              <span><Gauge size={13} />{requestPacing ? "请求并发" : "动态请求并发"}</span>
+              <strong className="mono">{formatCount(requestPacing ? progress.activeRequests : progress.currentConcurrency)} / {formatCount(progress.maxConcurrency)}</strong>
+              <small>{requestPacing ? "实际在途 / 并发上限" : "当前档位 / 并发上限"} · {strategyLabel}</small>
             </article>
+            {(requestPacing || requestRate !== null || progress.actualRequestStarts != null) && (
+              <article>
+                <span>请求发起频率（次/秒）</span>
+                <strong className="mono">{requestRate === null ? "—" : requestRate.toFixed(2)} / {requestRateLimit === null ? "—" : requestRateLimit.toFixed(2)}</strong>
+                <small>当前频率 / 频率上限</small>
+                <small className="mono">已实际发起 {formatCount(progress.actualRequestStarts)} 次</small>
+              </article>
+            )}
             <article className={`collection-window-health collection-window-health-${throughputLevel}`}>
-              <span>最近 30 秒成功吞吐</span>
-              <strong className="mono">当前 {formatCount(progress.windowSuccess)} · 上轮 {formatCount(progress.lastWindowSuccess)}</strong>
-              <small>前轮 {formatCount(progress.previousWindowSuccess)} · 窗口 {windowElapsed === null ? "—" : `${Math.min(30, Math.max(0, windowElapsed)).toFixed(1)} / 30 秒`} · {throughputTrend}</small>
+              <span>成功吞吐采样</span>
+              <strong className="mono">当前窗 {formatCount(progress.windowSuccess)} · 上窗 {formatCount(progress.lastWindowSuccess)}</strong>
+              <small>前窗 {formatCount(progress.previousWindowSuccess)} · 窗口 {windowElapsed === null ? "—" : `${Math.max(0, windowElapsed).toFixed(1)} / 30 秒`} · {throughputTrend}</small>
             </article>
           </div>
+
+          {proxyPool && (
+            <details style={{ borderTop: "1px solid var(--hairline-strong)", padding: "12px" }}>
+              <summary style={{ cursor: "pointer", fontSize: "11px", lineHeight: 1.8 }}>
+                <b>多节点代理</b>
+                <span className="mono"> · 可用 {formatCount(proxyPool.available)} / {formatCount(proxyPool.total)} · 冷却 {formatCount(proxyPool.cooling)} · 在途 {formatCount(proxyPool.inFlight)}</span>
+                <span style={{ color: "var(--ink-3)", marginLeft: "8px" }}>展开节点明细</span>
+              </summary>
+              <p style={{ color: "var(--ink-3)", fontSize: "10px", lineHeight: 1.6, margin: "10px 0" }}>
+                HTTP 成功仅表示请求返回成功，不等于信息字段齐全。请以上方“字段齐全 / 站点缺项已跳过”检查结果为准；“信息已处理”包含确认缺项后跳过的记录。
+              </p>
+              <div style={{ overflow: "auto", maxHeight: "280px" }}>
+                <table style={{ width: "100%", minWidth: "620px", borderCollapse: "collapse", fontSize: "10px", textAlign: "right" }}>
+                  <thead style={{ position: "sticky", top: 0, background: "var(--panel)" }}>
+                    <tr>
+                      {["节点", "状态", "在途", "请求", "HTTP 成功", "失败", "限流"].map((label, index) => (
+                        <th scope="col" key={label} style={{ padding: "8px", textAlign: index < 2 ? "left" : "right", whiteSpace: "nowrap", borderBottom: "1px solid var(--hairline-strong)" }}>{label}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {proxyPool.nodes.map((node) => {
+                      const cooldown = finiteNumber(node.cooldownRemainingSeconds);
+                      const status = node.cooling
+                        ? `冷却${cooldown === null ? "" : ` ${Math.max(0, Math.ceil(cooldown))} 秒`}`
+                        : node.available ? "可用" : "等待空位";
+                      return (
+                        <tr key={node.index} style={{ borderBottom: "1px solid var(--hairline)" }}>
+                          <th scope="row" style={{ padding: "8px", textAlign: "left", overflowWrap: "anywhere", maxWidth: "240px" }}>{node.name || `节点 ${node.index + 1}`}</th>
+                          <td style={{ padding: "8px", textAlign: "left", whiteSpace: "nowrap", color: node.cooling ? "var(--signal)" : "var(--ink-3)" }}>{status}</td>
+                          {[node.inFlight, node.requests, node.successes, node.failures, node.rateLimited].map((value, index) => (
+                            <td className="mono" key={index} style={{ padding: "8px" }}>{formatCount(value)}</td>
+                          ))}
+                        </tr>
+                      );
+                    })}
+                    {proxyPool.nodes.length === 0 && (
+                      <tr><td colSpan={7} style={{ padding: "12px", textAlign: "left", color: "var(--ink-3)" }}>等待节点统计……</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          )}
         </>
       )}
 

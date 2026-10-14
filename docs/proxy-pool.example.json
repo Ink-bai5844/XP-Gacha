@@ -1,0 +1,10 @@
+{
+  "proxies": [
+    { "name": "node-1", "url": "http://127.0.0.1:17891" },
+    { "name": "node-2", "url": "http://127.0.0.1:17892" },
+    { "name": "node-3", "url": "http://127.0.0.1:17893" }
+  ],
+  "per_proxy_interval": 3.2,
+  "cooldown_seconds": 60,
+  "connection_cooldown_seconds": 5
+}

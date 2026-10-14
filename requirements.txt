@@ -18,5 +18,6 @@ requests
 curl-cffi
 beautifulsoup4
 cloudscraper
+PyYAML>=6
 cryptography
 tomli; python_version < "3.11"

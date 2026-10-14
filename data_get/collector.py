@@ -14,7 +14,9 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
+import random
 import re
 import sys
 import threading
@@ -24,11 +26,32 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Use one module identity for -m, direct-file, and the legacy wrappers.  The
+# strategy module imports these classes by their canonical package name;
+# defining a second StopRequested would break cooperative cancellation.
+if __name__ == "__main__":
+    from data_get.collector import main as _canonical_main
+
+    raise SystemExit(_canonical_main())
+elif __name__ == "collector":
+    import data_get as _collection_package
+
+    sys.modules["data_get.collector"] = sys.modules[__name__]
+    _collection_package.collector = sys.modules[__name__]
+elif __name__ == "data_get.collector":
+    sys.modules.setdefault("collector", sys.modules[__name__])
+
 from bs4 import BeautifulSoup
+from data_get.metadata_review import MetadataReviewStore
 
 try:
     from data_get.proxy_config import build_proxies, configured_proxies
@@ -36,7 +59,6 @@ except ModuleNotFoundError:  # Direct execution from data_get/.
     from proxy_config import build_proxies, configured_proxies
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ORIGIN_DIR = PROJECT_ROOT / "data" / "gallery_info_origin"
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "onlineimgtmp"
 DEFAULT_LOG_DIR = PROJECT_ROOT / "logs" / "collection"
@@ -103,10 +125,11 @@ def build_page_url(start_url: str, page_number: int) -> str:
 class CollectionRequestError(RuntimeError):
     """A request or parse failure with an explicit retry classification."""
 
-    def __init__(self, message: str, *, retryable: bool = True, status_code: int | None = None):
+    def __init__(self, message: str, *, retryable: bool = True, status_code: int | None = None, retry_after: float = 0.0):
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class StopRequested(RuntimeError):
@@ -133,6 +156,11 @@ class CollectionConfig:
     error_log: str | os.PathLike[str] | None = None
     proxy: str | None = None
     resume: bool = True
+    strategy: str = "stable"
+    reuse_connections: bool = True
+    request_rate_limit: float = 1.0
+    request_start_rate: float | None = None
+    proxy_pool_file: str | os.PathLike[str] | None = None
 
     def resolved(self) -> "ResolvedConfig":
         if self.mode not in MODE_DEFAULTS:
@@ -142,6 +170,9 @@ class CollectionConfig:
         image_dir = _project_path(self.image_dir, DEFAULT_IMAGE_DIR)
         input_file = _project_path(self.input_file, defaults.get("input_file"))
         output_dir = _project_path(self.output_dir, defaults.get("output_dir"))
+        proxy_pool_file = _project_path(self.proxy_pool_file)
+        if proxy_pool_file is not None and str(self.proxy or "").strip():
+            raise ValueError("多节点代理配置文件与单代理不能同时填写，请清空单代理")
         max_pages = int(self.max_pages or defaults.get("max_pages", 1))
         workers = int(self.workers or defaults.get("workers", 5))
         if max_pages < 1:
@@ -154,6 +185,16 @@ class CollectionConfig:
             raise ValueError("max_rounds 必须大于等于 0")
         if self.retry_backoff < 0 or self.timeout <= 0 or self.interval < 0:
             raise ValueError("timeout 必须为正数，backoff/interval 不得为负数")
+        if self.strategy not in {"stable", "adaptive-step", "bandit", "paced"}:
+            raise ValueError(f"未知并发策略: {self.strategy}")
+        if isinstance(self.request_rate_limit, bool) or isinstance(self.request_start_rate, bool):
+            raise ValueError("请求频率必须是数值，不能是布尔值")
+        rate_limit = float(self.request_rate_limit)
+        start_rate = float(self.request_start_rate) if self.request_start_rate is not None else None
+        if not math.isfinite(rate_limit) or not 0.1 <= rate_limit <= 100:
+            raise ValueError("request_rate_limit 必须是 0.1～100 之间的有限数值（请求/秒）")
+        if start_rate is not None and (not math.isfinite(start_rate) or not 0.1 <= start_rate <= rate_limit):
+            raise ValueError("request_start_rate 必须是 0.1～频率上限之间的有限数值")
         base_url = (self.base_url or str(defaults.get("base_url", ""))).rstrip("/")
         start_url = self.start_url or str(defaults.get("start_url", ""))
         identity = "|".join(
@@ -183,6 +224,7 @@ class CollectionConfig:
             ("input_file", input_file),
             ("state_file", state_file),
             ("error_log", error_log),
+            ("proxy_pool_file", proxy_pool_file),
         ]
         seen_files: dict[str, str] = {}
         for name, path in named_files:
@@ -220,6 +262,11 @@ class CollectionConfig:
             proxy=self.proxy,
             resume=bool(self.resume),
             identity=digest,
+            strategy=self.strategy,
+            reuse_connections=bool(self.reuse_connections),
+            request_rate_limit=rate_limit,
+            request_start_rate=start_rate,
+            proxy_pool_file=proxy_pool_file,
         )
 
 
@@ -244,6 +291,11 @@ class ResolvedConfig:
     proxy: str | None
     resume: bool
     identity: str
+    strategy: str = "stable"
+    reuse_connections: bool = True
+    request_rate_limit: float = 1.0
+    request_start_rate: float | None = None
+    proxy_pool_file: Path | None = None
 
 
 @dataclass(slots=True)
@@ -285,6 +337,9 @@ class GalleryInfo:
 class ParsedGallery:
     info: GalleryInfo
     thumbnail_url: str = ""
+    # Only production parsers may assert these after recognizing a trustworthy
+    # detail page.  Empty CSV cells alone never prove the source lacks a field.
+    unavailable_fields: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -300,6 +355,7 @@ class TaskState:
     thumb_ok: bool = False
     terminal_info: bool = False
     terminal_thumb: bool = False
+    site_missing_fields: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -718,18 +774,20 @@ def _print_concurrency_adjustment(
     max_concurrency: int,
 ) -> None:
     samples = "/".join(str(value) for value in adjustment.sample_windows)
-    if adjustment.reason == "startup_warmup_discarded":
+    if adjustment.reason in {"startup_warmup_discarded", "level_warmup_discarded"}:
+        kind = "启动预热" if adjustment.reason == "startup_warmup_discarded" else "换档过渡"
         print(
-            "[采集] 启动预热窗口已忽略："
+            f"[采集] {kind}窗口已忽略："
             f"并发 {adjustment.from_concurrency}/{max_concurrency}，"
             f"30秒成功 {adjustment.last_window_success}；开始稳定采样",
             flush=True,
         )
         return
-    if adjustment.reason == "third_sample_needed":
+    if adjustment.reason in {"third_sample_needed", "third_pooled_sample_needed"}:
+        method = "按实际耗时汇总成功数" if adjustment.reason == "third_pooled_sample_needed" else "取中位数"
         print(
             f"[采集] 并发 {adjustment.from_concurrency}/{max_concurrency} "
-            f"的前两窗成功数 {samples} 不稳定；追加第 3 个 30 秒窗口并取中位数",
+            f"的前两窗成功数 {samples} 不稳定；追加第 3 个 30 秒窗口，{method}",
             flush=True,
         )
         return
@@ -747,6 +805,11 @@ def _print_concurrency_adjustment(
         "probe_improved_at_boundary": "探测吞吐提高并到达边界",
         "probe_rejected": "探测未提高，回退",
         "holding_refreshed": "回退档稳定重采样完成",
+        "similar_score_lower_concurrency": "吞吐相近，选择较低并发",
+        "baseline_shift_reexplore": "稳定吞吐变化，重新大步探索",
+        "bandit_initial_sweep": "分档初步探索",
+        "bandit_exploit": "采用已测高吞吐档",
+        "bandit_ucb_explore": "复测不确定档位",
     }
     action = action_labels.get(adjustment.reason, "稳定采样完成")
     if adjustment.from_concurrency == adjustment.to_concurrency:
@@ -761,6 +824,18 @@ def _print_concurrency_adjustment(
         f"{baseline_text}；{concurrency_text}",
         flush=True,
     )
+
+
+def _pacing_progress(controller: Any) -> dict[str, Any]:
+    pacer = getattr(controller, "pacer", None)
+    if pacer is None:
+        return {}
+    stats = pacer.snapshot()
+    return {"requestPacing": True, "requestRate": stats["current_rate"],
+            "requestRateLimit": stats["max_rate"],
+            "actualRequestStarts": stats.get("started_requests", 0),
+            "activeRequests": stats.get("active_requests", 0),
+            "throughputTrend": stats["trend"]}
 
 
 @dataclass(slots=True)
@@ -889,6 +964,8 @@ class Checkpoint(JsonlWriter):
                     if expected_identity and recorded_identity and recorded_identity != expected_identity:
                         active_segment = False
                         replayed = ReplayedState()
+                    else:
+                        replayed.run_completed = False
                 elif kind == "page_complete":
                     replayed.completed_pages.add(int(event["page"]))
                 elif kind == "page_terminal":
@@ -1001,15 +1078,14 @@ class Checkpoint(JsonlWriter):
 
 
 class CsvStore:
-    """An ID-keyed UTF-8-SIG CSV store with crash-safe incremental inserts.
+    """Incremental inserts plus durable, periodically merged existing-row updates."""
 
-    New IDs are appended and flushed immediately.  The expensive atomic full
-    rewrite is reserved for repairing malformed input or applying the unusual
-    case of an update to an existing ID.
-    """
+    UPDATE_COMMIT_SECONDS = 30.0
+    UPDATE_COMMIT_COUNT = 25
 
     def __init__(self, path: Path):
         self.path = path
+        self.update_journal_path = path.with_name(path.name + ".updates.jsonl")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.fieldnames = list(CSV_HEADERS)
@@ -1019,10 +1095,18 @@ class CsvStore:
         self._append_failed = False
         self._pending_updates = 0
         self._write_count = 0
+        self._journal_failed = False
+        self._csv_signature: tuple[int, int] | None = self._signature()
+        self._last_commit_time = time.monotonic()
         self._load()
 
     def _load(self) -> None:
         if not self.path.exists() or self.path.stat().st_size == 0:
+            # Do not create an empty replacement if an existing update journal
+            # belongs to a CSV that was deleted or replaced externally.
+            if self.update_journal_path.exists() and self.update_journal_path.stat().st_size:
+                raise ValueError("CSV 缺失或为空，与已有回补日志冲突；原文件和日志均未修改")
+            self._replay_updates_locked()
             self._rewrite_locked()
             return
         needs_rewrite = False
@@ -1036,17 +1120,24 @@ class CsvStore:
             self.fieldnames = list(CSV_HEADERS) + [name for name in existing_fields if name not in CSV_HEADERS]
             try:
                 for row in reader:
-                    required = [row.get("ID"), row.get("链接"), row.get("标题")]
                     # DictReader uses None values/keys for truncated or over-wide
                     # rows.  Such a tail must never count as completed metadata.
                     if (
                         None in row
                         or any(row.get(name) is None for name in existing_fields)
-                        or any(value is None or not str(value).strip() for value in required)
                     ):
                         needs_rewrite = True
                         continue
-                    gallery_id = str(row["ID"]).strip()
+                    gallery_id = str(row.get("ID") or "").strip()
+                    if not gallery_id:
+                        # Recover the stable identity when a spreadsheet left
+                        # its ID cell empty but the detail URL is still intact.
+                        link = str(row.get("链接") or "")
+                        gallery_id = _nh_id(link) or _jm_id(link)
+                        needs_rewrite = True
+                        if not gallery_id:
+                            continue
+                        row["ID"] = gallery_id
                     if gallery_id in self.rows:
                         needs_rewrite = True
                     self.rows[gallery_id] = {name: str(row.get(name, "") or "") for name in self.fieldnames}
@@ -1062,18 +1153,135 @@ class CsvStore:
                     needs_rewrite = True
         except (OSError, ValueError):
             needs_rewrite = True
+        self._csv_signature = self._signature()
+        # Validate the entire journal before repairing or rewriting any CSV.
+        self._replay_updates_locked()
         if needs_rewrite or existing_fields != self.fieldnames:
-            self._rewrite_locked()
+            self._dirty = True
+            self.commit()
+
+    @staticmethod
+    def _fingerprint(row: dict[str, str]) -> str:
+        encoded = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _signature(self) -> tuple[int, int] | None:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_size, stat.st_mtime_ns
+
+    def _check_csv_unchanged_locked(self) -> None:
+        if self._csv_signature != self._signature():
+            raise ValueError("CSV 在采集期间被外部修改；已保留回补日志，请停止任务后检查冲突")
+
+    @staticmethod
+    def _sync_directory(path: Path) -> None:
+        if os.name != "nt":
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def _replay_updates_locked(self) -> None:
+        if not self.update_journal_path.exists():
+            return
+        raw = self.update_journal_path.read_bytes()
+        records: dict[str, list[dict[str, Any]]] = {}
+        accepted_lines: list[bytes] = []
+        lines = raw.splitlines(keepends=True)
+        torn_tail = False
+        for index, line in enumerate(lines, 1):
+            try:
+                record = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if index == len(lines) and not line.endswith((b"\n", b"\r")):
+                    torn_tail = True
+                    break
+                raise ValueError(f"CSV 回补日志第 {index} 行损坏；原文件和日志均未修改") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"CSV 回补日志第 {index} 行格式无效；不会修改原文件")
+            gallery_id, row, baseline = record.get("id"), record.get("row"), record.get("baseline")
+            if (
+                type(record.get("version")) is not int
+                or record.get("version") != 1
+                or not isinstance(gallery_id, str)
+                or not isinstance(row, dict)
+                or set(row) != set(self.fieldnames)
+                or any(not isinstance(value, str) for value in row.values())
+                or row.get("ID") != gallery_id
+                or not row.get("ID", "").strip()
+                or not isinstance(baseline, str)
+                or re.fullmatch(r"[0-9a-f]{64}", baseline) is None
+            ):
+                raise ValueError(f"CSV 回补日志第 {index} 行格式无效；不会修改原文件")
+            previous = records.setdefault(gallery_id, [])
+            if previous and baseline != self._fingerprint(previous[-1]["row"]):
+                raise ValueError(f"CSV 回补日志第 {index} 行更新链不连续；不会修改原文件")
+            previous.append(record)
+            accepted_lines.append(line.rstrip(b"\r\n") + b"\n")
+        # A replace may have succeeded immediately before a crash. Accept either
+        # an earlier known baseline or the final row, making replay idempotent.
+        for gallery_id, changes in records.items():
+            current = self.rows.get(gallery_id)
+            allowed = {change["baseline"] for change in changes}
+            allowed.add(self._fingerprint(changes[-1]["row"]))
+            if current is None or self._fingerprint(current) not in allowed:
+                raise ValueError(f"CSV 回补日志与现有行 {gallery_id} 冲突；原文件和日志均未修改")
+        if torn_tail or (raw and not raw.endswith((b"\n", b"\r"))):
+            # Preserve the complete evidence before removing only the torn tail.
+            backup = self.update_journal_path.with_name(
+                self.update_journal_path.name + f".recovery-{uuid.uuid4().hex}.bak"
+            )
+            with backup.open("xb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temp = self.update_journal_path.with_name(f".{self.update_journal_path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with temp.open("xb") as handle:
+                    handle.write(b"".join(accepted_lines))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp, self.update_journal_path)
+                self._sync_directory(self.path.parent)
+            finally:
+                temp.unlink(missing_ok=True)
+        for gallery_id, changes in records.items():
+            self.rows[gallery_id] = dict(changes[-1]["row"])
+        self._pending_updates = sum(map(len, records.values()))
+        self._dirty = self._dirty or bool(records)
 
     def has(self, gallery_id: str) -> bool:
         with self._lock:
             return gallery_id in self.rows
 
+    def row(self, gallery_id: str) -> dict[str, str] | None:
+        with self._lock:
+            row = self.rows.get(gallery_id)
+            return dict(row) if row is not None else None
+
+    def has_complete(self, gallery_id: str, validator: Callable[[dict[str, str]], bool] | None = None) -> bool:
+        with self._lock:
+            row = self.rows.get(gallery_id)
+            return row is not None and (validator is None or bool(validator(dict(row))))
+
+    def incomplete_rows(self, validator: Callable[[dict[str, str]], bool]) -> list[dict[str, str]]:
+        with self._lock:
+            return [dict(row) for row in self.rows.values() if not validator(dict(row))]
+
     def upsert(self, info: GalleryInfo) -> bool:
         row = info.as_csv_row()
         with self._lock:
+            if self._journal_failed:
+                raise OSError("CSV 回补日志写入曾失败；请重启以安全恢复，当前不会继续写入")
             old = self.rows.get(info.id)
-            merged = {name: (row.get(name, old.get(name, "") if old else "")) for name in self.fieldnames}
+            merged = {
+                name: (row.get(name, "") if str(row.get(name, "") or "").strip() else (old or {}).get(name, ""))
+                for name in self.fieldnames
+            }
             if old == merged:
                 return False
             if old is None:
@@ -1086,21 +1294,54 @@ class CsvStore:
                 self.rows[info.id] = merged
                 self._write_count += 1
             else:
-                # Do not expose duplicate IDs by journalling updates into the
-                # canonical CSV.  They are atomically folded in at commit.
+                self._append_update_locked(info.id, old, merged)
+                # The durable journal must exist before info_ok can be exposed.
                 self.rows[info.id] = merged
                 self._dirty = True
                 self._pending_updates += 1
+                self._write_count += 1
             return True
+
+    def _append_update_locked(self, gallery_id: str, old: dict[str, str], row: dict[str, str]) -> None:
+        record = {"version": 1, "id": gallery_id, "baseline": self._fingerprint(old), "row": row}
+        encoded = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        try:
+            with self.update_journal_path.open("ab") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._sync_directory(self.path.parent)
+        except BaseException:
+            self._journal_failed = True
+            raise
+
+    def commit_if_due(self) -> bool:
+        """Merge at a completed-work boundary, after 30 seconds or 25 updates."""
+        with self._lock:
+            if self._pending_updates and (
+                self._pending_updates >= self.UPDATE_COMMIT_COUNT
+                or time.monotonic() - self._last_commit_time >= self.UPDATE_COMMIT_SECONDS
+            ):
+                self.commit()
+                return True
+            return False
 
     def commit(self) -> None:
         """Flush incremental rows and atomically fold in existing-row updates."""
 
         with self._lock:
-            if self._dirty or self._append_failed:
+            if self._journal_failed:
+                raise OSError("CSV 回补日志写入曾失败；已保留日志，请重启后恢复")
+            if self._dirty or self._append_failed or self._pending_updates:
                 self._rewrite_locked()
-                self._write_count += self._pending_updates
+                try:
+                    self.update_journal_path.unlink(missing_ok=True)
+                    self._sync_directory(self.path.parent)
+                except BaseException:
+                    self._dirty = True
+                    raise
                 self._pending_updates = 0
+                self._last_commit_time = time.monotonic()
             elif self._append_handle is not None:
                 self._append_handle.flush()
 
@@ -1110,6 +1351,7 @@ class CsvStore:
             return self._write_count
 
     def _append_locked(self, row: dict[str, str]) -> None:
+        self._check_csv_unchanged_locked()
         if self._append_handle is None:
             self._append_handle = self.path.open("a", encoding="utf-8", newline="")
         try:
@@ -1117,6 +1359,7 @@ class CsvStore:
             writer.writerow(row)
             # Flush every accepted gallery before its checkpoint records info_ok.
             self._append_handle.flush()
+            self._csv_signature = self._signature()
         except BaseException:
             failed_handle = self._append_handle
             self._append_handle = None
@@ -1125,6 +1368,7 @@ class CsvStore:
                 failed_handle.close()
             except Exception:
                 pass
+            self._csv_signature = self._signature()
             raise
 
     def _close_append_locked(self) -> None:
@@ -1139,10 +1383,19 @@ class CsvStore:
 
     def close(self) -> None:
         with self._lock:
-            self.commit()
-            self._close_append_locked()
+            try:
+                self.commit()
+            except BaseException:
+                try:
+                    self._close_append_locked()
+                except BaseException:
+                    pass
+                raise
+            else:
+                self._close_append_locked()
 
     def _rewrite_locked(self) -> None:
+        self._check_csv_unchanged_locked()
         self._close_append_locked()
         temp_path = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
         try:
@@ -1153,6 +1406,8 @@ class CsvStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.path)
+            self._csv_signature = self._signature()
+            self._sync_directory(self.path.parent)
             self._dirty = False
             self._append_failed = False
         finally:
@@ -1292,17 +1547,91 @@ def _validate_image_payload(payload: BinaryPayload) -> None:
         raise CollectionRequestError(f"图片内容损坏或格式无效: {exc}") from exc
 
 
-def _response_error(url: str, status_code: int) -> CollectionRequestError:
+def _parse_retry_after(value: object, *, now: float | None = None) -> float:
+    """Read both forms of Retry-After without treating malformed data as a delay."""
+    import math
+
+    try:
+        seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        try:
+            stamp = parsedate_to_datetime(str(value))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            seconds = stamp.timestamp() - (time.time() if now is None else now)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+    return max(0.0, seconds) if math.isfinite(seconds) else 0.0
+
+
+def _response_error(url: str, status_code: int, retry_after: object = None) -> CollectionRequestError:
     retryable = status_code not in {400, 401, 404, 410}
     return CollectionRequestError(
-        f"HTTP {status_code}: {url}", retryable=retryable, status_code=status_code
+        f"HTTP {status_code}: {url}", retryable=retryable, status_code=status_code,
+        retry_after=_parse_retry_after(retry_after),
     )
 
 
+class HostCooldown:
+    """Share a server-requested pause across workers on the same origin."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._until: dict[str, float] = {}
+        self.stop_event = threading.Event()
+
+    def defer(self, url: str, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        origin = urlsplit(url).netloc.lower()
+        with self._lock:
+            self._until[origin] = max(self._until.get(origin, 0.0), time.monotonic() + seconds)
+
+    def wait(self, url: str) -> None:
+        origin = urlsplit(url).netloc.lower()
+        while True:
+            if self.stop_event.is_set():
+                raise StopRequested()
+            with self._lock:
+                remaining = self._until.get(origin, 0.0) - time.monotonic()
+            if remaining <= 0:
+                return
+            if self.stop_event.wait(min(remaining, 1.0)):
+                raise StopRequested()
+
+    def remaining(self, url: str) -> float:
+        with self._lock:
+            return max(0.0, self._until.get(urlsplit(url).netloc.lower(), 0.0) - time.monotonic())
+
+
+def _wait_for_request_start(cooldown: HostCooldown, pacer: Any, url: str) -> None:
+    # A Retry-After can arrive while this worker waits for its pacing slot.
+    # Discard that slot and pace afresh after the new cooldown: no stored
+    # permits may accumulate into a simultaneous recovery burst.
+    while True:
+        cooldown.wait(url)
+        if pacer is not None:
+            pacer.wait(cooldown.stop_event)
+        if cooldown.stop_event.is_set():
+            raise StopRequested()
+        if cooldown.remaining(url) <= 0:
+            return
+
+
+def _nh_field_container(soup: BeautifulSoup, field_name: str) -> Any:
+    # Class names are independent tokens; Svelte adds a changing generated
+    # class, and their order is not part of the site's field contract.
+    label = re.compile(r"^" + re.escape(field_name.rstrip(":")) + r"\s*:")
+    for container in soup.select(".tag-container.field-name"):
+        if label.match(container.get_text(" ", strip=True)):
+            return container
+    return None
+
+
 def _field_names(soup: BeautifulSoup, field_name: str) -> str:
-    for container in soup.find_all("div", class_="tag-container field-name"):
-        if field_name in container.get_text(" ", strip=True):
-            return ", ".join(span.get_text(strip=True) for span in container.find_all("span", class_="name"))
+    container = _nh_field_container(soup, field_name)
+    if container is not None:
+        return ", ".join(span.get_text(strip=True) for span in container.select("span.name"))
     return ""
 
 
@@ -1311,27 +1640,227 @@ def _nh_id(url: str) -> str:
     return f"NH{match.group(1)}" if match else ""
 
 
+def _proxy_pool_progress(adapter: Any, url: str) -> dict[str, Any]:
+    pool = getattr(adapter, "proxy_pool", None)
+    return {"proxyPool": pool.snapshot(url)} if pool is not None else {}
+
+
+class _ProxyReselect(Exception):
+    """A reserved exit cooled down before its request actually started."""
+
+
+def _pooled_request(adapter: Any, url: str, get_for_lease: Callable, **kwargs: Any):
+    """Use independent explicit exits without changing system/TUN routing."""
+    from data_get.proxy_pool import ProxyPoolStopped
+
+    pool = adapter.proxy_pool
+    stop = adapter.cooldown.stop_event
+    pacer = adapter.request_pacer
+    lease = None
+    pace_started = False
+    locked = False
+    try:
+        # Serialize starts, never the network response. Results use a separate
+        # pool lock so they can still impose cooldowns while starts are waiting.
+        while not adapter._proxy_start_lock.acquire(timeout=0.1):
+            if stop.is_set():
+                raise StopRequested()
+        locked = True
+        if stop.is_set():
+            raise StopRequested()
+        if pacer is not None:
+            pacer.wait(stop)
+        while True:
+            lease = pool.acquire(url, stop)
+            get = get_for_lease(lease)
+
+            def ready_in() -> float:
+                # An older in-flight request may impose a new cooldown after
+                # this exit was reserved. Do not block healthy exits behind it.
+                if pool.cooldown_remaining(lease) > 0:
+                    raise _ProxyReselect()
+                return 0.0
+
+            def commit_start() -> bool:
+                if stop.is_set():
+                    raise StopRequested()
+                if not pool.mark_started(lease):
+                    raise _ProxyReselect()
+                return True
+
+            try:
+                if pacer is not None:
+                    pacer.record_started(stop, ready_in, commit_start=commit_start)
+                    pace_started = True
+                else:
+                    commit_start()
+                break
+            except _ProxyReselect:
+                # No actual start was charged to either gate. The next acquire
+                # picks any ready node, waiting only if every exit is busy.
+                pool.release(lease)
+                lease = None
+        adapter._proxy_start_lock.release()
+        locked = False
+        try:
+            response = get(url, timeout=adapter.config.timeout, proxies=lease.proxies, **kwargs)
+        except Exception as exc:
+            pool.record_result(lease, error=exc)
+            # Transport exceptions can include proxy credentials.
+            raise CollectionRequestError(f"代理节点 {lease.name} 请求失败（{type(exc).__name__}）") from None
+        retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+        pool.record_result(lease, status_code=int(response.status_code), retry_after=retry_after)
+        if response.status_code != 200:
+            error = _response_error(url, int(response.status_code), response.headers.get("Retry-After"))
+            error.proxy_pool_cooldown = True
+            raise error
+        return response
+    except ProxyPoolStopped:
+        raise StopRequested() from None
+    finally:
+        if locked:
+            adapter._proxy_start_lock.release()
+        if lease is not None:
+            pool.release(lease)
+        if pace_started:
+            pacer.record_finished()
+
+
 def _jm_id(url: str) -> str:
     match = re.search(r"/album/(\d+)/?", url)
     return f"JM{match.group(1)}" if match else ""
 
 
+def _metadata_incomplete_fields(row: dict[str, str]) -> list[str]:
+    invalid = [name for name in CSV_HEADERS if not str(row.get(name) or "").strip()]
+    pages = str(row.get("页数") or "").strip()
+    if pages and (not re.fullmatch(r"[0-9]+", pages) or not pages.lstrip("0")):
+        invalid.append("页数")
+    uploaded = str(row.get("上传日期") or "").strip()
+    if uploaded:
+        try:
+            # Accept calendar-equivalent dates saved by spreadsheet software.
+            match = re.fullmatch(r"([0-9]{4})([-/])([0-9]{1,2})\2([0-9]{1,2})", uploaded)
+            if match is None:
+                raise ValueError("not a supported calendar date")
+            datetime(int(match[1]), int(match[3]), int(match[4]))
+        except ValueError:
+            invalid.append("上传日期")
+    return invalid
+
+
+def _validate_parsed_metadata(parsed: ParsedGallery) -> None:
+    row = parsed.info.as_csv_row()
+    unavailable = set(parsed.unavailable_fields)
+    allowed = set(CSV_HEADERS) - {"ID", "链接", "标题"}
+    if unavailable - allowed or any(str(row.get(name) or "").strip() for name in unavailable):
+        raise CollectionRequestError("详情页缺项声明无效，不能跳过非空、未知或身份字段")
+    invalid = [name for name in _metadata_incomplete_fields(row) if name not in unavailable]
+    if invalid:
+        raise CollectionRequestError(f"详情页信息不完整（缺失或无效字段: {', '.join(invalid)}）: {parsed.info.link}")
+
+
+def _reject_challenge_page(soup: BeautifulSoup) -> None:
+    if soup.select_one("#challenge-form, #challenge-running, .cf-challenge"):
+        raise CollectionRequestError("返回的是验证页面，不能确认站点缺项")
+
+
 class NHAdapter:
+    @staticmethod
+    def _incomplete_info_fields(row: dict[str, str]) -> list[str]:
+        return _metadata_incomplete_fields(row)
+
+    @staticmethod
+    def is_info_complete(row: dict[str, str]) -> bool:
+        """Empty fields require a source check, even historically optional ones."""
+        return not NHAdapter._incomplete_info_fields(row)
+
+    validate_detail = staticmethod(_validate_parsed_metadata)
+
     def __init__(self, config: ResolvedConfig):
         self.config = config
-        self.proxies = build_proxies(config.proxy) if config.proxy is not None else configured_proxies()
+        from data_get.proxy_pool import ProxyPool
+
+        self.proxy_pool = ProxyPool.from_file(config.proxy_pool_file) if config.proxy_pool_file else None
+        self._proxy_start_lock = threading.Lock()
+        self.proxies = (build_proxies("") if self.proxy_pool is not None else
+                        build_proxies(config.proxy) if config.proxy is not None else configured_proxies())
+        self._local = threading.local()
+        self._sessions: list[Any] = []
+        self._sessions_lock = threading.Lock()
+        self.cooldown = HostCooldown()
+        self.request_pacer = None
+
+    def set_request_pacer(self, pacer: Any) -> None:
+        self.request_pacer = pacer
+
+    def close(self) -> None:
+        # Called only after the runner has joined all workers.  Each session
+        # owns one non-thread-local curl handle, which can be closed here.
+        with self._sessions_lock:
+            for session in self._sessions:
+                session.close()
+            self._sessions.clear()
+        self._local = threading.local()
+
+    def close_idle_sessions(self) -> None:
+        """A round has joined its worker pool; release those workers' handles."""
+        self.close()
 
     def _get(self, url: str):
         from curl_cffi import requests
 
-        response = requests.get(
-            url,
-            impersonate="chrome120",
-            proxies=self.proxies,
-            timeout=self.config.timeout,
-        )
+        if self.proxy_pool is not None:
+            from curl_cffi import CurlOpt
+
+            def pool_get(lease):
+                if not self.config.reuse_connections:
+                    def fresh_get(target, **kwargs):
+                        with requests.Session(use_thread_local_curl=False, trust_env=False,
+                                              curl_options={CurlOpt.NOPROXY: b""}) as session:
+                            return session.get(target, **kwargs)
+                    return fresh_get
+                sessions = getattr(self._local, "proxy_sessions", None)
+                if sessions is None:
+                    sessions = self._local.proxy_sessions = {}
+                session = sessions.get(lease.index)
+                if session is None:
+                    session = requests.Session(use_thread_local_curl=False, trust_env=False,
+                                               curl_options={CurlOpt.NOPROXY: b""})
+                    sessions[lease.index] = session
+                    with self._sessions_lock:
+                        self._sessions.append(session)
+                return session.get
+            return _pooled_request(self, url, pool_get, impersonate="chrome120")
+
+        get = requests.get
+        if self.config.reuse_connections:
+            session = getattr(self._local, "session", None)
+            if session is None:
+                session = requests.Session(use_thread_local_curl=False)
+                self._local.session = session
+                with self._sessions_lock:
+                    self._sessions.append(session)
+            get = session.get
+        pacer = self.request_pacer
+        _wait_for_request_start(self.cooldown, pacer, url)
+        if pacer is not None:
+            pacer.record_started(self.cooldown.stop_event, lambda: self.cooldown.remaining(url))
+        try:
+            response = get(
+                url,
+                impersonate="chrome120",
+                proxies=self.proxies,
+                timeout=self.config.timeout,
+            )
+        finally:
+            if pacer is not None:
+                pacer.record_finished()
         if response.status_code != 200:
-            raise _response_error(url, int(response.status_code))
+            error = _response_error(url, int(response.status_code), response.headers.get("Retry-After"))
+            if response.status_code in {429, 503}:
+                self.cooldown.defer(url, error.retry_after)
+            raise error
         return response
 
     def discover_page(self, page: int) -> list[CollectionItem]:
@@ -1360,20 +1889,39 @@ class NHAdapter:
     def fetch_detail(self, item: CollectionItem) -> ParsedGallery:
         response = self._get(item.detail_url)
         soup = BeautifulSoup(response.text, "html.parser")
-        title_node = soup.find("h2", class_="title") or soup.find("h1", class_="title")
-        if title_node and title_node.find("span", class_="pretty"):
-            title = title_node.find("span", class_="pretty").get_text(strip=True)
-        else:
-            title = title_node.get_text(" ", strip=True) if title_node else ""
-        if not title:
-            raise CollectionRequestError(f"详情页未解析到标题: {item.detail_url}")
+        _reject_challenge_page(soup)
+        title = ""
+        for title_node in [soup.find("h2", class_="title"), soup.find("h1", class_="title")]:
+            if title_node is None:
+                continue
+            pretty = title_node.find("span", class_="pretty")
+            title = pretty.get_text(strip=True) if pretty is not None else title_node.get_text(" ", strip=True)
+            if title:
+                break
         upload_date = ""
-        for container in soup.find_all("div", class_="tag-container field-name"):
-            if "Uploaded:" in container.get_text(" ", strip=True):
-                time_node = container.find("time")
-                if time_node and time_node.get("datetime"):
-                    upload_date = str(time_node["datetime"])[:10]
-                    break
+        uploaded_container = _nh_field_container(soup, "Uploaded:")
+        if uploaded_container is not None:
+            time_node = uploaded_container.find("time")
+            if time_node is not None and time_node.get("datetime"):
+                upload_date = str(time_node["datetime"]).strip()[:10]
+            elif uploaded_container.get_text(" ", strip=True).split(":", 1)[-1].strip():
+                raise CollectionRequestError("上传日期字段有内容但未解析到有效日期，不能视为站点缺项")
+        pages = _field_names(soup, "Pages:")
+        if not pages:
+            pages_container = _nh_field_container(soup, "Pages:")
+            if pages_container is not None:
+                pages = pages_container.get_text(" ", strip=True).split(":", 1)[1].strip()
+        info = GalleryInfo(
+            id=item.id,
+            link=item.detail_url,
+            title=title,
+            tags=_field_names(soup, "Tags:"),
+            authors=_field_names(soup, "Artists:"),
+            groups=_field_names(soup, "Groups:"),
+            languages=_field_names(soup, "Languages:"),
+            pages=pages,
+            uploaded_date=upload_date,
+        )
         cover = soup.select_one("#cover img")
         thumbnail_url = ""
         if cover:
@@ -1381,20 +1929,30 @@ class NHAdapter:
         if not thumbnail_url:
             meta = soup.find("meta", attrs={"property": "og:image"})
             thumbnail_url = str(meta.get("content") or "") if meta else ""
-        return ParsedGallery(
-            GalleryInfo(
-                id=item.id,
-                link=item.detail_url,
-                title=title,
-                tags=_field_names(soup, "Tags:"),
-                authors=_field_names(soup, "Artists:"),
-                groups=_field_names(soup, "Groups:"),
-                languages=_field_names(soup, "Languages:"),
-                pages=_field_names(soup, "Pages:"),
-                uploaded_date=upload_date,
-            ),
+        row = info.as_csv_row()
+        for field, label in (("标签", "Tags:"), ("作者", "Artists:"), ("团队", "Groups:"), ("语言", "Languages:")):
+            container = _nh_field_container(soup, label)
+            if container is not None and not row[field] and container.get_text(" ", strip=True).split(":", 1)[-1].strip():
+                raise CollectionRequestError(f"{field}字段有内容但解析失败，不能视为站点缺项")
+        invalid = set(self._incomplete_info_fields(row))
+        # The legacy minimal page has both reliable core fields.  If one is
+        # genuinely absent, require multiple independent metadata sections and
+        # a cover before accepting the omission; a title-only/truncated page
+        # must remain retryable rather than poisoning the absence cache.
+        valid_core = sum(name not in invalid for name in ("页数", "上传日期"))
+        containers = sum(_nh_field_container(soup, label) is not None for label in
+                         ("Tags:", "Artists:", "Groups:", "Languages:", "Pages:", "Uploaded:"))
+        if not title:
+            raise CollectionRequestError(f"详情页未解析到标题: {item.detail_url}")
+        if valid_core != 2 and not (valid_core == 1 and containers >= 3 and thumbnail_url):
+            raise CollectionRequestError("详情页结构或核心信息不完整（页数/上传日期），不能确认站点缺项")
+        parsed = ParsedGallery(
+            info,
             urljoin(item.detail_url, thumbnail_url) if thumbnail_url else "",
+            tuple(name for name in CSV_HEADERS if not str(row.get(name) or "").strip()),
         )
+        self.validate_detail(parsed)
+        return parsed
 
     def fetch_thumbnail(self, url: str) -> BinaryPayload:
         response = self._get(url)
@@ -1405,10 +1963,39 @@ class NHAdapter:
 class JMAdapter:
     LANGUAGE_TAGS = {"中文", "英文", "日文"}
 
+    _incomplete_info_fields = staticmethod(_metadata_incomplete_fields)
+    validate_detail = staticmethod(_validate_parsed_metadata)
+
+    @staticmethod
+    def is_info_complete(row: dict[str, str]) -> bool:
+        return not _metadata_incomplete_fields(row)
+
     def __init__(self, config: ResolvedConfig):
         self.config = config
-        self.proxies = build_proxies(config.proxy) if config.proxy is not None else configured_proxies()
+        from data_get.proxy_pool import ProxyPool
+
+        self.proxy_pool = ProxyPool.from_file(config.proxy_pool_file) if config.proxy_pool_file else None
+        self._proxy_start_lock = threading.Lock()
+        self.proxies = (build_proxies("") if self.proxy_pool is not None else
+                        build_proxies(config.proxy) if config.proxy is not None else configured_proxies())
         self._local = threading.local()
+        self._sessions: list[Any] = []
+        self._sessions_lock = threading.Lock()
+        self.cooldown = HostCooldown()
+        self.request_pacer = None
+
+    def set_request_pacer(self, pacer: Any) -> None:
+        self.request_pacer = pacer
+
+    def close(self) -> None:
+        with self._sessions_lock:
+            for session in self._sessions:
+                session.close()
+            self._sessions.clear()
+        self._local = threading.local()
+
+    def close_idle_sessions(self) -> None:
+        self.close()
 
     def _scraper(self):
         scraper = getattr(self._local, "scraper", None)
@@ -1419,12 +2006,44 @@ class JMAdapter:
                 browser={"browser": "chrome", "platform": "windows", "desktop": True}
             )
             self._local.scraper = scraper
+            with self._sessions_lock:
+                self._sessions.append(scraper)
         return scraper
 
     def _get(self, url: str):
-        response = self._scraper().get(url, timeout=self.config.timeout, proxies=self.proxies)
+        if self.proxy_pool is not None:
+            def pool_get(lease):
+                import cloudscraper
+
+                sessions = getattr(self._local, "proxy_sessions", None)
+                if sessions is None:
+                    sessions = self._local.proxy_sessions = {}
+                session = sessions.get(lease.index)
+                if session is None:
+                    session = cloudscraper.create_scraper(
+                        browser={"browser": "chrome", "platform": "windows", "desktop": True}
+                    )
+                    session.trust_env = False
+                    sessions[lease.index] = session
+                    with self._sessions_lock:
+                        self._sessions.append(session)
+                return session.get
+            return _pooled_request(self, url, pool_get)
+        get = self._scraper().get
+        pacer = self.request_pacer
+        _wait_for_request_start(self.cooldown, pacer, url)
+        if pacer is not None:
+            pacer.record_started(self.cooldown.stop_event, lambda: self.cooldown.remaining(url))
+        try:
+            response = get(url, timeout=self.config.timeout, proxies=self.proxies)
+        finally:
+            if pacer is not None:
+                pacer.record_finished()
         if response.status_code != 200:
-            raise _response_error(url, int(response.status_code))
+            error = _response_error(url, int(response.status_code), response.headers.get("Retry-After"))
+            if response.status_code in {429, 503}:
+                self.cooldown.defer(url, error.retry_after)
+            raise error
         return response
 
     def discover_page(self, page: int) -> list[CollectionItem]:
@@ -1451,6 +2070,7 @@ class JMAdapter:
     def fetch_detail(self, item: CollectionItem) -> ParsedGallery:
         response = self._get(item.detail_url)
         soup = BeautifulSoup(response.text, "html.parser")
+        _reject_challenge_page(soup)
         title_node = soup.find("h1", id="book-name")
         title = title_node.get_text(" ", strip=True) if title_node else ""
         if not title:
@@ -1468,28 +2088,48 @@ class JMAdapter:
         author_container = soup.find("span", {"itemprop": "author", "data-type": "author"})
         if author_container:
             authors = [node.get_text(strip=True) for node in author_container.find_all("a") if node.get_text(strip=True)]
-        date_node = soup.find("span", {"itemprop": "datePublished"})
-        raw_date = date_node.get_text(strip=True) if date_node else ""
-        date_match = re.search(r"\d{4}-\d{2}-\d{2}", raw_date)
+        group_container = soup.select_one('span[data-type="group"], span[data-type="groups"]')
+        groups = [node.get_text(strip=True) for node in group_container.find_all("a") if node.get_text(strip=True)] if group_container else []
+        for field, container, values in (("标签", tag_container, tags + languages), ("作者", author_container, authors), ("团队", group_container, groups)):
+            if container is not None and not values and container.get_text(strip=True):
+                raise CollectionRequestError(f"{field}字段有内容但解析失败，不能视为站点缺项")
+        date_node = soup.find(attrs={"itemprop": "datePublished"})
+        raw_date = str(date_node.get("content") or date_node.get("datetime") or date_node.get_text(strip=True)).strip() if date_node else ""
+        date_match = re.search(r"[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2}", raw_date)
+        if raw_date and not date_match:
+            raise CollectionRequestError("上传日期字段有内容但解析失败，不能视为站点缺项")
         text = soup.get_text("\n", strip=True)
-        pages_match = re.search(r"页数\s*[:：]\s*(\d+)", text)
+        pages_label = re.search(r"[页頁][数數]\s*[:：]", text)
+        raw_pages = text[pages_label.end():].lstrip().split("\n", 1)[0].strip() if pages_label else ""
+        # Read the full value, not just its numeric prefix: '24x' and '0'
+        # are parser/data errors, not evidence that the source omitted pages.
+        if raw_pages and not re.fullmatch(r"[0-9]+", raw_pages):
+            raise CollectionRequestError("页数字段有内容但解析失败，不能视为站点缺项")
         thumbnail_url = ""
         meta = soup.find("meta", attrs={"property": "og:image"})
         if meta:
             thumbnail_url = str(meta.get("content") or "")
-        return ParsedGallery(
-            GalleryInfo(
+        info = GalleryInfo(
                 id=item.id,
                 link=item.detail_url,
                 title=title,
                 tags=", ".join(dict.fromkeys(tags)),
                 authors=", ".join(dict.fromkeys(authors)),
+                groups=", ".join(dict.fromkeys(groups)),
                 languages=", ".join(dict.fromkeys(languages)),
-                pages=pages_match.group(1) if pages_match else "",
+                pages=raw_pages,
                 uploaded_date=date_match.group(0) if date_match else raw_date,
-            ),
+            )
+        sections = sum(value is not None for value in (tag_container, author_container, group_container, date_node, pages_label))
+        if sections < 2:
+            raise CollectionRequestError("JM 详情页元数据结构不完整，不能确认站点缺项")
+        parsed = ParsedGallery(
+            info,
             urljoin(item.detail_url, thumbnail_url) if thumbnail_url else "",
+            tuple(name for name, value in info.as_csv_row().items() if not str(value or "").strip()),
         )
+        self.validate_detail(parsed)
+        return parsed
 
     def fetch_thumbnail(self, url: str) -> BinaryPayload:
         response = self._get(url)
@@ -1555,16 +2195,66 @@ class OnlineCollectionRunner:
         self._progress_callback_failed = False
         self._round_number = 0
         self._concurrency_changed = threading.Event()
-        self.concurrency = AdaptiveConcurrency(config.workers)
+        from data_get.concurrency_strategies import create_controller
+        self.concurrency = create_controller(config.strategy, config.workers,
+                                             request_rate_limit=config.request_rate_limit,
+                                             request_start_rate=config.request_start_rate)
+        if hasattr(adapter, "cooldown"):
+            adapter.cooldown.stop_event = self.stop_event
+        if hasattr(adapter, "set_request_pacer"):
+            adapter.set_request_pacer(getattr(self.concurrency, "pacer", None))
         self.states: dict[str, TaskState] = {}
         self.completed_pages: set[int] = set()
         self.terminal_pages: set[int] = set()
         self._emit_progress("initializing", force=True)
         self.csv_store = CsvStore(config.output_csv)
+        self.metadata_reviews = MetadataReviewStore(config.output_csv, CSV_HEADERS)
+        # Strict source-field completeness is distinct from a fresh, validated
+        # check proving that the source itself did not provide some fields.
+        self._info_validator = getattr(adapter, "is_info_complete", None)
+        self._missing_info_fields = getattr(adapter, "_incomplete_info_fields", None)
+        source_prefix = "JM" if config.mode == "jm-online" else "NH"
+        is_online = config.mode in {"nh-online", "jm-online"}
+        self._local_links: list[tuple[str, str]] | None = None
+        if not is_online:
+            if config.input_file is None:
+                raise ValueError("nh-local-info 需要 input_file")
+            self._local_links = parse_local_links(config.input_file)
         self.thumbnail_store = ThumbnailStore(config.image_dir)
         self.checkpoint = Checkpoint(config.state_file)
         self.error_writer = JsonlWriter(config.error_log, flush_every=1)
         replayed = self.checkpoint.replay(config.identity) if config.resume else ReplayedState()
+        # The CSV is a shared output/cache, never the discovery scope.  Older
+        # collectors added every incomplete CSV row as a page=0 task, so reject
+        # those synthetic tasks (and out-of-range ones) when resuming.  Keep
+        # valid page-owned tasks even if a crash preceded page_complete.
+        old_task_count = len(replayed.tasks)
+        if is_online:
+            replayed.tasks = {
+                gallery_id: state
+                for gallery_id, state in replayed.tasks.items()
+                if isinstance(state.item.page, int)
+                and not isinstance(state.item.page, bool)
+                and 1 <= state.item.page <= config.max_pages
+                and re.fullmatch(rf"{source_prefix}\d+", gallery_id)
+            }
+            replayed.completed_pages = {
+                page for page in replayed.completed_pages if 1 <= page <= config.max_pages
+            }
+            replayed.terminal_pages = {
+                page for page in replayed.terminal_pages if 1 <= page <= config.max_pages
+            }
+        else:
+            local_ids = {_nh_id(url) for url, _label in self._local_links or []}
+            replayed.tasks = {
+                gallery_id: state for gallery_id, state in replayed.tasks.items()
+                if gallery_id in local_ids
+            }
+            replayed.completed_pages.clear()
+            replayed.terminal_pages.clear()
+        excluded_count = old_task_count - len(replayed.tasks)
+        if excluded_count:
+            print(f"[采集] 已排除断点中 {excluded_count} 个不属于当前采集范围的项目；原 CSV 和缩略图保留", flush=True)
         has_resume_state = bool(
             replayed.tasks or replayed.completed_pages or replayed.terminal_pages
         )
@@ -1582,9 +2272,50 @@ class OnlineCollectionRunner:
         # bytes, however, were written before task_state; defer their expensive
         # Pillow validation until an incomplete task is actually queued.
         for state in self.states.values():
-            state.info_ok = self.csv_store.has(state.item.id)
+            was_info_ok = state.info_ok
+            row = self.csv_store.row(state.item.id)
+            state.info_ok = row is not None and self._row_info_done(row)
+            if not state.info_ok and (was_info_ok or row is not None):
+                # Recheck older false-success/terminal metadata decisions,
+                # but only for records actually owned by this task's scope.
+                state.terminal_info = False
+                if row is not None:
+                    state.terminal_thumb = False
+            state.site_missing_fields = self._reviewed_missing_fields(state.item.id) if state.info_ok else ()
             state.thumb_ok = state.thumb_ok and self.thumbnail_store.has_candidate(state.item.id)
+        if is_online:
+            print(f"[采集] 缺项回补仅检查列表第 1～{config.max_pages} 页及其有效断点项目，不扫描整个 CSV", flush=True)
+        else:
+            print("[采集] 缺项回补仅检查输入文件中的链接，不扫描整个 CSV", flush=True)
         self._emit_progress("ready", force=True)
+
+    def _has_complete_info(self, gallery_id: str) -> bool:
+        row = self.csv_store.row(gallery_id)
+        return row is not None and self._row_info_done(row)
+
+    def _row_info_done(self, row: dict[str, str]) -> bool:
+        if self._info_validator is None or self._info_validator(row):
+            return True
+        missing = self._missing_info_fields(row) if self._missing_info_fields else []
+        confirmed = self.metadata_reviews.unavailable(row)
+        return bool(missing) and set(missing).issubset(confirmed)
+
+    def _reviewed_missing_fields(self, gallery_id: str) -> tuple[str, ...]:
+        row = self.csv_store.row(gallery_id)
+        if row is None or self._missing_info_fields is None:
+            return ()
+        missing = self._missing_info_fields(row)
+        confirmed = self.metadata_reviews.unavailable(row)
+        return tuple(key for key in missing if key in confirmed)
+
+    def _validate_detail(self, parsed: ParsedGallery, item: CollectionItem) -> None:
+        if parsed.info.id != item.id:
+            raise CollectionRequestError("详情返回的 ID 与当前采集项目不一致")
+        detail_validator = getattr(self.adapter, "validate_detail", None)
+        if detail_validator is not None:
+            detail_validator(parsed)
+        elif self._info_validator is not None and not self._info_validator(parsed.info.as_csv_row()):
+            raise CollectionRequestError("详情元数据不完整，不计入信息成功；将在后续尝试中回补")
 
     def _state_snapshot(self) -> list[TaskState]:
         with self._states_lock:
@@ -1619,6 +2350,13 @@ class OnlineCollectionRunner:
             "previousWindowSuccess": throughput.previous_window_success,
             "windowElapsedSeconds": round(throughput.window_elapsed_seconds, 2),
             "throughputTrend": throughput.trend,
+            "concurrencyStrategy": self.config.strategy,
+            **_pacing_progress(self.concurrency),
+            **_proxy_pool_progress(self.adapter, self.config.base_url),
+            "informationCompleted": info_complete,
+            "informationComplete": sum(state.info_ok and not state.site_missing_fields for state in states),
+            "informationSiteMissing": sum(state.info_ok and bool(state.site_missing_fields) for state in states),
+            "imagesCompleted": image_complete,
             "progressPercent": round(min(100.0, max(0.0, percent)), 2),
             "csvWrites": csv_store.write_count if csv_store is not None else 0,
             "updatedAt": _utc_now(),
@@ -1693,7 +2431,12 @@ class OnlineCollectionRunner:
                 self.concurrency.release()
             if not should_retry:
                 break
-            self._wait(_retry_delay(self.config.retry_backoff, attempt - 1, cap=60.0))
+            delay = _retry_delay(self.config.retry_backoff, attempt - 1, cap=60.0)
+            # Spread retries without retrying earlier than the configured
+            # backoff or a server's explicit Retry-After instruction.
+            delay += random.uniform(0.0, min(1.0, delay * 0.2))
+            server_delay = 0.0 if getattr(last_error, "proxy_pool_cooldown", False) else getattr(last_error, "retry_after", 0.0)
+            self._wait(max(delay, server_delay))
         assert last_error is not None
         raise last_error
 
@@ -1724,12 +2467,13 @@ class OnlineCollectionRunner:
         )
 
     def _merge_item(self, item: CollectionItem) -> TaskState:
-        info_exists = self.csv_store.has(item.id)
+        info_exists = self._has_complete_info(item.id)
         thumb_exists = self.thumbnail_store.has(item.id)
         with self._states_lock:
             state = self.states.get(item.id)
             if state is None:
                 state = TaskState(item=item, info_ok=info_exists, thumb_ok=thumb_exists)
+                state.site_missing_fields = self._reviewed_missing_fields(item.id) if info_exists else ()
                 self.states[item.id] = state
             else:
                 state.item.detail_url = item.detail_url or state.item.detail_url
@@ -1779,6 +2523,9 @@ class OnlineCollectionRunner:
             return False, []
         candidate_ids: list[str] = []
         for item in items:
+            # Attribute scope at the trusted discovery boundary rather than
+            # relying on an adapter to populate the optional page field.
+            item.page = page
             state = self._merge_item(item)
             with self._states_lock:
                 if not state.complete and not state.terminal:
@@ -1792,27 +2539,22 @@ class OnlineCollectionRunner:
         with self._states_lock:
             item = state.item
             gallery_id = item.id
-        info_exists = self.csv_store.has(gallery_id)
+        info_exists = self._has_complete_info(gallery_id)
         thumb_exists = self.thumbnail_store.has(gallery_id)
         with self._states_lock:
             state.info_ok = state.info_ok or info_exists
-            state.thumb_ok = state.thumb_ok or thumb_exists
+            # Startup only checked the filename for speed; now validate bytes
+            # before trusting an old thumbnail during metadata repair.
+            state.thumb_ok = thumb_exists
             if state.complete or state.terminal:
                 return state
             needs_detail = not state.info_ok or (not state.thumb_ok and not item.thumbnail_url)
         if needs_detail:
             try:
-                parsed = self._attempt(lambda: self.adapter.fetch_detail(item))
-                with self._states_lock:
-                    needs_info_write = not state.info_ok
-                if needs_info_write:
-                    self.csv_store.upsert(parsed.info)
-                with self._states_lock:
-                    if needs_info_write:
-                        state.info_ok = True
-                        state.terminal_info = False
-                    if parsed.thumbnail_url:
-                        item.thumbnail_url = parsed.thumbnail_url
+                parsed = self._attempt(
+                    lambda: self.adapter.fetch_detail(item),
+                    validate_result=lambda result: self._validate_detail(result, item),
+                )
             except StopRequested:
                 raise
             except Exception as exc:
@@ -1831,6 +2573,29 @@ class OnlineCollectionRunner:
                             state.terminal_info = True
                         elif not state.thumb_ok:
                             state.terminal_thumb = True
+            else:
+                with self._states_lock:
+                    needs_info_write = not state.info_ok
+                if needs_info_write:
+                    # Persistence failures must stop the run, not become an
+                    # endless network retry with another apparently successful
+                    # request.  Keep the CSV/journal intact for safe recovery.
+                    self.csv_store.upsert(parsed.info)
+                    # Persist the CSV/journal first, then bind this check to
+                    # the merged row (including any preserved nonempty data).
+                    # A crash between them only causes an extra safe request.
+                    saved = self.csv_store.row(item.id)
+                    missing = self._missing_info_fields(saved) if self._missing_info_fields and saved else []
+                    confirmed = tuple(key for key in missing if key in parsed.unavailable_fields)
+                    if saved is not None and confirmed:
+                        self.metadata_reviews.record(saved, confirmed)
+                with self._states_lock:
+                    if needs_info_write:
+                        state.info_ok = self._has_complete_info(item.id)
+                        state.terminal_info = False
+                        state.site_missing_fields = self._reviewed_missing_fields(item.id) if state.info_ok else ()
+                    if parsed.thumbnail_url:
+                        item.thumbnail_url = parsed.thumbnail_url
 
         with self._states_lock:
             needs_thumbnail = not state.thumb_ok
@@ -1877,6 +2642,8 @@ class OnlineCollectionRunner:
             info_ok = state.info_ok
             thumb_ok = state.thumb_ok
         status = "完成" if complete else "待重试"
+        if state.site_missing_fields:
+            print(f"[采集] {item.id} 已检查并补齐可用信息；站点未提供 {', '.join(state.site_missing_fields)}，跳过这些缺项", flush=True)
         print(
             f"[采集] {item.id} {status}（信息={'OK' if info_ok else 'FAIL'}，缩略图={'OK' if thumb_ok else 'FAIL'}）",
             flush=True,
@@ -1888,7 +2655,7 @@ class OnlineCollectionRunner:
     def _initial_local_items(self) -> None:
         if self.config.input_file is None:
             raise ValueError("nh-local-info 需要 input_file")
-        links = parse_local_links(self.config.input_file)
+        links = self._local_links if self._local_links is not None else parse_local_links(self.config.input_file)
         if not links and not self.states:
             self.csv_store.close()
             self.checkpoint.close()
@@ -1967,8 +2734,21 @@ class OnlineCollectionRunner:
                     ready.append(gallery_id)
                     queued.add(gallery_id)
 
-                for gallery_id in sorted(pending_ids):
-                    enqueue(gallery_id)
+                # A resumed run may have thousands of unfinished items.  Do
+                # not put them all ahead of undiscovered pages; keep a bounded
+                # backlog and interleave page discovery with detail work.
+                resume_backlog = iter(sorted(pending_ids))
+                backlog_exhausted = False
+
+                def fill_backlog() -> None:
+                    nonlocal backlog_exhausted
+                    while not backlog_exhausted and len(ready) < queue_limit:
+                        try:
+                            gallery_id = next(resume_backlog)
+                        except StopIteration:
+                            backlog_exhausted = True
+                        else:
+                            enqueue(gallery_id)
 
                 executor = ThreadPoolExecutor(
                     max_workers=self.config.workers,
@@ -1976,6 +2756,7 @@ class OnlineCollectionRunner:
                 )
 
                 def schedule_available() -> None:
+                    fill_backlog()
                     current = self.concurrency.snapshot().current
                     while ready and len(futures) < current and not self.stop_event.is_set():
                         gallery_id = ready.popleft()
@@ -2005,6 +2786,7 @@ class OnlineCollectionRunner:
                         queued.discard(gallery_id)
                         processed.add(gallery_id)
                         future.result()
+                    self.csv_store.commit_if_due()
                     if self._concurrency_changed.is_set():
                         self._concurrency_changed.clear()
                         self._emit_progress("streaming", force=True)
@@ -2044,7 +2826,7 @@ class OnlineCollectionRunner:
                         if discovered_ids and not processed and futures:
                             collect_completed(block=True)
                         self._emit_progress("streaming")
-                    while ready or futures:
+                    while ready or futures or not backlog_exhausted:
                         collect_completed(block=True)
                     if self.stop_event.is_set():
                         raise StopRequested()
@@ -2056,6 +2838,9 @@ class OnlineCollectionRunner:
                     raise
                 else:
                     executor.shutdown(wait=True)
+                    close_idle = getattr(self.adapter, "close_idle_sessions", None)
+                    if close_idle is not None:
+                        close_idle()
 
                 self.csv_store.commit()
 
@@ -2204,7 +2989,14 @@ class LocalImagesRunner:
         self._progress_stage = ""
         self._progress_callback_failed = False
         self._round_number = 0
-        self.concurrency = AdaptiveConcurrency(config.workers)
+        from data_get.concurrency_strategies import create_controller
+        self.concurrency = create_controller(config.strategy, config.workers,
+                                             request_rate_limit=config.request_rate_limit,
+                                             request_start_rate=config.request_start_rate)
+        if hasattr(adapter, "cooldown"):
+            adapter.cooldown.stop_event = self.stop_event
+        if hasattr(adapter, "set_request_pacer"):
+            adapter.set_request_pacer(getattr(self.concurrency, "pacer", None))
         self._concurrency_changed = threading.Event()
         self.states: dict[str, TaskState] = {}
         self._emit_progress("initializing", force=True)
@@ -2265,6 +3057,11 @@ class LocalImagesRunner:
             "throughputTrend": throughput.trend,
             "progressPercent": round(min(100.0, max(0.0, percent)), 2),
             "csvWrites": 0,
+            "concurrencyStrategy": self.config.strategy,
+            **_pacing_progress(self.concurrency),
+            **_proxy_pool_progress(self.adapter, self.config.base_url),
+            "informationCompleted": info_complete,
+            "imagesCompleted": image_complete,
             "updatedAt": _utc_now(),
         }
 
@@ -2332,7 +3129,10 @@ class LocalImagesRunner:
                 self.concurrency.release()
             if not should_retry:
                 break
-            self._wait(_retry_delay(self.config.retry_backoff, attempt, cap=60.0))
+            delay = _retry_delay(self.config.retry_backoff, attempt, cap=60.0)
+            delay += random.uniform(0.0, min(1.0, delay * 0.2))
+            server_delay = 0.0 if getattr(last, "proxy_pool_cooldown", False) else getattr(last, "retry_after", 0.0)
+            self._wait(max(delay, server_delay))
         assert last is not None
         raise last
 
@@ -2568,6 +3368,9 @@ class LocalImagesRunner:
                         raise
                     else:
                         executor.shutdown(wait=True)
+                        close_idle = getattr(self.adapter, "close_idle_sessions", None)
+                        if close_idle is not None:
+                            close_idle()
                 retry_pending = any(
                     not state.complete and not state.terminal for state in self._state_snapshot()
                 )
@@ -2625,28 +3428,28 @@ def run_collection(
     """Run one collection job; no network is used when a fake adapter is injected."""
 
     resolved = config.resolved()
-    if adapter is None:
-        if resolved.mode == "jm-online":
-            adapter = JMAdapter(resolved)
-        elif resolved.mode == "nh-local-images":
-            adapter = NHFullImageAdapter(resolved)
-        else:
-            adapter = NHAdapter(resolved)
-    if resolved.mode == "nh-local-images":
-        return LocalImagesRunner(
-            resolved,
-            adapter,
-            sleep_fn=sleep_fn,
-            stop_event=stop_event,
-            progress_callback=progress_callback,
-        ).run()
-    return OnlineCollectionRunner(
-        resolved,
-        adapter,
-        sleep_fn=sleep_fn,
-        stop_event=stop_event,
-        progress_callback=progress_callback,
-    ).run()
+    from data_get.collection_lock import collection_output_lock
+    with collection_output_lock(resolved):
+        owned_adapter = adapter is None
+        if adapter is None:
+            if resolved.mode == "jm-online":
+                adapter = JMAdapter(resolved)
+            elif resolved.mode == "nh-local-images":
+                adapter = NHFullImageAdapter(resolved)
+            else:
+                adapter = NHAdapter(resolved)
+        try:
+            runner_type = LocalImagesRunner if resolved.mode == "nh-local-images" else OnlineCollectionRunner
+            return runner_type(
+                resolved,
+                adapter,
+                sleep_fn=sleep_fn,
+                stop_event=stop_event,
+                progress_callback=progress_callback,
+            ).run()
+        finally:
+            if owned_adapter and hasattr(adapter, "close"):
+                adapter.close()
 
 
 def _add_retry_options(parser: argparse.ArgumentParser, *, default_workers: int) -> None:
@@ -2658,6 +3461,14 @@ def _add_retry_options(parser: argparse.ArgumentParser, *, default_workers: int)
         help="请求并发上限（从上限启动；忽略首个 30 秒预热窗，再按 2～3 个窗口的稳定成功吞吐自动寻优）",
     )
     parser.add_argument("--request-attempts", type=int, default=3, help="每轮内单次请求尝试次数")
+    parser.add_argument("--strategy", choices=("stable", "adaptive-step", "bandit", "paced"), default="stable",
+                        help="稳定成功吞吐寻优：相邻档、大步自适应、分档探索、动态频率逐发")
+    parser.add_argument("--rate-limit", dest="request_rate_limit", type=float, default=1.0,
+                        help="paced 每秒请求发起频率上限（0.1～100），与并发上限独立")
+    parser.add_argument("--start-rate", dest="request_start_rate", type=float,
+                        help="paced 起始每秒请求数，留空从频率上限开始")
+    parser.add_argument("--no-reuse-connections", action="store_true",
+                        help="关闭 NH 连接复用，仅用于对照测试")
     parser.add_argument(
         "--max-rounds",
         "--retry-rounds",
@@ -2671,6 +3482,7 @@ def _add_retry_options(parser: argparse.ArgumentParser, *, default_workers: int)
     parser.add_argument("--state-file", help="结构化断点 JSONL；默认按任务参数生成")
     parser.add_argument("--error-log", help="结构化失败 JSONL；默认按任务参数生成")
     parser.add_argument("--proxy", help="显式 HTTP(S) 代理；空值使用 ONLINE_COVER_PROXY")
+    parser.add_argument("--proxy-pool-file", help="多节点代理 JSON 文件；与 --proxy 互斥，不修改系统代理或 TUN")
     parser.add_argument("--no-resume", action="store_true", help="忽略未完成断点并开始新一轮扫描")
     parser.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
 
@@ -2732,7 +3544,12 @@ def config_from_args(args: argparse.Namespace) -> CollectionConfig:
         state_file=args.state_file,
         error_log=args.error_log,
         proxy=args.proxy,
+        proxy_pool_file=getattr(args, "proxy_pool_file", None),
         resume=not args.no_resume,
+        strategy=getattr(args, "strategy", "stable"),
+        reuse_connections=not getattr(args, "no_reuse_connections", False),
+        request_rate_limit=getattr(args, "request_rate_limit", 1.0),
+        request_start_rate=getattr(args, "request_start_rate", None),
     )
 
 

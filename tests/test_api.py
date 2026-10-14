@@ -84,6 +84,10 @@ class JobTaskAdapterTest(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(captured["mode"], "jm-online")
+        self.assertEqual(captured["strategy"], "stable")
+        self.assertEqual(captured["request_rate_limit"], 1.0)
+        self.assertIsNone(captured["request_start_rate"])
+        self.assertTrue(captured["reuse_connections"])
         self.assertEqual(captured["max_pages"], 7)
         self.assertEqual(captured["request_attempts"], 4)
         self.assertEqual(captured["timeout"], 17)
@@ -103,6 +107,93 @@ class JobTaskAdapterTest(unittest.TestCase):
             job_tasks.run("export-title-translations", {"pattern": "*_full.csv"})
         with self.assertRaisesRegex(ValueError, "当前 CSV 目录"):
             job_tasks.run("export-title-translations", {"pattern": "../*_full.csv", "dryRun": True})
+
+    def test_collection_strategy_labels_and_machine_values_reach_all_collectors(self) -> None:
+        captured: dict[str, object] = {}
+        collector = ModuleType("data_get.collector")
+
+        class FakeConfig:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+        collector.CollectionConfig = FakeConfig
+        collector.run_collection = lambda config, **_kwargs: {"completed": True}
+        choices = {
+            "稳定相邻探测": "stable",
+            "大步自适应": "adaptive-step",
+            "分档探索": "bandit",
+            "动态频率逐发": "paced",
+            "stable": "stable",
+            "adaptive-step": "adaptive-step",
+            "bandit": "bandit",
+            "paced": "paced",
+        }
+        with patch.dict(sys.modules, {"data_get.collector": collector}), patch("sys.stdout", new_callable=io.StringIO):
+            for script_id in job_tasks.COLLECTION_MODES:
+                for value, expected in choices.items():
+                    with self.subTest(script_id=script_id, value=value):
+                        job_tasks.run_collection_task(script_id, {"confirm": True, "concurrencyStrategy": value})
+                        self.assertEqual(captured["strategy"], expected)
+                for field in ("strategy", "concurrency_strategy"):
+                    with self.subTest(script_id=script_id, field=field):
+                        job_tasks.run_collection_task(
+                            script_id,
+                            {"confirm": True, field: "bandit", "reuse_connections": "false"},
+                        )
+                        self.assertEqual(captured["strategy"], "bandit")
+                        self.assertFalse(captured["reuse_connections"])
+
+    def test_unknown_collection_strategy_is_rejected_before_collection_starts(self) -> None:
+        with patch("data_get.collector.run_collection") as run_collection:
+            with self.assertRaisesRegex(ValueError, "未知并发策略"):
+                job_tasks.run_collection_task(
+                    "collection-nh-online",
+                    {"confirm": True, "concurrencyStrategy": "unrecognized"},
+                )
+        run_collection.assert_not_called()
+
+    def test_paced_rates_accept_aliases_and_default_start_to_the_cap(self) -> None:
+        captured: dict[str, object] = {}
+        collector = ModuleType("data_get.collector")
+
+        class FakeConfig:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+        collector.CollectionConfig = FakeConfig
+        collector.run_collection = lambda config, **_kwargs: {"completed": True}
+        cases = (
+            ({}, 1.0, None),
+            ({"requestRateLimit": "0.5", "requestStartRate": ""}, 0.5, None),
+            ({"requestRateLimit": 0.1, "requestStartRate": None}, 0.1, None),
+            ({"request_rate_limit": 100, "request_start_rate": "0.1"}, 100.0, 0.1),
+            ({"requestRateLimit": 2, "requestStartRate": 1}, 2.0, 1.0),
+        )
+        with patch.dict(sys.modules, {"data_get.collector": collector}), patch("sys.stdout", new_callable=io.StringIO):
+            for parameters, expected_limit, expected_start in cases:
+                with self.subTest(parameters=parameters):
+                    job_tasks.run_collection_task(
+                        "collection-nh-online",
+                        {"confirm": True, "concurrencyStrategy": "动态频率逐发", **parameters},
+                    )
+                    self.assertEqual(captured["strategy"], "paced")
+                    self.assertEqual(captured["request_rate_limit"], expected_limit)
+                    self.assertEqual(captured["request_start_rate"], expected_start)
+
+    def test_paced_invalid_rates_are_rejected_before_starting_collection(self) -> None:
+        with patch("data_get.collector.run_collection") as run_collection:
+            for field in ("requestRateLimit", "requestStartRate", "request_rate_limit", "request_start_rate"):
+                for value in (0, -1, 0.09, 100.1, "nan", "inf", float("-inf"), True, [], "bad"):
+                    with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, "请求频率"):
+                        job_tasks.run_collection_task(
+                            "collection-nh-online", {"confirm": True, "strategy": "paced", field: value},
+                        )
+            with self.assertRaisesRegex(ValueError, "起始请求频率不能超过"):
+                job_tasks.run_collection_task(
+                    "collection-nh-online",
+                    {"confirm": True, "strategy": "paced", "requestRateLimit": 0.5, "requestStartRate": 1},
+                )
+        run_collection.assert_not_called()
 
     def test_incomplete_collection_propagates_its_nonzero_exit_code(self) -> None:
         collector = ModuleType("data_get.collector")
@@ -322,6 +413,14 @@ class JobsModuleRaceTest(unittest.TestCase):
             "stage": "items",
             "complete": 7,
             "missingInfo": 1,
+            "informationCompleted": 7,
+            "imagesCompleted": 8,
+            "concurrencyStrategy": "paced",
+            "requestPacing": True,
+            "requestRate": 0.5,
+            "requestRateLimit": 1.0,
+            "actualRequestStarts": 20,
+            "activeRequests": 2,
             "progressPercent": 87.5,
         }
 

@@ -242,6 +242,27 @@ export function importProject(mode: "upsert" | "replace") {
 
 export type JobStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
 
+export type ProxyPoolNodeProgress = {
+  index: number;
+  name: string;
+  available: boolean;
+  cooling: boolean;
+  inFlight: number;
+  requests: number;
+  successes: number;
+  failures: number;
+  rateLimited: number;
+  cooldownRemainingSeconds?: number;
+};
+
+export type ProxyPoolProgress = {
+  total: number;
+  available: number;
+  cooling: number;
+  inFlight: number;
+  nodes: ProxyPoolNodeProgress[];
+};
+
 export type JobProgress = {
   mode?: string | null;
   round?: number | null;
@@ -250,6 +271,10 @@ export type JobProgress = {
   pagesTotal?: number | null;
   pagesPending?: number | null;
   discovered?: number | null;
+  informationCompleted?: number | null;
+  informationComplete?: number | null;
+  informationSiteMissing?: number | null;
+  imagesCompleted?: number | null;
   complete?: number | null;
   missingInfo?: number | null;
   missingImage?: number | null;
@@ -258,6 +283,13 @@ export type JobProgress = {
   terminal?: number | null;
   currentConcurrency?: number | null;
   maxConcurrency?: number | null;
+  concurrencyStrategy?: string | null;
+  requestPacing?: boolean | null;
+  requestRate?: number | null;
+  requestRateLimit?: number | null;
+  actualRequestStarts?: number | null;
+  activeRequests?: number | null;
+  proxyPool?: ProxyPoolProgress | null;
   windowSuccess?: number | null;
   lastWindowSuccess?: number | null;
   previousWindowSuccess?: number | null;

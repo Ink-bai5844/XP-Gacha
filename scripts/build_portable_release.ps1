@@ -218,6 +218,46 @@ function Invoke-RobocopyTree {
     }
 }
 
+function Copy-EmptyDictionaryTemplates {
+    param(
+        [string]$SourceRoot,
+        [string]$Destination
+    )
+    $contents = @{}
+    foreach ($dictionaryFile in $DefaultDictionaryFiles) {
+        $templateName = [System.IO.Path]::GetFileNameWithoutExtension($dictionaryFile) + "_empty" + [System.IO.Path]::GetExtension($dictionaryFile)
+        $source = Join-Path (Join-Path $SourceRoot "dictionaries") $templateName
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Required empty dictionary template is missing: dictionaries\$templateName"
+        }
+        if ((Get-Item -LiteralPath $source -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "Empty dictionary template must not be a link: dictionaries\$templateName"
+        }
+        $content = [System.IO.File]::ReadAllText($source, [System.Text.UTF8Encoding]::new($false, $true))
+        if ([System.IO.Path]::GetExtension($dictionaryFile) -eq ".json") {
+            if ($content -notmatch '\A\s*\{\s*\}\s*\z') {
+                throw "Empty dictionary template must contain only an empty JSON object: $templateName"
+            }
+            $contents[$dictionaryFile] = "{}`n"
+        }
+        else {
+            if (-not [string]::IsNullOrWhiteSpace($content)) {
+                throw "Empty dictionary template must contain only whitespace: $templateName"
+            }
+            $contents[$dictionaryFile] = ""
+        }
+    }
+    # Validate all templates first. Never fall back to private normal-name files.
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    foreach ($dictionaryFile in $DefaultDictionaryFiles) {
+        [System.IO.File]::WriteAllText(
+            (Join-Path $Destination $dictionaryFile),
+            $contents[$dictionaryFile],
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+}
+
 function Copy-ApplicationFiles {
     param([string]$Destination)
 
@@ -253,14 +293,7 @@ function Copy-ApplicationFiles {
         Invoke-RobocopyTree -Source (Join-Path $ProjectRoot $directory) -Destination (Join-Path $Destination $directory)
     }
     $dictionaryDestination = Join-Path $Destination "dictionaries"
-    New-Item -ItemType Directory -Path $dictionaryDestination -Force | Out-Null
-    foreach ($dictionaryFile in $DefaultDictionaryFiles) {
-        $dictionarySource = Join-Path (Join-Path $ProjectRoot "dictionaries") $dictionaryFile
-        if (-not (Test-Path -LiteralPath $dictionarySource -PathType Leaf)) {
-            throw "Required default dictionary is missing: dictionaries\$dictionaryFile"
-        }
-        Copy-Item -LiteralPath $dictionarySource -Destination (Join-Path $dictionaryDestination $dictionaryFile) -Force
-    }
+    Copy-EmptyDictionaryTemplates -SourceRoot $ProjectRoot -Destination $dictionaryDestination
     Invoke-RobocopyTree -Source (Join-Path $ProjectRoot "web\dist") -Destination (Join-Path $Destination "web\dist")
 
     foreach ($template in Get-ChildItem -LiteralPath (Join-Path $ProjectRoot "portable") -File) {

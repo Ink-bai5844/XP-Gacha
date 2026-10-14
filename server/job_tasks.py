@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -49,6 +50,13 @@ COLLECTION_MODES = {
     "collection-jm-online": "jm-online",
     "collection-nh-local-info": "nh-local-info",
     "collection-nh-local-images": "nh-local-images",
+}
+
+COLLECTION_STRATEGIES = {
+    "稳定相邻探测": "stable",
+    "大步自适应": "adaptive-step",
+    "分档探索": "bandit",
+    "动态频率逐发": "paced",
 }
 
 COLLECTION_DEFAULTS = {
@@ -121,6 +129,27 @@ def parameter_bool(parameters: dict, *names: str, default: bool = False) -> bool
     if normalized in {"0", "false", "no", "off", ""}:
         return False
     raise ValueError(f"布尔参数 {names[0]} 的值无效：{value}")
+
+
+def collection_strategy(parameters: dict) -> str:
+    value = str(parameter_value(parameters, "concurrencyStrategy", "strategy", "concurrency_strategy", default="stable")).strip()
+    strategy = COLLECTION_STRATEGIES.get(value, value)
+    if strategy not in COLLECTION_STRATEGIES.values():
+        raise ValueError(f"未知并发策略：{value}")
+    return strategy
+
+
+def parameter_request_rate(parameters: dict, *names: str, default: float | None = None) -> float | None:
+    value = parameter_value(parameters, *names, default=default)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    try:
+        rate = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"请求频率 {names[0]} 必须为 0.1 到 100 之间的有限数值") from None
+    if isinstance(value, bool) or not math.isfinite(rate) or not 0.1 <= rate <= 100:
+        raise ValueError(f"请求频率 {names[0]} 必须为 0.1 到 100 之间的有限数值")
+    return rate
 
 
 def print_summary(summary: object) -> None:
@@ -199,6 +228,13 @@ def run_collection_task(script_id: str, parameters: dict) -> bool:
     image_field_names = ("imageDir", "outputDir", "image_dir") if mode == "jm-online" else ("imageDir", "image_dir")
     raw_proxy = parameter_value(parameters, "proxy", default=None)
     proxy = str(raw_proxy).strip() if raw_proxy is not None else ""
+    proxy_pool_file = parameter_path(parameters, "proxyPoolFile", "proxy_pool_file")
+    if proxy and proxy_pool_file is not None:
+        raise ValueError("多节点代理配置文件与单代理不能同时填写，请清空单代理。")
+    request_rate_limit = parameter_request_rate(parameters, "requestRateLimit", "request_rate_limit", default=1.0)
+    request_start_rate = parameter_request_rate(parameters, "requestStartRate", "request_start_rate")
+    if request_start_rate is not None and request_start_rate > request_rate_limit:
+        raise ValueError("起始请求频率不能超过请求发起频率上限")
     config = CollectionConfig(
         mode=mode,
         base_url=str(parameter_value(parameters, "baseUrl", "base_url", default=defaults.get("base_url", ""))),
@@ -209,6 +245,10 @@ def run_collection_task(script_id: str, parameters: dict) -> bool:
         input_file=parameter_path(parameters, "inputFile", "input_file", default=defaults.get("input_file")),
         output_dir=parameter_path(parameters, "outputDir", "rootDir", "output_dir", default=defaults.get("output_dir")),
         workers=int(parameter_value(parameters, "workers", "maxWorkers", default=defaults["workers"])),
+        strategy=collection_strategy(parameters),
+        request_rate_limit=request_rate_limit,
+        request_start_rate=request_start_rate,
+        reuse_connections=parameter_bool(parameters, "reuseConnections", "reuse_connections", default=True),
         request_attempts=int(parameter_value(parameters, "requestAttempts", "retries", "request_attempts", default=3)),
         max_rounds=int(parameter_value(parameters, "retryRounds", "maxRounds", "max_rounds", default=0)),
         retry_backoff=float(parameter_value(parameters, "retryBackoff", "retry_backoff", default=2.0)),
@@ -217,6 +257,7 @@ def run_collection_task(script_id: str, parameters: dict) -> bool:
         state_file=parameter_path(parameters, "stateFile", "state_file", default=defaults.get("state_file")),
         error_log=parameter_path(parameters, "errorLog", "error_log", default=defaults.get("error_log")),
         proxy=proxy or None,
+        proxy_pool_file=proxy_pool_file,
         resume=not parameter_bool(parameters, "noResume", "no_resume", default=False),
     )
     stop_event = threading.Event()
